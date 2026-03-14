@@ -1,0 +1,37 @@
+[package]
+name = "truant"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dominic Pearson <dsp@technoanimal.net>"]
+license = "ISC"
+description = "Static binary rewriter for arbitrary function hooking across ELF, Mach-O, and PE"
+
+[features]
+default = ["aarch64", "coverage"]
+aarch64 = ["capstone"]
+macho = []
+coverage = []
+
+[dependencies]
+goblin = "0.10"
+iced-x86 = { version = "1.21", features = ["decoder", "block_encoder", "op_code_info", "instr_info"] }
+anyhow = "1"
+tracing = "0.1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1.0"
+capstone = { version = "0.14", optional = true }
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "rewrite_bench"
+harness = false
+
+[[bin]]
+name = "truant"
+path = "src/main.rs"
