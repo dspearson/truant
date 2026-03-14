@@ -438,7 +438,7 @@ pub fn patch(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "return hook at 0x{:x}: trampoline generation failed: {}",
+                                "return hook at 0x{:x}: trampoline generation failed: {:#}",
                                 hook.target_va,
                                 e,
                             );
@@ -461,7 +461,7 @@ pub fn patch(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "hook at 0x{:x}: trampoline generation failed: {}",
+                                "hook at 0x{:x}: trampoline generation failed: {:#}",
                                 hook.target_va,
                                 e,
                             );
@@ -495,7 +495,7 @@ pub fn patch(
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "chained hook at 0x{:x}: trampoline generation failed: {}",
+                            "chained hook at 0x{:x}: trampoline generation failed: {:#}",
                             resolved_hooks[indices[0]].target_va,
                             e,
                         );

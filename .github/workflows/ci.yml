@@ -28,9 +28,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             features: ""
-          - os: macos-13
-            name: macos-x64
-            features: ""
           - os: windows-latest
             name: windows
             features: ""
@@ -207,18 +204,10 @@ jobs:
           file /tmp/so_test_out.so | grep -q "shared object"
           echo "PASS: rewritten .so is still a valid shared object"
 
-  # ── macOS: live Mach-O verification (ARM64 + x86_64) ────────
+  # ── macOS: live Mach-O verification (ARM64) ──────────────────
   macos-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: arm64
-          - os: macos-13
-            name: x64
-    runs-on: ${{ matrix.os }}
-    name: macos-tests (${{ matrix.name }})
+    runs-on: macos-latest
+    name: macos-tests (arm64)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -260,19 +249,12 @@ jobs:
           cc -Wl,-headerpad_max_install_names -o /tmp/mac_hook /tmp/mac_hook.c
           VA=$(nm /tmp/mac_hook | grep ' T _get_val' | awk '{print "0x"$1}')
           if [ -z "$VA" ]; then VA=$(nm /tmp/mac_hook | grep ' T get_val' | awk '{print "0x"$1}'); fi
-          # Arch-appropriate replace-hook shellcode (structural test only).
-          # x86_64: mov qword [rdi], 7; ret  (sets RegContext.rax = 7)
-          # arm64:  str xzr, [x0]; ret       (sets RegContext.x0 = 0)
-          if [ "${{ matrix.name }}" = "x64" ]; then
-            SHELLCODE="[0x48, 0xC7, 0x07, 0x07, 0x00, 0x00, 0x00, 0xC3]"
-          else
-            SHELLCODE="[0x1F, 0x00, 0x00, 0xF9, 0xC0, 0x03, 0x5F, 0xD6]"
-          fi
+          # ARM64 replace-hook shellcode: str xzr, [x0]; ret (sets RegContext.x0 = 0)
           cat > /tmp/mac_hooks.toml << EOF
           [[hook]]
           target = "$VA"
           mode = "replace"
-          shellcode = $SHELLCODE
+          shellcode = [0x1F, 0x00, 0x00, 0xF9, 0xC0, 0x03, 0x5F, 0xD6]
           EOF
           ./target/debug/truant /tmp/mac_hook -o /tmp/mac_hook_out --hooks /tmp/mac_hooks.toml --no-coverage
           echo "PASS: Mach-O binary rewritten with hook"

@@ -1693,7 +1693,7 @@ fn is_multi_push_prologue(text_bytes: &[u8], off: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AllocEntryKind, ElfContext, find_allocator_symbols};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1713,10 +1713,6 @@ mod tests {
     fn test_func_symbols_non_empty() {
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
-
-        // /usr/bin/true may or may not have symbols, but the parsing should not fail.
-        // If it has a .dynsym, we should get at least some function symbols.
-        // This is mainly checking that the code doesn't crash.
         let _ = ctx.func_symbols.len();
     }
 
@@ -1725,9 +1721,6 @@ mod tests {
     fn test_plt_ranges_detected() {
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
-
-        // Most dynamically linked binaries have a .plt section
-        // But we don't require it — just check parsing doesn't crash
         for plt in &ctx.plt_ranges {
             assert!(plt.size > 0);
         }
@@ -1736,15 +1729,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_find_allocator_symbols_dynamic() {
-        // /usr/bin/true is dynamically linked and uses malloc/free via libc
-        // It may or may not import all allocator functions, but the function
-        // should not crash and should find at least some on most systems.
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
         let syms = find_allocator_symbols(&ctx, &data);
-
-        // Just verify it doesn't crash and returns valid entries.
-        // On most systems /usr/bin/true uses at least malloc from libc.
         if let Some(entry) = syms.get("malloc") {
             assert_eq!(entry.kind, AllocEntryKind::GotPlt);
             assert!(entry.patch_offset > 0);

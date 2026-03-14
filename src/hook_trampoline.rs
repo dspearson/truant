@@ -51,6 +51,25 @@ const SHADOW_SPACE: u8 = 32;
 // ABI-abstraction helpers
 // ---------------------------------------------------------------------------
 
+/// Emit `lea rsp, [rsp - N]` — flags-safe stack allocation.
+fn emit_lea_rsp_sub(code: &mut Vec<u8>, offset: u32) {
+    // LEA RSP, [RSP - disp32]: 48 8D A4 24 <neg-disp32-le>
+    let neg = (-(offset as i32)) as u32;
+    code.extend_from_slice(&[0x48, 0x8D, 0xA4, 0x24]);
+    code.extend_from_slice(&neg.to_le_bytes());
+}
+
+/// Emit `lea rsp, [rsp + N]` — flags-safe stack deallocation.
+///
+/// Unlike `add rsp, N`, `lea` does not modify EFLAGS/RFLAGS. This is critical
+/// when deallocating the RegContext frame after a `popf` that restored flags from
+/// the displaced instructions (post-hook flow).
+fn emit_lea_rsp_add(code: &mut Vec<u8>, offset: u32) {
+    // LEA RSP, [RSP + disp32]: 48 8D A4 24 <disp32-le>
+    code.extend_from_slice(&[0x48, 0x8D, 0xA4, 0x24]);
+    code.extend_from_slice(&offset.to_le_bytes());
+}
+
 /// Emit red zone skip (lea rsp, [rsp - 128] on SysV, NOP on Windows).
 fn emit_red_zone_skip(code: &mut Vec<u8>, windows_abi: bool) {
     if !windows_abi {
@@ -419,8 +438,7 @@ fn generate_x86_64_chained_hook_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 2. Allocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]); // SUB RSP, imm32
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
@@ -486,8 +504,7 @@ fn generate_x86_64_chained_hook_trampoline(
     emit_restore_regs(&mut code);
 
     // 6. Deallocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]); // ADD RSP, imm32
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 7. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -589,8 +606,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 2. Allocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
@@ -635,8 +651,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     emit_restore_regs(&mut code);
 
     // 6. Deallocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]); // ADD RSP, imm32
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 7. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -652,8 +667,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 9. Allocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 10. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
@@ -698,8 +712,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     emit_restore_regs(&mut code);
 
     // 13. Deallocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 14. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -1078,8 +1091,7 @@ fn generate_pre_hook_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 2. Allocate RegContext: sub rsp, 144
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
@@ -1134,8 +1146,7 @@ fn generate_pre_hook_trampoline(
     emit_restore_regs(&mut code);
 
     // 9. Deallocate RegContext: add rsp, 144
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 10. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -1192,8 +1203,7 @@ fn generate_post_hook_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 3. Allocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 4. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
@@ -1248,8 +1258,7 @@ fn generate_post_hook_trampoline(
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 11. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -1295,8 +1304,7 @@ fn generate_replace_hook_trampoline(
     emit_red_zone_skip(&mut code, windows_abi);
 
     // 2. Allocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_sub(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
@@ -1343,8 +1351,7 @@ fn generate_replace_hook_trampoline(
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
-    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-    code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
     // 11. Restore red zone
     emit_red_zone_restore(&mut code, windows_abi);
@@ -1368,9 +1375,8 @@ fn generate_replace_hook_trampoline(
         // Restore all registers
         emit_restore_regs(&mut code);
 
-        // Deallocate RegContext
-        code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-        code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+        // Deallocate RegContext (lea to avoid clobbering flags)
+        emit_lea_rsp_add(&mut code, REG_CONTEXT_SIZE as u32);
 
         // Restore red zone
         emit_red_zone_restore(&mut code, windows_abi);
@@ -1517,9 +1523,9 @@ fn generate_return_hook_trampolines_x86_64(
     // 1. Skip red zone
     emit_red_zone_skip(&mut ret_code, windows_abi);
 
-    // 2. Allocate RegContext: sub rsp, 144
-    ret_code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    ret_code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
+    // 2. Allocate RegContext (lea to avoid clobbering flags)
+    ret_code.extend_from_slice(&[0x48, 0x8D, 0xA4, 0x24]);
+    ret_code.extend_from_slice(&((-(REG_CONTEXT_SIZE as i32)) as u32).to_le_bytes());
 
     // 3. Save all registers
     emit_save_regs(&mut ret_code, hook.target_va, windows_abi);
@@ -1570,8 +1576,9 @@ fn generate_return_hook_trampolines_x86_64(
     // 8. Restore all registers
     emit_restore_regs(&mut ret_code);
 
-    // 9. Deallocate RegContext: add rsp, 144
-    ret_code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+    // 9. Deallocate RegContext (lea to avoid clobbering flags)
+    // LEA RSP, [RSP + 144]
+    ret_code.extend_from_slice(&[0x48, 0x8D, 0xA4, 0x24]);
     ret_code.extend_from_slice(&(REG_CONTEXT_SIZE as u32).to_le_bytes());
 
     // 10. Restore red zone

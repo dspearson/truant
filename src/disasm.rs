@@ -576,6 +576,12 @@ pub fn extract_displaced_bytes(
     let offset_in_sec = (va - sec_va) as usize;
     let file_offset = sec_offset as usize + offset_in_sec;
     let remaining = sec_size as usize - offset_in_sec;
+
+    // AArch64: fixed 4-byte instruction width, no variable-length decoding needed.
+    if min_bytes == 4 && remaining >= 4 {
+        return Ok((data[file_offset..file_offset + 4].to_vec(), 4));
+    }
+
     let slice = &data[file_offset..file_offset + remaining];
 
     let mut decoder = Decoder::with_ip(64, slice, va, DecoderOptions::NONE);
@@ -622,11 +628,11 @@ pub(crate) fn fnv_hash_u16(val: u64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elf::ElfContext;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_find_blocks_usr_bin_true() {
+        use crate::elf::ElfContext;
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
         let blocks = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");

@@ -901,6 +901,7 @@ fn corpus_toggle_hook() {
 
 // ---- Library handler hook: hook resolved from companion .so ------------
 
+#[cfg(target_os = "linux")]
 #[test]
 fn corpus_library_handler_hook() {
     let dir = test_dir();

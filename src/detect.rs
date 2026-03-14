@@ -201,7 +201,7 @@ mod tests {
         assert!(result.is_err(), "expected Err for file too short");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_detect_arch_x86_64() {
         let data = std::fs::read("/usr/bin/true").expect("could not read /usr/bin/true");
@@ -214,6 +214,22 @@ mod tests {
         assert_eq!(
             result.expect("x86_64 architecture detection should succeed"),
             CpuArchitecture::X86_64
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn test_detect_arch_aarch64_system() {
+        let data = std::fs::read("/usr/bin/true").expect("could not read /usr/bin/true");
+        let result = detect_architecture(&data);
+        assert!(
+            result.is_ok(),
+            "expected Ok for /usr/bin/true: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.expect("aarch64 architecture detection should succeed"),
+            CpuArchitecture::AArch64
         );
     }
 

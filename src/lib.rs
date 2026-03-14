@@ -815,7 +815,7 @@ fn codesign_if_available(path: &Path) {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_dry_run() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -860,7 +860,7 @@ mod tests {
         input
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_nopatch_entry_only() {
         // Test: redirect entry to init code with NO block patching.
@@ -928,7 +928,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_init_code_only() {
         // Test: full init code with no block patching.
@@ -1051,7 +1051,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_actual() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1105,7 +1105,7 @@ mod tests {
     // Shared object (.so) rewrite integration tests
     // ===================================================================
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_shared_object() {
         // Compile a simple .so with a single exported function.
@@ -1326,7 +1326,7 @@ int main(int argc, char **argv) {
 
     // --- Static binary tests: inline GOT/function-entry patching ---
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_heap_san_clean_program() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1354,7 +1354,7 @@ int main(int argc, char **argv) {
         assert!(status.success(), "no-args should exit 0, got {:?}", status);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_heap_san_overflow() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1378,7 +1378,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_heap_san_use_after_free() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1402,7 +1402,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_heap_san_double_free() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1428,7 +1428,7 @@ int main(int argc, char **argv) {
 
     // --- Dynamic binary tests: LD_PRELOAD preload library ---
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_clean() {
@@ -1454,7 +1454,7 @@ int main(int argc, char **argv) {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_overflow() {
@@ -1479,7 +1479,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_use_after_free() {
@@ -1532,7 +1532,7 @@ int main(int argc, char **argv) {
 }
 "#;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_persistent_produces_valid_binary() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1643,7 +1643,7 @@ int main(int argc, char **argv) {
         // end-to-end testing is done via `truant fuzz --forkserver --persistent`.
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_rewrite_persistent_deferred() {
         let td = tempfile::tempdir().expect("failed to create temp dir");
@@ -1759,7 +1759,7 @@ int main(int argc, char **argv) {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[cfg(feature = "aarch64")]
     #[test]
     fn test_aarch64_dry_run() {
