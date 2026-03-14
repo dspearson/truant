@@ -852,7 +852,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_generate_sidecar_preload_lib() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("tempdir creation should succeed");
         let output = td.path().join("sidecar_target");
         let so_path = generate_sidecar_preload_lib(&output, false)
             .expect("failed to compile sidecar preload lib");
@@ -873,7 +873,7 @@ mod tests {
 
         // Verify exported symbols.
         let nm_output = std::process::Command::new("nm")
-            .args(["-D", so_path.to_str().unwrap()])
+            .args(["-D", so_path.to_str().expect("path should be valid UTF-8")])
             .output()
             .expect("nm command failed");
         let symbols = String::from_utf8_lossy(&nm_output.stdout);
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn test_sidecar_preload_clean_program() {
         // Compile a small test program and run it under our preload .so.
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("tempdir creation should succeed");
         let src = td.path().join("sidecar_test_clean.c");
         let bin = td.path().join("sidecar_test_clean");
         std::fs::write(
@@ -925,10 +925,14 @@ int main() {
 }
 "#,
         )
-        .unwrap();
+        .expect("writing test source should succeed");
 
         let cc = std::process::Command::new("gcc")
-            .args(["-o", bin.to_str().unwrap(), src.to_str().unwrap()])
+            .args([
+                "-o",
+                bin.to_str().expect("path should be valid UTF-8"),
+                src.to_str().expect("path should be valid UTF-8"),
+            ])
             .status()
             .expect("gcc not available");
         assert!(cc.success());

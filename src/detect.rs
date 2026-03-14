@@ -145,7 +145,10 @@ mod tests {
         data[0..4].copy_from_slice(b"\x7fELF");
         let result = detect_format(&data);
         assert!(result.is_ok(), "expected Ok for ELF magic");
-        assert_eq!(result.unwrap(), BinaryFormat::Elf);
+        assert_eq!(
+            result.expect("ELF format detection should succeed"),
+            BinaryFormat::Elf
+        );
     }
 
     #[test]
@@ -154,7 +157,10 @@ mod tests {
         data[0..4].copy_from_slice(b"\xfe\xed\xfa\xce");
         let result = detect_format(&data);
         assert!(result.is_ok(), "expected Ok for Mach-O LE32 magic");
-        assert_eq!(result.unwrap(), BinaryFormat::MachO);
+        assert_eq!(
+            result.expect("Mach-O LE32 format detection should succeed"),
+            BinaryFormat::MachO
+        );
     }
 
     #[test]
@@ -163,7 +169,10 @@ mod tests {
         data[0..4].copy_from_slice(b"\xfe\xed\xfa\xcf");
         let result = detect_format(&data);
         assert!(result.is_ok(), "expected Ok for Mach-O LE64 magic");
-        assert_eq!(result.unwrap(), BinaryFormat::MachO);
+        assert_eq!(
+            result.expect("Mach-O LE64 format detection should succeed"),
+            BinaryFormat::MachO
+        );
     }
 
     #[test]
@@ -172,7 +181,10 @@ mod tests {
         data[0..4].copy_from_slice(b"\xce\xfa\xed\xfe");
         let result = detect_format(&data);
         assert!(result.is_ok(), "expected Ok for Mach-O BE32 magic");
-        assert_eq!(result.unwrap(), BinaryFormat::MachO);
+        assert_eq!(
+            result.expect("Mach-O BE32 format detection should succeed"),
+            BinaryFormat::MachO
+        );
     }
 
     #[test]
@@ -200,6 +212,9 @@ mod tests {
             "expected Ok for /usr/bin/true: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap(), CpuArchitecture::X86_64);
+        assert_eq!(
+            result.expect("x86_64 architecture detection should succeed"),
+            CpuArchitecture::X86_64
+        );
     }
 }

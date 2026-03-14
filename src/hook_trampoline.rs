@@ -2401,7 +2401,7 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
-        let tramp = result.unwrap();
+        let tramp = result.expect("pre-hook trampoline generation should succeed");
         assert_eq!(tramp.va, 0x600000);
         // Should contain the red zone skip pattern
         assert!(tramp.code.windows(4).any(|w| w == [0x80, 0xFF, 0xFF, 0xFF]));
@@ -2422,7 +2422,7 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
-        let tramp = result.unwrap();
+        let tramp = result.expect("post-hook trampoline generation should succeed");
         // Post-hook: displaced instructions come first (NOPs), then red zone skip
         // First bytes should be the relocated NOPs
         assert_eq!(&tramp.code[0..5], &[0x90, 0x90, 0x90, 0x90, 0x90]);
@@ -2441,7 +2441,7 @@ mod tests {
             None,
         );
         assert!(result.is_ok());
-        let tramp = result.unwrap();
+        let tramp = result.expect("replace-hook trampoline generation should succeed");
         // Replace trampoline should be larger (has original function stub appended)
         assert!(tramp.code.len() > 100);
         // Main flow ends with RET (0xC3), stub ends with JMP rel32 (0xE9).
@@ -2483,7 +2483,7 @@ mod tests {
         let result =
             generate_hook_trampoline(0x600000, &hook, 0x500000, None, TargetAbi::SysV64, None);
         assert!(result.is_ok());
-        let tramp = result.unwrap();
+        let tramp = result.expect("library symbol hook generation should succeed");
         // Should contain mov rax, [rip+disp] (48 8B 05) for indirect call
         assert!(tramp.code.windows(3).any(|w| w == [0x48, 0x8B, 0x05]));
     }
@@ -2509,9 +2509,18 @@ mod tests {
 
     #[test]
     fn test_reg_context_offset_x86_64() {
-        assert_eq!(reg_context_offset_x86_64("rax").unwrap(), 0);
-        assert_eq!(reg_context_offset_x86_64("rdi").unwrap(), 40);
-        assert_eq!(reg_context_offset_x86_64("r15").unwrap(), 120);
+        assert_eq!(
+            reg_context_offset_x86_64("rax").expect("rax is a valid x86_64 register"),
+            0
+        );
+        assert_eq!(
+            reg_context_offset_x86_64("rdi").expect("rdi is a valid x86_64 register"),
+            40
+        );
+        assert_eq!(
+            reg_context_offset_x86_64("r15").expect("r15 is a valid x86_64 register"),
+            120
+        );
         assert!(reg_context_offset_x86_64("x0").is_err());
         assert!(reg_context_offset_x86_64("eax").is_err());
     }
@@ -2524,7 +2533,8 @@ mod tests {
             value: 42,
         };
         let mut code = Vec::new();
-        let fixup_pos = emit_condition_check_x86_64(&mut code, &cond).unwrap();
+        let fixup_pos = emit_condition_check_x86_64(&mut code, &cond)
+            .expect("condition check emission should succeed");
         // Should contain a Jcc (0F 85 = JNE for Eq condition)
         assert!(
             code.windows(2).any(|w| w == [0x0F, 0x85]),
@@ -2542,7 +2552,8 @@ mod tests {
             value: 0x1_0000_0000, // > i32::MAX
         };
         let mut code = Vec::new();
-        let _fixup = emit_condition_check_x86_64(&mut code, &cond).unwrap();
+        let _fixup = emit_condition_check_x86_64(&mut code, &cond)
+            .expect("condition check with large value should succeed");
         // Should contain mov rcx, imm64 (48 B9)
         assert!(
             code.windows(2).any(|w| w == [0x48, 0xB9]),
@@ -2558,7 +2569,8 @@ mod tests {
             value: 0x80, // bit 7
         };
         let mut code = Vec::new();
-        let _fixup = emit_condition_check_x86_64(&mut code, &cond).unwrap();
+        let _fixup = emit_condition_check_x86_64(&mut code, &cond)
+            .expect("condition check for BitSet should succeed");
         // Should contain TEST rax, imm32 (48 A9)
         assert!(
             code.windows(2).any(|w| w == [0x48, 0xA9]),
@@ -2593,7 +2605,7 @@ mod tests {
             "conditional pre-hook failed: {:?}",
             result.err()
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("conditional pre-hook generation should succeed");
         // Should be larger than unconditional (condition check adds bytes)
         let uncond_hook = make_test_hook(HookMode::Pre);
         let uncond = generate_hook_trampoline(
@@ -2604,7 +2616,7 @@ mod tests {
             TargetAbi::SysV64,
             None,
         )
-        .unwrap();
+        .expect("unconditional pre-hook generation should succeed");
         assert!(
             tramp.code.len() > uncond.code.len(),
             "conditional trampoline should be larger: {} vs {}",
@@ -2635,7 +2647,7 @@ mod tests {
             "conditional replace hook failed: {:?}",
             result.err()
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("conditional replace hook generation should succeed");
         // Conditional replace trampoline should be substantially larger
         // (has a fallback path with restore + displaced + JMP)
         let uncond_hook = make_test_hook(HookMode::Replace);
@@ -2647,7 +2659,7 @@ mod tests {
             TargetAbi::SysV64,
             None,
         )
-        .unwrap();
+        .expect("unconditional replace hook generation should succeed");
         assert!(
             tramp.code.len() > uncond.code.len() + 50,
             "conditional replace trampoline should be much larger: {} vs {}",
@@ -2662,7 +2674,7 @@ mod tests {
         // Simulate Jcc at position 6: [0F 8x] at 4-5, rel32 at 6-9
         // Want to skip to position 16
         fixup_condition_skip(&mut code, 6, 16);
-        let rel32 = i32::from_le_bytes(code[6..10].try_into().unwrap());
+        let rel32 = i32::from_le_bytes(code[6..10].try_into().expect("slice is 4 bytes"));
         // rel32 should be 16 - (6 + 4) = 6
         assert_eq!(rel32, 6);
     }
@@ -2679,7 +2691,7 @@ mod tests {
             TargetAbi::SysV64,
             None,
         )
-        .unwrap();
+        .expect("no-toggle trampoline generation should succeed");
         let with_toggle = generate_hook_trampoline(
             0x600000,
             &hook,
@@ -2688,7 +2700,7 @@ mod tests {
             TargetAbi::SysV64,
             Some(0x580000),
         )
-        .unwrap();
+        .expect("toggle trampoline generation should succeed");
         assert!(
             with_toggle.code.len() > no_toggle.code.len(),
             "toggle trampoline ({}) should be larger than no-toggle ({})",
@@ -2736,7 +2748,7 @@ mod tests {
             TargetAbi::SysV64,
             None,
         )
-        .unwrap();
+        .expect("condition-only trampoline generation should succeed");
 
         hook.condition = None;
         let toggle_only = generate_hook_trampoline(
@@ -2747,7 +2759,7 @@ mod tests {
             TargetAbi::SysV64,
             Some(0x580000),
         )
-        .unwrap();
+        .expect("toggle-only trampoline generation should succeed");
 
         hook.condition = Some(HookCondition {
             register: "rdi".to_string(),
@@ -2762,7 +2774,7 @@ mod tests {
             TargetAbi::SysV64,
             Some(0x580000),
         )
-        .unwrap();
+        .expect("toggle+condition trampoline generation should succeed");
 
         assert!(
             both.code.len() > cond_only.code.len(),
@@ -2795,7 +2807,7 @@ mod tests {
             return_slot_va,
         );
         assert!(result.is_ok(), "return hook failed: {:?}", result.err());
-        let (entry, ret_tramp) = result.unwrap();
+        let (entry, ret_tramp) = result.expect("return hook trampoline generation should succeed");
         assert_eq!(entry.va, entry_va);
         assert_eq!(ret_tramp.va, ret_tramp_va);
         // Both should have non-empty code
@@ -2825,7 +2837,7 @@ mod tests {
             None,
             return_slot_va,
         )
-        .unwrap();
+        .expect("return hook entry trampoline generation should succeed");
         // Entry trampoline should start with push rax (0x50)
         assert_eq!(entry.code[0], 0x50, "entry should start with push rax");
         // Entry trampoline should end with JMP rel32 (E9)
@@ -2854,10 +2866,13 @@ mod tests {
             None,
             return_slot_va,
         )
-        .unwrap();
+        .expect("return hook return trampoline generation should succeed");
         // Return trampoline should end with RET (0xC3)
         assert_eq!(
-            *ret_tramp.code.last().unwrap(),
+            *ret_tramp
+                .code
+                .last()
+                .expect("return trampoline code should not be empty"),
             0xC3,
             "return trampoline should end with RET"
         );
@@ -2957,7 +2972,7 @@ mod tests {
             None,
         );
         assert!(result.is_ok(), "PE32 pre-hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 pre-hook trampoline generation should succeed");
         assert_eq!(tramp.va, 0x600000);
         assert!(!tramp.code.is_empty());
         // Should end with JMP rel32 (E9)
@@ -2979,7 +2994,7 @@ mod tests {
             TargetAbi::Win32,
             None,
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 register save hook generation should succeed");
         // Should contain pushfd (0x9C) — 32-bit flags save
         assert!(
             tramp.code.contains(&0x9C),
@@ -3026,7 +3041,7 @@ mod tests {
         };
         let result =
             generate_hook_trampoline(0x600000, &hook, 0x500000, None, TargetAbi::Win32, None);
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 absolute address hook generation should succeed");
         // Should contain mov eax, [moffs32] (0xA1) — absolute address load
         assert!(
             tramp.code.contains(&0xA1),
@@ -3051,7 +3066,7 @@ mod tests {
             None,
         );
         assert!(result.is_ok(), "PE32 post-hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 post-hook trampoline generation should succeed");
         // Post-hook: displaced instructions (NOPs) come first
         assert_eq!(
             &tramp.code[0..5],
@@ -3076,7 +3091,7 @@ mod tests {
             "PE32 replace-hook failed: {:?}",
             result.err()
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 replace-hook trampoline generation should succeed");
         // Replace trampoline should contain RET (0xC3)
         assert!(
             tramp.code.contains(&0xC3),
@@ -3109,14 +3124,18 @@ mod tests {
             "PE32 return hook failed: {:?}",
             result.err()
         );
-        let (entry, ret_tramp) = result.unwrap();
+        let (entry, ret_tramp) =
+            result.expect("PE32 return hook trampoline generation should succeed");
         assert!(!entry.code.is_empty());
         assert!(!ret_tramp.code.is_empty());
         // Entry starts with push eax (0x50)
         assert_eq!(entry.code[0], 0x50, "PE32 entry should start with push eax");
         // Return trampoline ends with RET (0xC3)
         assert_eq!(
-            *ret_tramp.code.last().unwrap(),
+            *ret_tramp
+                .code
+                .last()
+                .expect("PE32 return trampoline code should not be empty"),
             0xC3,
             "PE32 return trampoline should end with RET"
         );
@@ -3124,9 +3143,18 @@ mod tests {
 
     #[test]
     fn test_pe32_reg_context_offsets() {
-        assert_eq!(reg_context_offset_pe32("eax").unwrap(), 28);
-        assert_eq!(reg_context_offset_pe32("edi").unwrap(), 0);
-        assert_eq!(reg_context_offset_pe32("eflags").unwrap(), 36);
+        assert_eq!(
+            reg_context_offset_pe32("eax").expect("eax is a valid PE32 register"),
+            28
+        );
+        assert_eq!(
+            reg_context_offset_pe32("edi").expect("edi is a valid PE32 register"),
+            0
+        );
+        assert_eq!(
+            reg_context_offset_pe32("eflags").expect("eflags is a valid PE32 register"),
+            36
+        );
         assert!(reg_context_offset_pe32("rax").is_err());
         assert!(reg_context_offset_pe32("r8").is_err());
     }
@@ -3142,7 +3170,7 @@ mod tests {
             TargetAbi::Win32,
             None,
         )
-        .unwrap();
+        .expect("PE32 no-toggle trampoline generation should succeed");
         let with_toggle = generate_hook_trampoline(
             0x600000,
             &hook,
@@ -3151,7 +3179,7 @@ mod tests {
             TargetAbi::Win32,
             Some(0x580000),
         )
-        .unwrap();
+        .expect("PE32 toggle trampoline generation should succeed");
         assert!(
             with_toggle.code.len() > no_toggle.code.len(),
             "PE32 toggle trampoline ({}) should be larger than no-toggle ({})",
@@ -3186,7 +3214,7 @@ mod tests {
             "PE32 conditional hook failed: {:?}",
             result.err()
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 conditional hook generation should succeed");
         // Should contain JNE (0F 85) for Eq condition
         assert!(
             tramp.code.windows(2).any(|w| w == [0x0F, 0x85]),
@@ -3214,7 +3242,7 @@ mod tests {
             "PE32 chained hooks failed: {:?}",
             result.err()
         );
-        let tramp = result.unwrap();
+        let tramp = result.expect("PE32 chained hooks generation should succeed");
         assert!(!tramp.code.is_empty());
         // Should contain two call eax sequences (FF D0)
         let call_count = tramp.code.windows(2).filter(|w| *w == [0xFF, 0xD0]).count();

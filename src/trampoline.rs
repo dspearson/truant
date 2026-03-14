@@ -2391,7 +2391,8 @@ mod tests {
 
         assert!(!init.code.is_empty());
         // Should be shorter than the forkserver version
-        let with_fork = generate_init_code(0x700000, 0x6FF000, 0x401000, true, None).unwrap();
+        let with_fork = generate_init_code(0x700000, 0x6FF000, 0x401000, true, None)
+            .expect("init code with forkserver should succeed");
         assert!(init.code.len() < with_fork.code.len());
     }
 
@@ -2611,7 +2612,8 @@ mod tests {
         );
 
         // Should be larger than the no-chain version (has lea rax + jmp rax instead of ret)
-        let no_chain = generate_so_init_code(0x700000, 0x6FF000, None).unwrap();
+        let no_chain = generate_so_init_code(0x700000, 0x6FF000, None)
+            .expect("SO init code without chain should succeed");
         assert!(
             init.code.len() > no_chain.code.len(),
             "chained ({}) should be larger than no-chain ({})",

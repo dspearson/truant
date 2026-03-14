@@ -295,8 +295,8 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Clippy (warnings only, non-blocking)
-        run: cargo clippy 2>&1 || true
+      - name: Clippy
+        run: cargo clippy -- -D warnings
 
       - name: Format check
         run: cargo fmt --check

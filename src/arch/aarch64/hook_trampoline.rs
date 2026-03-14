@@ -649,7 +649,7 @@ fn relocate_displaced_aarch64(bytes: &[u8], orig_va: u64, new_va: u64) -> Result
 
     for i in 0..num_insns {
         let off = i * 4;
-        let raw = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let raw = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("slice is 4 bytes"));
         let insn_orig_va = orig_va + off as u64;
         let insn_new_va = new_va + off as u64;
 
@@ -791,12 +791,11 @@ fn relocate_pc_relative(raw: u32, original_va: u64, new_va: u64) -> Result<u32> 
 
 /// Map an AArch64 register name (x0-x30) to its byte offset in the RegContext.
 fn reg_context_offset_aarch64(reg: &str) -> Result<u32> {
-    if let Some(rest) = reg.strip_prefix('x') {
-        if let Ok(n) = rest.parse::<u32>() {
-            if n <= 30 {
-                return Ok(n * 8);
-            }
-        }
+    if let Some(rest) = reg.strip_prefix('x')
+        && let Ok(n) = rest.parse::<u32>()
+        && n <= 30
+    {
+        return Ok(n * 8);
     }
     anyhow::bail!("unknown AArch64 register '{}'", reg);
 }
@@ -867,7 +866,11 @@ fn fixup_condition_skip_aarch64(code: &mut [u8], fixup_pos: usize, skip_target_o
     let offset_insns = (delta / 4) as i32;
     let new_word = encode_bcond(
         // Preserve the existing condition code from the placeholder
-        u32::from_le_bytes(code[fixup_pos..fixup_pos + 4].try_into().unwrap()) & 0xF,
+        u32::from_le_bytes(
+            code[fixup_pos..fixup_pos + 4]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        ) & 0xF,
         offset_insns,
     );
     code[fixup_pos..fixup_pos + 4].copy_from_slice(&new_word);
@@ -1430,7 +1433,7 @@ mod tests {
         let hook = make_test_hook(HookMode::Pre);
         let result = generate_hook_trampoline(0x200000, &hook, 0x180000, Some(0x1F0000), None);
         assert!(result.is_ok(), "pre-hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("pre-hook trampoline should succeed");
         assert_eq!(tramp.va, 0x200000);
         // Must be multiple of 4 (ARM64 instruction alignment)
         assert_eq!(tramp.code.len() % 4, 0);
@@ -1447,10 +1450,10 @@ mod tests {
         let hook = make_test_hook(HookMode::Post);
         let result = generate_hook_trampoline(0x200000, &hook, 0x180000, Some(0x1F0000), None);
         assert!(result.is_ok(), "post-hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("post-hook trampoline should succeed");
         assert_eq!(tramp.code.len() % 4, 0);
         // Post-hook starts with displaced NOP instruction
-        let first_word = u32::from_le_bytes(tramp.code[0..4].try_into().unwrap());
+        let first_word = u32::from_le_bytes(tramp.code[0..4].try_into().expect("slice is 4 bytes"));
         // The relocated NOP should still be a NOP (not PC-relative)
         assert_eq!(first_word, 0xD503_201F, "first instruction should be NOP");
     }
@@ -1460,7 +1463,7 @@ mod tests {
         let hook = make_test_hook(HookMode::Replace);
         let result = generate_hook_trampoline(0x200000, &hook, 0x180000, Some(0x1F0000), None);
         assert!(result.is_ok(), "replace-hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("replace-hook trampoline should succeed");
         assert_eq!(tramp.code.len() % 4, 0);
         // Replace trampoline is larger (has original function stub appended)
         assert!(
@@ -1472,7 +1475,8 @@ mod tests {
         let b_count = (0..tramp.code.len())
             .step_by(4)
             .filter(|&i| {
-                let w = u32::from_le_bytes(tramp.code[i..i + 4].try_into().unwrap());
+                let w =
+                    u32::from_le_bytes(tramp.code[i..i + 4].try_into().expect("slice is 4 bytes"));
                 (w & 0xFC00_0000) == 0x1400_0000 // B opcode
             })
             .count();
@@ -1508,10 +1512,10 @@ mod tests {
         };
         let result = generate_hook_trampoline(0x200000, &hook, 0x180000, None, None);
         assert!(result.is_ok(), "library hook failed: {:?}", result.err());
-        let tramp = result.unwrap();
+        let tramp = result.expect("library hook trampoline should succeed");
         // Should contain BLR x16 somewhere: 0xD63F0200
         let has_blr = (0..tramp.code.len()).step_by(4).any(|i| {
-            let w = u32::from_le_bytes(tramp.code[i..i + 4].try_into().unwrap());
+            let w = u32::from_le_bytes(tramp.code[i..i + 4].try_into().expect("slice is 4 bytes"));
             w == 0xD63F_0200 // BLR x16
         });
         assert!(has_blr, "expected BLR x16 in trampoline");
@@ -1521,7 +1525,8 @@ mod tests {
     fn test_relocate_nop() {
         // NOP is not PC-relative, should be unchanged
         let nop = vec![0x1F, 0x20, 0x03, 0xD5];
-        let result = relocate_displaced_aarch64(&nop, 0x1000, 0x2000).unwrap();
+        let result = relocate_displaced_aarch64(&nop, 0x1000, 0x2000)
+            .expect("NOP relocation should succeed");
         assert_eq!(result, nop);
     }
 
@@ -1532,8 +1537,9 @@ mod tests {
         let b_insn = 0x1400_0040u32.to_le_bytes().to_vec();
         // Relocate to VA 0x2000 → new offset = 0x1100 - 0x2000 = -0xF00
         // imm26 = -0xF00/4 = -0x3C0 → 0x14 | (-0x3C0 & 0x3FFFFFF) = 0x17FFFC40
-        let result = relocate_displaced_aarch64(&b_insn, 0x1000, 0x2000).unwrap();
-        let relocated = u32::from_le_bytes(result[0..4].try_into().unwrap());
+        let result = relocate_displaced_aarch64(&b_insn, 0x1000, 0x2000)
+            .expect("B relocation should succeed");
+        let relocated = u32::from_le_bytes(result[0..4].try_into().expect("slice is 4 bytes"));
         // Verify it's still a B instruction
         assert_eq!(relocated & 0xFC00_0000, 0x1400_0000);
         // Verify target: new_va(0x2000) + imm26*4 should == 0x1100
@@ -1563,7 +1569,7 @@ mod tests {
             "AArch64 return hook failed: {:?}",
             result.err()
         );
-        let (entry, ret_tramp) = result.unwrap();
+        let (entry, ret_tramp) = result.expect("return hook should generate two trampolines");
         assert_eq!(entry.va, entry_va);
         assert_eq!(ret_tramp.va, ret_tramp_va);
         // ARM64 instructions must be 4-byte aligned
@@ -1593,9 +1599,13 @@ mod tests {
             None,
             return_slot_va,
         )
-        .unwrap();
+        .expect("return hook entry trampoline should succeed");
         // Last instruction should be B (unconditional branch)
-        let last_word = u32::from_le_bytes(entry.code[entry.code.len() - 4..].try_into().unwrap());
+        let last_word = u32::from_le_bytes(
+            entry.code[entry.code.len() - 4..]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
         assert_eq!(
             last_word & 0xFC00_0000,
             0x1400_0000,
@@ -1619,12 +1629,12 @@ mod tests {
             None,
             return_slot_va,
         )
-        .unwrap();
+        .expect("return hook return trampoline should succeed");
         // Last instruction should be BR x16 (0xD61F0200)
         let last_word = u32::from_le_bytes(
             ret_tramp.code[ret_tramp.code.len() - 4..]
                 .try_into()
-                .unwrap(),
+                .expect("slice is 4 bytes"),
         );
         assert_eq!(
             last_word, 0xD61F_0200,

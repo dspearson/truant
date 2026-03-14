@@ -140,7 +140,7 @@ impl MachOContext {
         }
 
         // Determine endianness and bitness from magic
-        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let magic = u32::from_le_bytes(data[0..4].try_into().expect("slice is 4 bytes"));
         let (is_64bit, is_big_endian) = match magic {
             MH_MAGIC_64 => (true, false),
             MH_CIGAM_64 => (true, true),
@@ -157,12 +157,12 @@ impl MachOContext {
         }
 
         // Parse mach_header_64 (32 bytes)
-        let cputype = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let _cpusubtype = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        let filetype = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        let ncmds = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let sizeofcmds = u32::from_le_bytes(data[20..24].try_into().unwrap());
-        let _flags = u32::from_le_bytes(data[24..28].try_into().unwrap());
+        let cputype = u32::from_le_bytes(data[4..8].try_into().expect("slice is 4 bytes"));
+        let _cpusubtype = u32::from_le_bytes(data[8..12].try_into().expect("slice is 4 bytes"));
+        let filetype = u32::from_le_bytes(data[12..16].try_into().expect("slice is 4 bytes"));
+        let ncmds = u32::from_le_bytes(data[16..20].try_into().expect("slice is 4 bytes"));
+        let sizeofcmds = u32::from_le_bytes(data[20..24].try_into().expect("slice is 4 bytes"));
+        let _flags = u32::from_le_bytes(data[24..28].try_into().expect("slice is 4 bytes"));
         // reserved at 28..32
 
         let header_size: usize = 32; // sizeof(mach_header_64)
@@ -213,8 +213,16 @@ impl MachOContext {
             if offset + 8 > data.len() {
                 break;
             }
-            let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cmdsize = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+            let cmd = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let cmdsize = u32::from_le_bytes(
+                data[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
 
             if cmdsize < 8 || offset + cmdsize as usize > data.len() {
                 break;
@@ -234,16 +242,31 @@ impl MachOContext {
                     .unwrap_or("")
                     .to_string();
 
-                    let vmaddr =
-                        u64::from_le_bytes(data[offset + 24..offset + 32].try_into().unwrap());
-                    let vmsize =
-                        u64::from_le_bytes(data[offset + 32..offset + 40].try_into().unwrap());
-                    let fileoff =
-                        u64::from_le_bytes(data[offset + 40..offset + 48].try_into().unwrap());
-                    let filesize =
-                        u64::from_le_bytes(data[offset + 48..offset + 56].try_into().unwrap());
-                    let nsects =
-                        u32::from_le_bytes(data[offset + 64..offset + 68].try_into().unwrap());
+                    let vmaddr = u64::from_le_bytes(
+                        data[offset + 24..offset + 32]
+                            .try_into()
+                            .expect("slice is 8 bytes"),
+                    );
+                    let vmsize = u64::from_le_bytes(
+                        data[offset + 32..offset + 40]
+                            .try_into()
+                            .expect("slice is 8 bytes"),
+                    );
+                    let fileoff = u64::from_le_bytes(
+                        data[offset + 40..offset + 48]
+                            .try_into()
+                            .expect("slice is 8 bytes"),
+                    );
+                    let filesize = u64::from_le_bytes(
+                        data[offset + 48..offset + 56]
+                            .try_into()
+                            .expect("slice is 8 bytes"),
+                    );
+                    let nsects = u32::from_le_bytes(
+                        data[offset + 64..offset + 68]
+                            .try_into()
+                            .expect("slice is 4 bytes"),
+                    );
 
                     let va_end = vmaddr + vmsize;
                     if va_end > highest_va_end {
@@ -293,13 +316,19 @@ impl MachOContext {
                         .to_string();
 
                         let sect_addr = u64::from_le_bytes(
-                            data[sect_off + 32..sect_off + 40].try_into().unwrap(),
+                            data[sect_off + 32..sect_off + 40]
+                                .try_into()
+                                .expect("slice is 8 bytes"),
                         );
                         let sect_size = u64::from_le_bytes(
-                            data[sect_off + 40..sect_off + 48].try_into().unwrap(),
+                            data[sect_off + 40..sect_off + 48]
+                                .try_into()
+                                .expect("slice is 8 bytes"),
                         );
                         let sect_offset = u32::from_le_bytes(
-                            data[sect_off + 48..sect_off + 52].try_into().unwrap(),
+                            data[sect_off + 48..sect_off + 52]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
                         );
 
                         // Track first section file offset for LC space calculation
@@ -340,8 +369,9 @@ impl MachOContext {
                             if ptr_end <= data.len() {
                                 let mut p = ptr_start;
                                 while p + 8 <= ptr_end {
-                                    let ptr_val =
-                                        u64::from_le_bytes(data[p..p + 8].try_into().unwrap());
+                                    let ptr_val = u64::from_le_bytes(
+                                        data[p..p + 8].try_into().expect("slice is 8 bytes"),
+                                    );
                                     if ptr_val != 0 {
                                         mod_init_func_pointers.push(ptr_val);
                                     }
@@ -365,8 +395,9 @@ impl MachOContext {
                             if off_end <= data.len() {
                                 let mut p = off_start;
                                 while p + 4 <= off_end {
-                                    let offset32 =
-                                        u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+                                    let offset32 = u32::from_le_bytes(
+                                        data[p..p + 4].try_into().expect("slice is 4 bytes"),
+                                    );
                                     if offset32 != 0 {
                                         let abs_va = text_segment_vmaddr + offset32 as u64;
                                         mod_init_func_pointers.push(abs_va);
@@ -382,21 +413,36 @@ impl MachOContext {
 
                 LC_SYMTAB => {
                     if cmdsize >= 24 {
-                        symtab_offset =
-                            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
-                        symtab_nsyms =
-                            u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap());
-                        strtab_offset =
-                            u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap());
-                        _strtab_size =
-                            u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap());
+                        symtab_offset = u32::from_le_bytes(
+                            data[offset + 8..offset + 12]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
+                        symtab_nsyms = u32::from_le_bytes(
+                            data[offset + 12..offset + 16]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
+                        strtab_offset = u32::from_le_bytes(
+                            data[offset + 16..offset + 20]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
+                        _strtab_size = u32::from_le_bytes(
+                            data[offset + 20..offset + 24]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
                     }
                 }
 
                 LC_MAIN => {
                     if cmdsize >= 24 {
-                        let entryoff =
-                            u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+                        let entryoff = u64::from_le_bytes(
+                            data[offset + 8..offset + 16]
+                                .try_into()
+                                .expect("slice is 8 bytes"),
+                        );
                         // entryoff is relative to __TEXT segment vmaddr
                         entry_point = text_segment_vmaddr + entryoff;
                         lc_main_entryoff_offset = Some(offset as u64 + 8);
@@ -408,15 +454,20 @@ impl MachOContext {
                     // x86_64: flavor=4, count=42, state starts at offset+16, RIP at state+128 (=offset+144)
                     // ARM64: flavor=6, count=68, state starts at offset+16, PC at state+256 (=offset+272)
                     if cmdsize >= 16 {
-                        let flavor =
-                            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
+                        let flavor = u32::from_le_bytes(
+                            data[offset + 8..offset + 12]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
                         match cputype {
                             CPU_TYPE_X86_64 => {
                                 // x86_THREAD_STATE64: flavor=4
                                 if flavor == 4 && cmdsize >= 152 {
                                     // RIP is at offset 16 (state start) + 128 = 144 from LC start
                                     let rip = u64::from_le_bytes(
-                                        data[offset + 144..offset + 152].try_into().unwrap(),
+                                        data[offset + 144..offset + 152]
+                                            .try_into()
+                                            .expect("slice is 8 bytes"),
                                     );
                                     entry_point = rip;
                                     lc_unixthread_pc_offset = Some(offset as u64 + 144);
@@ -427,7 +478,9 @@ impl MachOContext {
                                 if flavor == 6 && cmdsize >= 280 {
                                     // PC is at offset 16 (state start) + 256 = 272 from LC start
                                     let pc = u64::from_le_bytes(
-                                        data[offset + 272..offset + 280].try_into().unwrap(),
+                                        data[offset + 272..offset + 280]
+                                            .try_into()
+                                            .expect("slice is 8 bytes"),
                                     );
                                     entry_point = pc;
                                     lc_unixthread_pc_offset = Some(offset as u64 + 272);
@@ -446,10 +499,16 @@ impl MachOContext {
                 LC_DYLD_CHAINED_FIXUPS => {
                     if cmdsize >= 16 {
                         chained_fixups_lc_offset = Some(offset as u64);
-                        chained_fixups_dataoff =
-                            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
-                        chained_fixups_datasize =
-                            u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap());
+                        chained_fixups_dataoff = u32::from_le_bytes(
+                            data[offset + 8..offset + 12]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
+                        chained_fixups_datasize = u32::from_le_bytes(
+                            data[offset + 12..offset + 16]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        );
                     }
                 }
 
@@ -460,9 +519,11 @@ impl MachOContext {
                     dylib_ordinal += 1;
                     // dylib_command: name is at offset 8+name_off from LC start (name_off at offset+8)
                     if cmdsize >= 16 {
-                        let name_off =
-                            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap())
-                                as usize;
+                        let name_off = u32::from_le_bytes(
+                            data[offset + 8..offset + 12]
+                                .try_into()
+                                .expect("slice is 4 bytes"),
+                        ) as usize;
                         let name_start = offset + name_off;
                         if name_start < offset + cmdsize as usize && name_start < data.len() {
                             let name_end = data[name_start..offset + cmdsize as usize]
@@ -490,17 +551,17 @@ impl MachOContext {
 
         // If LC_MAIN was encountered before __TEXT segment, re-calculate entry point
         // (LC_MAIN may appear before LC_SEGMENT_64 for __TEXT in some linker outputs)
-        if let Some(entryoff_offset) = lc_main_entryoff_offset {
-            if text_segment_vmaddr > 0 {
-                let entryoff_file_pos = entryoff_offset as usize;
-                if entryoff_file_pos + 8 <= data.len() {
-                    let entryoff = u64::from_le_bytes(
-                        data[entryoff_file_pos..entryoff_file_pos + 8]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    entry_point = text_segment_vmaddr + entryoff;
-                }
+        if let Some(entryoff_offset) = lc_main_entryoff_offset
+            && text_segment_vmaddr > 0
+        {
+            let entryoff_file_pos = entryoff_offset as usize;
+            if entryoff_file_pos + 8 <= data.len() {
+                let entryoff = u64::from_le_bytes(
+                    data[entryoff_file_pos..entryoff_file_pos + 8]
+                        .try_into()
+                        .expect("slice is 8 bytes"),
+                );
+                entry_point = text_segment_vmaddr + entryoff;
             }
         }
 
@@ -576,7 +637,11 @@ fn parse_nlist_func_symbols(
 
         // nlist_64: n_strx(4) n_type(1) n_sect(1) n_desc(2) n_value(8)
         let n_type = data[off + 4];
-        let n_value = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        let n_value = u64::from_le_bytes(
+            data[off + 8..off + 16]
+                .try_into()
+                .expect("slice is 8 bytes"),
+        );
 
         // N_TYPE mask: 0x0E. N_SECT = 0x0E means symbol is defined in a section.
         // N_EXT (0x01) = external symbol.
@@ -668,17 +733,41 @@ pub fn find_allocator_symbols_macho(
         if offset + 8 > data.len() {
             break;
         }
-        let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let cmdsize = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+        let cmd = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
+        let cmdsize = u32::from_le_bytes(
+            data[offset + 4..offset + 8]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
         if cmdsize < 8 || offset + cmdsize as usize > data.len() {
             break;
         }
 
         if cmd == 0x02 /* LC_SYMTAB */ && cmdsize >= 24 {
-            symtab_off = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
-            symtab_nsyms = u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap());
-            strtab_off = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap());
-            strtab_sz = u32::from_le_bytes(data[offset + 20..offset + 24].try_into().unwrap());
+            symtab_off = u32::from_le_bytes(
+                data[offset + 8..offset + 12]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            symtab_nsyms = u32::from_le_bytes(
+                data[offset + 12..offset + 16]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            strtab_off = u32::from_le_bytes(
+                data[offset + 16..offset + 20]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            strtab_sz = u32::from_le_bytes(
+                data[offset + 20..offset + 24]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
             break;
         }
         offset += cmdsize as usize;
@@ -705,9 +794,13 @@ pub fn find_allocator_symbols_macho(
         }
 
         // nlist_64: n_strx(4) n_type(1) n_sect(1) n_desc(2) n_value(8)
-        let n_strx = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        let n_strx = u32::from_le_bytes(data[off..off + 4].try_into().expect("slice is 4 bytes"));
         let n_type = data[off + 4];
-        let n_value = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        let n_value = u64::from_le_bytes(
+            data[off + 8..off + 16]
+                .try_into()
+                .expect("slice is 8 bytes"),
+        );
 
         // N_SECT (0x0E) means defined in a section; skip undefined/external-only symbols.
         let n_type_masked = n_type & 0x0E;
@@ -863,7 +956,7 @@ mod tests {
     #[test]
     fn test_va_to_file_offset() {
         let data = build_minimal_macho();
-        let ctx = MachOContext::parse(&data).unwrap();
+        let ctx = MachOContext::parse(&data).expect("failed to parse minimal Mach-O");
 
         // VA in __text section
         let off = va_to_file_offset_macho(0x100000800, &ctx);
@@ -938,7 +1031,7 @@ mod tests {
     #[test]
     fn test_available_lc_space() {
         let data = build_minimal_macho();
-        let ctx = MachOContext::parse(&data).unwrap();
+        let ctx = MachOContext::parse(&data).expect("failed to parse minimal Mach-O");
 
         // first_section_offset = 0x800 (__text), lc_end = header + sizeofcmds
         // available = 0x800 - lc_end

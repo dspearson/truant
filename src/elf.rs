@@ -327,7 +327,7 @@ fn find_dt_init(elf: &Elf, data: &[u8]) -> (Option<u64>, Option<u64>, Option<u64
         let end = (off + sz).min(data.len());
         let mut pos = off;
         while pos + 16 <= end {
-            let tag = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let tag = i64::from_le_bytes(data[pos..pos + 8].try_into().expect("slice is 8 bytes"));
             if tag == goblin::elf::dynamic::DT_NULL as i64 {
                 dt_null_count += 1;
                 if first_dt_null_offset.is_none() {
@@ -685,23 +685,23 @@ fn scan_for_allocators(
     for &(xref_va, name) in &xrefs {
         // Inner helper functions — record for caller analysis, don't use directly.
         if name == "free_inner" {
-            if free_inner_va.is_none() {
-                if let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va) {
-                    tracing::debug!("string xref scan: _int_free (inner) at VA 0x{:x}", func_va);
-                    free_inner_va = Some(func_va);
-                }
+            if free_inner_va.is_none()
+                && let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va)
+            {
+                tracing::debug!("string xref scan: _int_free (inner) at VA 0x{:x}", func_va);
+                free_inner_va = Some(func_va);
             }
             continue;
         }
         if name == "memalign_inner" {
-            if memalign_inner_va.is_none() {
-                if let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va) {
-                    tracing::debug!(
-                        "string xref scan: _mid_memalign (inner) at VA 0x{:x}",
-                        func_va
-                    );
-                    memalign_inner_va = Some(func_va);
-                }
+            if memalign_inner_va.is_none()
+                && let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va)
+            {
+                tracing::debug!(
+                    "string xref scan: _mid_memalign (inner) at VA 0x{:x}",
+                    func_va
+                );
+                memalign_inner_va = Some(func_va);
             }
             continue;
         }
@@ -715,23 +715,23 @@ fn scan_for_allocators(
             continue; // Already found this allocator.
         }
 
-        if let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va) {
-            if let Some(file_off) = va_to_file_offset(loads, func_va) {
-                tracing::debug!(
-                    "string xref scan: {} at VA 0x{:x} (file offset 0x{:x})",
-                    name,
-                    func_va,
-                    file_off
-                );
-                syms.entries.insert(
-                    target_name,
-                    AllocEntry {
-                        patch_offset: file_off,
-                        patch_va: func_va,
-                        kind: AllocEntryKind::FuncEntry,
-                    },
-                );
-            }
+        if let Some(func_va) = find_function_start_backward(text_bytes, text.va, xref_va)
+            && let Some(file_off) = va_to_file_offset(loads, func_va)
+        {
+            tracing::debug!(
+                "string xref scan: {} at VA 0x{:x} (file offset 0x{:x})",
+                name,
+                func_va,
+                file_off
+            );
+            syms.entries.insert(
+                target_name,
+                AllocEntry {
+                    patch_offset: file_off,
+                    patch_va: func_va,
+                    kind: AllocEntryKind::FuncEntry,
+                },
+            );
         }
     }
 
@@ -739,12 +739,11 @@ fn scan_for_allocators(
     //
     // If free wasn't found via __libc_free assertion string but we located _int_free,
     // find __libc_free by searching for callers that match the free(void*) pattern.
-    if !syms.entries.contains_key("free") {
-        if let Some(inner_va) = free_inner_va {
-            if let Some(entry) = find_free_via_caller(data, text, loads, inner_va) {
-                syms.entries.insert("free", entry);
-            }
-        }
+    if !syms.entries.contains_key("free")
+        && let Some(inner_va) = free_inner_va
+        && let Some(entry) = find_free_via_caller(data, text, loads, inner_va)
+    {
+        syms.entries.insert("free", entry);
     }
 
     // If memalign wasn't found via direct assertion but we located _mid_memalign,
@@ -753,24 +752,24 @@ fn scan_for_allocators(
     // and inlined into __libc_memalign), use _mid_memalign itself — patching at its
     // entry catches all aligned allocation paths (memalign, aligned_alloc, valloc,
     // pvalloc, posix_memalign). The extra `address` arg in rdx is harmlessly ignored.
-    if !syms.entries.contains_key("memalign") {
-        if let Some(inner_va) = memalign_inner_va {
-            if let Some(entry) = find_memalign_via_caller(data, text, loads, inner_va) {
-                syms.entries.insert("memalign", entry);
-            } else if let Some(file_off) = va_to_file_offset(loads, inner_va) {
-                tracing::debug!(
-                    "string xref scan: using _mid_memalign directly at VA 0x{:x} (inlined into __libc_memalign)",
-                    inner_va
-                );
-                syms.entries.insert(
-                    "memalign",
-                    AllocEntry {
-                        patch_offset: file_off,
-                        patch_va: inner_va,
-                        kind: AllocEntryKind::FuncEntry,
-                    },
-                );
-            }
+    if !syms.entries.contains_key("memalign")
+        && let Some(inner_va) = memalign_inner_va
+    {
+        if let Some(entry) = find_memalign_via_caller(data, text, loads, inner_va) {
+            syms.entries.insert("memalign", entry);
+        } else if let Some(file_off) = va_to_file_offset(loads, inner_va) {
+            tracing::debug!(
+                "string xref scan: using _mid_memalign directly at VA 0x{:x} (inlined into __libc_memalign)",
+                inner_va
+            );
+            syms.entries.insert(
+                "memalign",
+                AllocEntry {
+                    patch_offset: file_off,
+                    patch_va: inner_va,
+                    kind: AllocEntryKind::FuncEntry,
+                },
+            );
         }
     }
 
@@ -1234,7 +1233,11 @@ fn scan_for_musl_allocators(
             continue;
         }
 
-        let rel32 = i32::from_le_bytes(text_bytes[off + 1..off + 5].try_into().unwrap());
+        let rel32 = i32::from_le_bytes(
+            text_bytes[off + 1..off + 5]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
         let target = (candidate_va as i64 + 5 + rel32 as i64) as u64;
 
         // Verify: target starts with `test rdi, rdi` (48 85 FF).
@@ -1548,10 +1551,10 @@ fn find_function_start_backward(text_bytes: &[u8], text_va: u64, xref_va: u64) -
     while pos > scan_start {
         pos -= 1;
 
-        if let Some(limit) = extend_limit {
-            if pos < limit {
-                break;
-            }
+        if let Some(limit) = extend_limit
+            && pos < limit
+        {
+            break;
         }
 
         let is_candidate = is_endbr64(text_bytes, pos) || is_multi_push_prologue(text_bytes, pos);

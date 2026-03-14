@@ -18,7 +18,7 @@ pub fn is_fat_binary(data: &[u8]) -> bool {
     if data.len() < 8 {
         return false;
     }
-    let magic = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let magic = u32::from_be_bytes(data[0..4].try_into().expect("slice is 4 bytes"));
     magic == 0xCAFEBABE || magic == 0xCAFEBABF
 }
 
@@ -27,9 +27,9 @@ fn parse_fat_header(data: &[u8]) -> Result<Vec<FatSlice>> {
     if data.len() < 8 {
         bail!("fat binary too short");
     }
-    let magic = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let magic = u32::from_be_bytes(data[0..4].try_into().expect("slice is 4 bytes"));
     let is_64 = magic == 0xCAFEBABF;
-    let nfat_arch = u32::from_be_bytes(data[4..8].try_into().unwrap());
+    let nfat_arch = u32::from_be_bytes(data[4..8].try_into().expect("slice is 4 bytes"));
 
     if nfat_arch == 0 || nfat_arch > 16 {
         bail!("invalid fat_header nfat_arch: {}", nfat_arch);
@@ -44,13 +44,31 @@ fn parse_fat_header(data: &[u8]) -> Result<Vec<FatSlice>> {
             if offset + 32 > data.len() {
                 bail!("fat binary truncated in fat_arch_64 entries");
             }
-            let cpu_type = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cpu_subtype = u32::from_be_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-            let slice_offset =
-                u64::from_be_bytes(data[offset + 8..offset + 16].try_into().unwrap()) as usize;
-            let slice_size =
-                u64::from_be_bytes(data[offset + 16..offset + 24].try_into().unwrap()) as usize;
-            let align = u32::from_be_bytes(data[offset + 24..offset + 28].try_into().unwrap());
+            let cpu_type = u32::from_be_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let cpu_subtype = u32::from_be_bytes(
+                data[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let slice_offset = u64::from_be_bytes(
+                data[offset + 8..offset + 16]
+                    .try_into()
+                    .expect("slice is 8 bytes"),
+            ) as usize;
+            let slice_size = u64::from_be_bytes(
+                data[offset + 16..offset + 24]
+                    .try_into()
+                    .expect("slice is 8 bytes"),
+            ) as usize;
+            let align = u32::from_be_bytes(
+                data[offset + 24..offset + 28]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
             slices.push(FatSlice {
                 cpu_type,
                 cpu_subtype,
@@ -64,13 +82,31 @@ fn parse_fat_header(data: &[u8]) -> Result<Vec<FatSlice>> {
             if offset + 20 > data.len() {
                 bail!("fat binary truncated in fat_arch entries");
             }
-            let cpu_type = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cpu_subtype = u32::from_be_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-            let slice_offset =
-                u32::from_be_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
-            let slice_size =
-                u32::from_be_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
-            let align = u32::from_be_bytes(data[offset + 16..offset + 20].try_into().unwrap());
+            let cpu_type = u32::from_be_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let cpu_subtype = u32::from_be_bytes(
+                data[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let slice_offset = u32::from_be_bytes(
+                data[offset + 8..offset + 12]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            ) as usize;
+            let slice_size = u32::from_be_bytes(
+                data[offset + 12..offset + 16]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            ) as usize;
+            let align = u32::from_be_bytes(
+                data[offset + 16..offset + 20]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
             slices.push(FatSlice {
                 cpu_type,
                 cpu_subtype,
@@ -282,7 +318,7 @@ mod tests {
         // align
         data[24..28].copy_from_slice(&14u32.to_be_bytes());
 
-        let slices = parse_fat_header(&data).unwrap();
+        let slices = parse_fat_header(&data).expect("fat header should parse successfully");
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].cpu_type, 0x01000007);
         assert_eq!(slices[0].offset, 28);

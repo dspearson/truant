@@ -1742,7 +1742,7 @@ pub fn generate_macho_dylib_init_aarch64(
     ];
     for &pos in &done_targets {
         // Read existing cond from the placeholder
-        let existing = u32::from_le_bytes(code[pos..pos + 4].try_into().unwrap());
+        let existing = u32::from_le_bytes(code[pos..pos + 4].try_into().expect("slice is 4 bytes"));
         let cond = existing & 0xF;
         patch_b_cond(&mut code, pos, (done as i64 - pos as i64) as i32, cond);
     }
@@ -3088,8 +3088,8 @@ mod tests {
 
     #[test]
     fn test_exec_init_code_size() {
-        let code =
-            generate_macho_exec_init_x86_64(0x200000, 0x100000, 0x100800, false, false).unwrap();
+        let code = generate_macho_exec_init_x86_64(0x200000, 0x100000, 0x100800, false, false)
+            .expect("exec init x86_64 should succeed");
         assert!(!code.code.is_empty());
         assert!(
             code.code.len() < 1024,
@@ -3101,8 +3101,8 @@ mod tests {
 
     #[test]
     fn test_exec_init_with_forkserver() {
-        let code =
-            generate_macho_exec_init_x86_64(0x200000, 0x100000, 0x100800, true, false).unwrap();
+        let code = generate_macho_exec_init_x86_64(0x200000, 0x100000, 0x100800, true, false)
+            .expect("exec init x86_64 with forkserver should succeed");
         assert!(!code.code.is_empty());
         // Forkserver adds ~200 bytes
         assert!(code.code.len() > 100);
@@ -3110,7 +3110,8 @@ mod tests {
 
     #[test]
     fn test_dylib_init_code_size() {
-        let code = generate_macho_dylib_init_x86_64(0x200000, 0x100000, None, false).unwrap();
+        let code = generate_macho_dylib_init_x86_64(0x200000, 0x100000, None, false)
+            .expect("dylib init x86_64 should succeed");
         assert!(!code.code.is_empty());
         assert!(
             code.code.len() < 2048,
@@ -3121,8 +3122,8 @@ mod tests {
 
     #[test]
     fn test_dylib_init_with_chain() {
-        let code =
-            generate_macho_dylib_init_x86_64(0x200000, 0x100000, Some(0x150000), false).unwrap();
+        let code = generate_macho_dylib_init_x86_64(0x200000, 0x100000, Some(0x150000), false)
+            .expect("dylib init x86_64 with chain should succeed");
         assert!(!code.code.is_empty());
         // Should end with a JMP to the chain target, not RET
         let last5 = &code.code[code.code.len() - 5..];
@@ -3133,7 +3134,7 @@ mod tests {
     fn test_unixthread_init_code_size() {
         let code =
             generate_macho_unixthread_init_x86_64(0x200000, 0x100000, 0x100800, false, false)
-                .unwrap();
+                .expect("unixthread init x86_64 should succeed");
         assert!(!code.code.is_empty());
         assert!(code.code.len() < 1024);
     }
@@ -3148,8 +3149,8 @@ mod tests {
 
     #[test]
     fn test_aarch64_exec_init_code_size() {
-        let code =
-            generate_macho_exec_init_aarch64(0x200000, 0x100000, 0x100800, false, false).unwrap();
+        let code = generate_macho_exec_init_aarch64(0x200000, 0x100000, 0x100800, false, false)
+            .expect("aarch64 exec init should succeed");
         assert!(!code.code.is_empty());
         assert!(
             code.code.len() < 2048,
@@ -3163,8 +3164,8 @@ mod tests {
 
     #[test]
     fn test_aarch64_exec_init_with_forkserver() {
-        let code =
-            generate_macho_exec_init_aarch64(0x200000, 0x100000, 0x100800, true, false).unwrap();
+        let code = generate_macho_exec_init_aarch64(0x200000, 0x100000, 0x100800, true, false)
+            .expect("aarch64 exec init with forkserver should succeed");
         assert!(!code.code.is_empty());
         assert!(code.code.len() > 200);
         assert_eq!(code.code.len() % 4, 0);
@@ -3172,7 +3173,8 @@ mod tests {
 
     #[test]
     fn test_aarch64_dylib_init_code_size() {
-        let code = generate_macho_dylib_init_aarch64(0x200000, 0x100000, None, false).unwrap();
+        let code = generate_macho_dylib_init_aarch64(0x200000, 0x100000, None, false)
+            .expect("aarch64 dylib init should succeed");
         assert!(!code.code.is_empty());
         assert!(
             code.code.len() < 4096,
@@ -3184,15 +3186,16 @@ mod tests {
 
     #[test]
     fn test_aarch64_dylib_init_with_chain() {
-        let code =
-            generate_macho_dylib_init_aarch64(0x200000, 0x100000, Some(0x150000), false).unwrap();
+        let code = generate_macho_dylib_init_aarch64(0x200000, 0x100000, Some(0x150000), false)
+            .expect("aarch64 dylib init with chain should succeed");
         assert!(!code.code.is_empty());
         assert_eq!(code.code.len() % 4, 0);
         // Should contain a B to chain target (before the literal pool at the end)
         // Scan backwards from the literal pool to find the B instruction
         let mut found_b = false;
         for i in (0..code.code.len()).step_by(4).rev() {
-            let instr = u32::from_le_bytes(code.code[i..i + 4].try_into().unwrap());
+            let instr =
+                u32::from_le_bytes(code.code[i..i + 4].try_into().expect("slice is 4 bytes"));
             if instr & 0xFC000000 == 0x14000000 && instr != 0x14000000 {
                 found_b = true;
                 break;
@@ -3205,7 +3208,7 @@ mod tests {
     fn test_aarch64_unixthread_init_code_size() {
         let code =
             generate_macho_unixthread_init_aarch64(0x200000, 0x100000, 0x100800, false, false)
-                .unwrap();
+                .expect("aarch64 unixthread init should succeed");
         assert!(!code.code.is_empty());
         assert!(code.code.len() < 2048);
         assert_eq!(code.code.len() % 4, 0);
@@ -3218,7 +3221,7 @@ mod tests {
         let wrapper = generate_macho_persistent_wrapper_x86_64(
             0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, false,
         )
-        .unwrap();
+        .expect("persistent wrapper x86_64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert!(
             wrapper.code.len() < 512,
@@ -3256,7 +3259,7 @@ mod tests {
         let wrapper = generate_macho_persistent_wrapper_x86_64(
             0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, true,
         )
-        .unwrap();
+        .expect("persistent wrapper x86_64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         // Forkserver adds significant code
         assert!(
@@ -3285,7 +3288,7 @@ mod tests {
         let wrapper = generate_macho_persistent_wrapper_x86_64(
             0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, false,
         )
-        .unwrap();
+        .expect("persistent wrapper x86_64 for sigstop test should succeed");
         // SIGSTOP=17 should appear as mov esi, 17 (BE 11 00 00 00)
         assert!(
             wrapper.code.windows(5).any(|w| w == [0xBE, 17, 0, 0, 0]),
@@ -3301,7 +3304,7 @@ mod tests {
         let wrapper = generate_macho_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
         )
-        .unwrap();
+        .expect("persistent wrapper aarch64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(
             wrapper.code.len() % 4,
@@ -3322,7 +3325,7 @@ mod tests {
         let wrapper = generate_macho_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, true,
         )
-        .unwrap();
+        .expect("persistent wrapper aarch64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(wrapper.code.len() % 4, 0);
         assert!(

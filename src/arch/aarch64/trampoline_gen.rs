@@ -2351,7 +2351,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64; // trampoline is further away
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target page: (0x1000 & ~0xFFF) + (1 << 12) = 0x1000 + 0x1000 = 0x2000
         // New imm = (0x2000 - (0x20000 & ~0xFFF)) >> 12 = (0x2000 - 0x20000) >> 12 = -0x1E000 >> 12 = -30
@@ -2381,7 +2382,8 @@ mod tests {
         let original_va = 0x5000u64;
         let new_va = 0x30000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target page: (0x5000 & ~0xFFF) + (-1 << 12) = 0x5000 - 0x1000 = 0x4000
         let new_immlo = (relocated >> 29) & 0x3;
@@ -2404,7 +2406,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target: 0x1000 + 0x100 = 0x1100
         // New offset: 0x1100 - 0x20000 = -0x1EF00
@@ -2426,7 +2429,8 @@ mod tests {
         let original_va = 0x2000u64;
         let new_va = 0x30000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target: 0x2000 - 0x200 = 0x1E00
         let new_imm26 = relocated & 0x03FF_FFFF;
@@ -2451,7 +2455,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target: 0x1000 + 0x80 = 0x1080
         let new_immlo = (relocated >> 29) & 0x3;
@@ -2476,7 +2481,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         // Original target: 0x1000 + 0x40 = 0x1040
         let new_imm19 = (relocated >> 5) & 0x7_FFFF;
@@ -2497,7 +2503,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         let new_imm19 = (relocated >> 5) & 0x7_FFFF;
         let new_offset = sign_extend(new_imm19, 19) * 4;
@@ -2519,7 +2526,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x20000u64;
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         let new_imm19 = (relocated >> 5) & 0x7_FFFF;
         let new_offset = sign_extend(new_imm19, 19) * 4;
@@ -2544,7 +2552,8 @@ mod tests {
         let original_va = 0x1000u64;
         let new_va = 0x2000u64; // close enough for ±32 KiB range
 
-        let relocated = relocate_pc_relative(raw, original_va, new_va).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, original_va, new_va).expect("relocation should succeed");
 
         let new_imm14 = (relocated >> 5) & 0x3FFF;
         let new_offset = sign_extend(new_imm14, 14) * 4;
@@ -2624,7 +2633,8 @@ mod tests {
         // If original_va == new_va, instruction should be unchanged
         let imm26 = 0x40u32;
         let raw = 0x1400_0000u32 | imm26;
-        let relocated = relocate_pc_relative(raw, 0x1000, 0x1000).unwrap();
+        let relocated =
+            relocate_pc_relative(raw, 0x1000, 0x1000).expect("identity relocation should succeed");
         assert_eq!(
             relocated, raw,
             "identity relocation should produce same instruction"
@@ -2801,7 +2811,7 @@ mod tests {
             result.err()
         );
 
-        let tramp = result.unwrap();
+        let tramp = result.expect("trampoline with TBZ island should succeed");
         let code = &tramp.code;
 
         // The trampoline should be 4 bytes larger than a normal one (the island B instruction).
@@ -2879,7 +2889,7 @@ mod tests {
             result.err()
         );
 
-        let tramp = result.unwrap();
+        let tramp = result.expect("trampoline with B.NE island should succeed");
         let code = &tramp.code;
 
         // Island is the last instruction
@@ -2930,7 +2940,7 @@ mod tests {
             result.err()
         );
 
-        let tramp = result.unwrap();
+        let tramp = result.expect("trampoline with CBZ island should succeed");
         // Last instruction should be B return_va (no island appended)
         let last_bytes = &tramp.code[tramp.code.len() - 4..];
         let last_word =
@@ -3504,7 +3514,9 @@ mod tests {
             let tramp = gen_trampoline(block_va, raw, trampoline_va);
 
             // Verify island target
-            let island_b = *last_n_insns(&tramp.code, 1).last().unwrap();
+            let island_b = *last_n_insns(&tramp.code, 1)
+                .last()
+                .expect("should have at least one instruction");
             let island_va = trampoline_va + (tramp.code.len() - 4) as u64;
             let island_target = decode_b_target(island_b, island_va);
 
@@ -3605,7 +3617,7 @@ mod tests {
         let wrapper = generate_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
         )
-        .unwrap();
+        .expect("ELF persistent wrapper aarch64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(
             wrapper.code.len() % 4,
@@ -3620,14 +3632,14 @@ mod tests {
         let wrapper = generate_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, true,
         )
-        .unwrap();
+        .expect("ELF persistent wrapper aarch64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(wrapper.code.len() % 4, 0);
         // Forkserver variant should be larger
         let basic = generate_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
         )
-        .unwrap();
+        .expect("ELF persistent wrapper aarch64 basic for comparison should succeed");
         assert!(
             wrapper.code.len() > basic.code.len(),
             "forkserver wrapper ({}) should be larger than basic ({})",
@@ -3642,7 +3654,7 @@ mod tests {
         let wrapper = generate_persistent_wrapper_aarch64(
             0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
         )
-        .unwrap();
+        .expect("ELF persistent wrapper aarch64 for sigstop test should succeed");
         // Check SIGSTOP=19 (0x13) is in the code, not macOS SIGSTOP=17
         // MOVZ x1, #19 = 0xD2800261
         let sigstop_movz = 0xD280_0261u32.to_le_bytes();

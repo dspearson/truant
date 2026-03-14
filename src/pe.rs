@@ -409,12 +409,12 @@ pub fn inject_import(
     let old_import_rva = u32::from_le_bytes(
         data[import_dir_rva_offset..import_dir_rva_offset + 4]
             .try_into()
-            .unwrap(),
+            .expect("slice is 4 bytes"),
     );
     let old_import_size = u32::from_le_bytes(
         data[import_dir_rva_offset + 4..import_dir_rva_offset + 8]
             .try_into()
-            .unwrap(),
+            .expect("slice is 4 bytes"),
     );
 
     // Count existing import descriptors (20 bytes each, null-terminated).
@@ -495,13 +495,10 @@ pub fn inject_import(
     // Null terminator descriptor is already zeroed.
 
     // ILT: one entry pointing to hint/name.
-    if ctx.is_64bit {
-        sec_data[ilt_offset_in_sec..ilt_offset_in_sec + 4]
-            .copy_from_slice(&hint_name_rva.to_le_bytes());
-    } else {
-        sec_data[ilt_offset_in_sec..ilt_offset_in_sec + 4]
-            .copy_from_slice(&hint_name_rva.to_le_bytes());
-    }
+    // For PE32+ the ILT entry is 8 bytes, but the high bytes are already
+    // zeroed (by-name import), so writing the low 4 is correct either way.
+    sec_data[ilt_offset_in_sec..ilt_offset_in_sec + 4]
+        .copy_from_slice(&hint_name_rva.to_le_bytes());
 
     // IAT: same as ILT initially (loader overwrites with actual address).
     sec_data[iat_offset_in_sec..iat_offset_in_sec + 4]

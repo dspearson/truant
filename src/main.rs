@@ -5,7 +5,7 @@
 //!   truant <input> --info
 //!   truant <input> --dry-run
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, Command};
@@ -169,7 +169,7 @@ fn cmd_info(input: &PathBuf) -> Result<()> {
 // rewrite (default operation)
 // ---------------------------------------------------------------------------
 
-fn cmd_rewrite(input: &PathBuf, matches: &clap::ArgMatches) -> Result<()> {
+fn cmd_rewrite(input: &Path, matches: &clap::ArgMatches) -> Result<()> {
     let validate = matches.get_flag("validate");
     let dry_run = matches.get_flag("dry_run");
 
@@ -207,7 +207,7 @@ fn cmd_rewrite(input: &PathBuf, matches: &clap::ArgMatches) -> Result<()> {
     let no_coverage = matches.get_flag("no_coverage");
 
     let config = truant::RewriteConfig {
-        input: input.clone(),
+        input: input.to_path_buf(),
         output: output.clone(),
         forkserver: !no_forkserver,
         dry_run,
@@ -273,7 +273,7 @@ fn cmd_rewrite(input: &PathBuf, matches: &clap::ArgMatches) -> Result<()> {
         if result.persistent_mode {
             println!(
                 "  persistent mode: addr=0x{:x} count={}{}",
-                persistent_addr.unwrap(),
+                persistent_addr.expect("persistent_addr must be set when persistent_mode is true"),
                 persistent_count,
                 if defer { " (deferred forkserver)" } else { "" },
             );

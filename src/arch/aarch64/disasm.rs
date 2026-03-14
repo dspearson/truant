@@ -118,7 +118,9 @@ impl Disassembler for AArch64Disassembler {
                 // Extract branch target from operand detail.
                 if let Ok(detail) = cs.insn_detail(insn) {
                     let arch_detail = detail.arch_detail();
-                    let arm64_detail = arch_detail.arm64().unwrap();
+                    let arm64_detail = arch_detail
+                        .arm64()
+                        .expect("instruction should have ARM64 detail when disassembled as ARM64");
                     for op in arm64_detail.operands() {
                         use capstone::arch::arm64::Arm64OperandType;
                         if let Arm64OperandType::Imm(target) = op.op_type {
@@ -186,74 +188,74 @@ impl Disassembler for AArch64Disassembler {
         }
 
         // Apply instrument_modules filter if requested.
-        if let Some(filter) = instrument_modules {
-            if !filter.is_empty() {
-                let allowed_ranges: Vec<(u64, u64)> = if is_elf {
-                    let elf = goblin::elf::Elf::parse(binary_data)
-                        .context("goblin ELF parse failed during instrument_modules filter")?;
-                    elf.syms
-                        .iter()
-                        .filter(|sym| sym.st_type() == goblin::elf::sym::STT_FUNC)
-                        .filter_map(|sym| {
-                            let name = elf.strtab.get_at(sym.st_name)?;
-                            if filter.iter().any(|m| name.contains(m.as_str())) {
-                                let end = if sym.st_size > 0 {
-                                    sym.st_value + sym.st_size
-                                } else {
-                                    sym.st_value + 0x10000
-                                };
-                                Some((sym.st_value, end))
+        if let Some(filter) = instrument_modules
+            && !filter.is_empty()
+        {
+            let allowed_ranges: Vec<(u64, u64)> = if is_elf {
+                let elf = goblin::elf::Elf::parse(binary_data)
+                    .context("goblin ELF parse failed during instrument_modules filter")?;
+                elf.syms
+                    .iter()
+                    .filter(|sym| sym.st_type() == goblin::elf::sym::STT_FUNC)
+                    .filter_map(|sym| {
+                        let name = elf.strtab.get_at(sym.st_name)?;
+                        if filter.iter().any(|m| name.contains(m.as_str())) {
+                            let end = if sym.st_size > 0 {
+                                sym.st_value + sym.st_size
                             } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    // Mach-O: use goblin Mach-O parser for symbol extraction
-                    let macho = goblin::mach::MachO::parse(binary_data, 0)
-                        .context("goblin Mach-O parse failed during instrument_modules filter")?;
-                    let mut ranges = Vec::new();
-                    if let Some(ref symbols) = macho.symbols {
-                        for (name, nlist) in symbols.iter().flatten() {
-                            if nlist.is_undefined() || nlist.n_value == 0 {
-                                continue;
-                            }
-                            if filter.iter().any(|m| name.contains(m.as_str())) {
-                                let end = nlist.n_value + 0x10000;
-                                ranges.push((nlist.n_value, end));
-                            }
+                                sym.st_value + 0x10000
+                            };
+                            Some((sym.st_value, end))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                // Mach-O: use goblin Mach-O parser for symbol extraction
+                let macho = goblin::mach::MachO::parse(binary_data, 0)
+                    .context("goblin Mach-O parse failed during instrument_modules filter")?;
+                let mut ranges = Vec::new();
+                if let Some(ref symbols) = macho.symbols {
+                    for (name, nlist) in symbols.iter().flatten() {
+                        if nlist.is_undefined() || nlist.n_value == 0 {
+                            continue;
+                        }
+                        if filter.iter().any(|m| name.contains(m.as_str())) {
+                            let end = nlist.n_value + 0x10000;
+                            ranges.push((nlist.n_value, end));
                         }
                     }
-                    ranges
-                };
+                }
+                ranges
+            };
 
-                if allowed_ranges.is_empty() {
-                    anyhow::bail!(
-                        "--instrument-modules filter matched 0 symbols for modules {:?}; \
+            if allowed_ranges.is_empty() {
+                anyhow::bail!(
+                    "--instrument-modules filter matched 0 symbols for modules {:?}; \
                          check module names match symbol table (use `nm -D <binary>` to list symbols)",
-                        filter
-                    );
-                }
-
-                let before = blocks.len();
-                blocks.retain(|b| {
-                    allowed_ranges
-                        .iter()
-                        .any(|&(start, end)| b.va >= start && b.va < end)
-                });
-
-                tracing::info!(
-                    "--instrument-modules: {} blocks retained after filtering ({} removed)",
-                    blocks.len(),
-                    before - blocks.len(),
+                    filter
                 );
+            }
 
-                if blocks.is_empty() {
-                    anyhow::bail!(
-                        "instrument_modules filter {:?} matched symbols but no blocks align",
-                        filter
-                    );
-                }
+            let before = blocks.len();
+            blocks.retain(|b| {
+                allowed_ranges
+                    .iter()
+                    .any(|&(start, end)| b.va >= start && b.va < end)
+            });
+
+            tracing::info!(
+                "--instrument-modules: {} blocks retained after filtering ({} removed)",
+                blocks.len(),
+                before - blocks.len(),
+            );
+
+            if blocks.is_empty() {
+                anyhow::bail!(
+                    "instrument_modules filter {:?} matched symbols but no blocks align",
+                    filter
+                );
             }
         }
 

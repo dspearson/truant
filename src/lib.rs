@@ -42,7 +42,6 @@ pub use arch::{AArch64Disassembler, AArch64TrampolineGenerator};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-extern crate libc;
 
 /// Configuration for the rewrite operation.
 #[derive(Debug, Clone)]
@@ -278,7 +277,13 @@ int main(int argc, char **argv) {{
                 .context("failed to write dlopen harness source")?;
 
             let cc_status = std::process::Command::new("cc")
-                .args(["-o", tmp_harness.to_str().unwrap(), &harness_src_path])
+                .args([
+                    "-o",
+                    tmp_harness
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("harness path is not valid UTF-8"))?,
+                    &harness_src_path,
+                ])
                 .status();
             let _ = std::fs::remove_file(&harness_src_path);
 
@@ -425,10 +430,10 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
     );
 
     // PT_NOTE warning: ELF-specific. Check via downcast; suppress if not ELF.
-    if let Some(elf_ctx) = ctx.as_any().downcast_ref::<ElfBinaryContext>() {
-        if elf_ctx.inner().note_segment.is_none() {
-            tracing::info!("no PT_NOTE segment — will append new program header entry");
-        }
+    if let Some(elf_ctx) = ctx.as_any().downcast_ref::<ElfBinaryContext>()
+        && elf_ctx.inner().note_segment.is_none()
+    {
+        tracing::info!("no PT_NOTE segment — will append new program header entry");
     }
 
     // Create architecture-specific disassembler
@@ -815,7 +820,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_rewrite_dry_run() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let config = RewriteConfig {
             input: PathBuf::from("/usr/bin/true"),
             output: td.path().join("truant_test_dry"),
@@ -842,13 +847,13 @@ mod tests {
     fn compile_test_binary(dir: &std::path::Path, suffix: &str) -> PathBuf {
         let src = dir.join(format!("{}.c", suffix));
         let input = dir.join(suffix);
-        std::fs::write(&src, "int main() { return 0; }\n").unwrap();
+        std::fs::write(&src, "int main() { return 0; }\n").expect("failed to write test source");
         let cc = std::process::Command::new("gcc")
             .args([
                 "-o",
-                input.to_str().unwrap(),
+                input.to_str().expect("input path is not valid UTF-8"),
                 "-no-pie",
-                src.to_str().unwrap(),
+                src.to_str().expect("source path is not valid UTF-8"),
             ])
             .status()
             .expect("gcc not available");
@@ -862,12 +867,12 @@ mod tests {
     fn test_rewrite_nopatch_entry_only() {
         // Test: redirect entry to init code with NO block patching.
         // This isolates whether init code + segment loading works.
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_test_binary(td.path(), "entry_only");
         let output = td.path().join("entry_only_out");
 
-        let data = std::fs::read(&input).unwrap();
-        let ctx = elf::ElfContext::parse(&data).unwrap();
+        let data = std::fs::read(&input).expect("failed to read test binary");
+        let ctx = elf::ElfContext::parse(&data).expect("failed to parse ELF");
 
         // Create a minimal init code that just jumps to original entry
         let segment_va = ((ctx.highest_va_end + 0xFFF) & !0xFFF) + 0x1000;
@@ -904,7 +909,7 @@ mod tests {
             file_end,
             segment_size as u64,
         )
-        .unwrap();
+        .expect("failed to patch PT_NOTE to PT_LOAD");
 
         // Patch e_entry
         out_data[24..32].copy_from_slice(&init_va.to_le_bytes());
@@ -912,8 +917,8 @@ mod tests {
         // Append segment
         out_data.extend_from_slice(&segment_data);
 
-        std::fs::write(&output, &out_data).unwrap();
-        set_executable(&output).unwrap();
+        std::fs::write(&output, &out_data).expect("failed to write output binary");
+        set_executable(&output).expect("failed to set executable permission");
 
         let status = std::process::Command::new(&output)
             .status()
@@ -930,19 +935,19 @@ mod tests {
     fn test_rewrite_init_code_only() {
         // Test: full init code with no block patching.
         // Isolates whether the init code (environ parsing) works.
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_test_binary(td.path(), "init_only");
         let output = td.path().join("initonly");
 
-        let data = std::fs::read(&input).unwrap();
-        let ctx = elf::ElfContext::parse(&data).unwrap();
+        let data = std::fs::read(&input).expect("failed to read test binary");
+        let ctx = elf::ElfContext::parse(&data).expect("failed to parse ELF");
 
         let segment_va = ((ctx.highest_va_end + 0xFFF) & !0xFFF) + 0x1000;
         let data_va = segment_va;
         let init_va = segment_va + trampoline::DATA_SIZE;
 
-        let init =
-            trampoline::generate_init_code(init_va, data_va, ctx.entry_point, false, None).unwrap();
+        let init = trampoline::generate_init_code(init_va, data_va, ctx.entry_point, false, None)
+            .expect("failed to generate init code");
 
         let total_size = trampoline::DATA_SIZE as usize + init.code.len();
         let mut segment_data = vec![0u8; total_size];
@@ -962,15 +967,15 @@ mod tests {
             file_end,
             total_size as u64,
         )
-        .unwrap();
+        .expect("failed to patch PT_NOTE to PT_LOAD");
 
         // Patch e_entry to our init code
         out_data[24..32].copy_from_slice(&init_va.to_le_bytes());
 
         out_data.extend_from_slice(&segment_data);
 
-        std::fs::write(&output, &out_data).unwrap();
-        set_executable(&output).unwrap();
+        std::fs::write(&output, &out_data).expect("failed to write output binary");
+        set_executable(&output).expect("failed to set executable permission");
 
         // Also test a minimal save/restore version (no syscalls)
         let output_stub = td.path().join("stub");
@@ -1007,13 +1012,13 @@ mod tests {
             let off = trampoline::DATA_SIZE as usize;
             seg[off..off + stub.len()].copy_from_slice(&stub);
 
-            let data2 = std::fs::read(&input).unwrap();
-            let ctx2 = elf::ElfContext::parse(&data2).unwrap();
+            let data2 = std::fs::read(&input).expect("failed to read test binary");
+            let ctx2 = elf::ElfContext::parse(&data2).expect("failed to parse ELF");
             let mut out2 = data2;
             let p2 = (out2.len() + 0xFFF) & !0xFFF;
             out2.resize(p2, 0);
             let fe2 = out2.len() as u64;
-            let note2 = ctx2.note_segment.as_ref().unwrap();
+            let note2 = ctx2.note_segment.as_ref().expect("no PT_NOTE segment");
             elf_impl::patcher::patch_phdr_note_to_load_test(
                 &mut out2,
                 note2.phdr_offset,
@@ -1021,13 +1026,15 @@ mod tests {
                 fe2,
                 total as u64,
             )
-            .unwrap();
+            .expect("failed to patch PT_NOTE to PT_LOAD");
             out2[24..32].copy_from_slice(&init_va.to_le_bytes());
             out2.extend_from_slice(&seg);
-            std::fs::write(&output_stub, &out2).unwrap();
-            set_executable(&output_stub).unwrap();
+            std::fs::write(&output_stub, &out2).expect("failed to write stub binary");
+            set_executable(&output_stub).expect("failed to set executable permission");
 
-            let st = std::process::Command::new(&output_stub).status().unwrap();
+            let st = std::process::Command::new(&output_stub)
+                .status()
+                .expect("failed to run stub binary");
             assert!(
                 st.success(),
                 "stub (push/pop only) should exit 0, got {:?}",
@@ -1049,7 +1056,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_rewrite_actual() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_test_binary(td.path(), "actual");
         let output = td.path().join("actual_out");
 
@@ -1104,7 +1111,7 @@ mod tests {
     #[test]
     fn test_rewrite_shared_object() {
         // Compile a simple .so with a single exported function.
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let src = td.path().join("so_test_lib.c");
         let so_input = td.path().join("so_test_lib.so");
         let so_output = td.path().join("so_test_lib_instr.so");
@@ -1119,7 +1126,7 @@ mod tests {
             }
         "#,
         )
-        .unwrap();
+        .expect("failed to write .so source");
 
         let cc = std::process::Command::new("gcc")
             .args([
@@ -1127,8 +1134,8 @@ mod tests {
                 "-fPIC",
                 "-O0",
                 "-o",
-                so_input.to_str().unwrap(),
-                src.to_str().unwrap(),
+                so_input.to_str().expect("so_input path is not valid UTF-8"),
+                src.to_str().expect("source path is not valid UTF-8"),
             ])
             .status()
             .expect("gcc not available");
@@ -1159,8 +1166,8 @@ mod tests {
         );
 
         // Verify the output .so has DT_INIT (synthesised from DT_NULL if needed)
-        let data = std::fs::read(&so_output).unwrap();
-        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let data = std::fs::read(&so_output).expect("failed to read rewritten .so");
+        let elf = goblin::elf::Elf::parse(&data).expect("failed to parse rewritten ELF");
         let has_dt_init = elf
             .dynamic
             .as_ref()
@@ -1178,7 +1185,9 @@ mod tests {
         // Compile a harness that dlopen's the .so using an absolute path
         let harness_src = td.path().join("so_test_harness.c");
         let harness_bin = td.path().join("so_test_harness");
-        let so_output_abs = so_output.canonicalize().unwrap();
+        let so_output_abs = so_output
+            .canonicalize()
+            .expect("failed to canonicalize .so output path");
         std::fs::write(
             &harness_src,
             format!(
@@ -1207,13 +1216,17 @@ mod tests {
                 so_output_abs.display()
             ),
         )
-        .unwrap();
+        .expect("failed to write harness source");
 
         let cc = std::process::Command::new("gcc")
             .args([
                 "-o",
-                harness_bin.to_str().unwrap(),
-                harness_src.to_str().unwrap(),
+                harness_bin
+                    .to_str()
+                    .expect("harness_bin path is not valid UTF-8"),
+                harness_src
+                    .to_str()
+                    .expect("harness_src path is not valid UTF-8"),
                 "-ldl",
             ])
             .status()
@@ -1260,12 +1273,16 @@ int main(int argc, char **argv) {
     fn compile_heap_san_target(dir: &std::path::Path, suffix: &str, static_link: bool) -> PathBuf {
         let src = dir.join(format!("{}.c", suffix));
         let bin = dir.join(suffix);
-        std::fs::write(&src, HEAP_SAN_TARGET_SRC).unwrap();
-        let mut args = vec!["-o", bin.to_str().unwrap(), "-no-pie"];
+        std::fs::write(&src, HEAP_SAN_TARGET_SRC).expect("failed to write heap san source");
+        let mut args = vec![
+            "-o",
+            bin.to_str().expect("bin path is not valid UTF-8"),
+            "-no-pie",
+        ];
         if static_link {
             args.push("-static");
         }
-        args.push(src.to_str().unwrap());
+        args.push(src.to_str().expect("source path is not valid UTF-8"));
         let status = std::process::Command::new("gcc")
             .args(&args)
             .status()
@@ -1314,7 +1331,7 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_heap_san_clean_program() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "clean", true);
         let output = td.path().join("heap_san_out_clean");
 
@@ -1342,7 +1359,7 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_heap_san_overflow() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "overflow", true);
         let output = td.path().join("heap_san_out_overflow");
 
@@ -1366,7 +1383,7 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_heap_san_use_after_free() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "uaf", true);
         let output = td.path().join("heap_san_out_uaf");
 
@@ -1390,7 +1407,7 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_heap_san_double_free() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "dblf", true);
         let output = td.path().join("heap_san_out_dblf");
 
@@ -1417,7 +1434,7 @@ int main(int argc, char **argv) {
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_clean() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "dyn_clean", false);
         let output = td.path().join("heap_san_out_dyn_clean");
 
@@ -1443,7 +1460,7 @@ int main(int argc, char **argv) {
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_overflow() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "dyn_overflow", false);
         let output = td.path().join("heap_san_out_dyn_overflow");
 
@@ -1468,7 +1485,7 @@ int main(int argc, char **argv) {
     #[test]
     #[cfg(feature = "coverage")]
     fn test_heap_san_dynamic_use_after_free() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let input = compile_heap_san_target(td.path(), "dyn_uaf", false);
         let output = td.path().join("heap_san_out_dyn_uaf");
 
@@ -1520,19 +1537,22 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_rewrite_persistent_produces_valid_binary() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let src = td.path().join("persistent_test.c");
         let input_bin = td.path().join("persistent_test_input");
         let output_bin = td.path().join("persistent_test_output");
 
-        std::fs::write(&src, PERSISTENT_TARGET_SRC).unwrap();
+        std::fs::write(&src, PERSISTENT_TARGET_SRC)
+            .expect("failed to write persistent target source");
         let cc = std::process::Command::new("gcc")
             .args([
                 "-o",
-                input_bin.to_str().unwrap(),
+                input_bin
+                    .to_str()
+                    .expect("input_bin path is not valid UTF-8"),
                 "-no-pie",
                 "-static",
-                src.to_str().unwrap(),
+                src.to_str().expect("source path is not valid UTF-8"),
             ])
             .status()
             .expect("gcc not available");
@@ -1579,8 +1599,10 @@ int main(int argc, char **argv) {
         assert!(result.segment_size > 0);
 
         // Verify output binary exists, is larger than input, and is executable
-        let input_meta = std::fs::metadata(&input_bin).unwrap();
-        let output_meta = std::fs::metadata(&output_bin).unwrap();
+        let input_meta =
+            std::fs::metadata(&input_bin).expect("failed to get input binary metadata");
+        let output_meta =
+            std::fs::metadata(&output_bin).expect("failed to get output binary metadata");
         assert!(
             output_meta.len() > input_meta.len(),
             "rewritten binary should be larger than original"
@@ -1596,8 +1618,8 @@ int main(int argc, char **argv) {
         }
 
         // Verify the persistent_addr was patched with a branch instruction
-        let output_data = std::fs::read(&output_bin).unwrap();
-        let output_ctx = elf::ElfContext::parse(&output_data).unwrap();
+        let output_data = std::fs::read(&output_bin).expect("failed to read output binary");
+        let output_ctx = elf::ElfContext::parse(&output_data).expect("failed to parse output ELF");
         let text = &output_ctx.text;
         let file_offset = (persistent_addr - text.va) as usize + text.offset as usize;
         if cfg!(target_arch = "aarch64") {
@@ -1626,19 +1648,22 @@ int main(int argc, char **argv) {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_rewrite_persistent_deferred() {
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let src = td.path().join("deferred_test.c");
         let input_bin = td.path().join("deferred_test_input");
         let output_bin = td.path().join("deferred_test_output");
 
-        std::fs::write(&src, PERSISTENT_TARGET_SRC).unwrap();
+        std::fs::write(&src, PERSISTENT_TARGET_SRC)
+            .expect("failed to write persistent target source");
         let cc = std::process::Command::new("gcc")
             .args([
                 "-o",
-                input_bin.to_str().unwrap(),
+                input_bin
+                    .to_str()
+                    .expect("input_bin path is not valid UTF-8"),
                 "-no-pie",
                 "-static",
-                src.to_str().unwrap(),
+                src.to_str().expect("source path is not valid UTF-8"),
             ])
             .status()
             .expect("gcc not available");
@@ -1682,16 +1707,18 @@ int main(int argc, char **argv) {
         assert!(result.blocks_instrumented > 0);
 
         // Verify output binary exists and is larger than input
-        let input_meta = std::fs::metadata(&input_bin).unwrap();
-        let output_meta = std::fs::metadata(&output_bin).unwrap();
+        let input_meta =
+            std::fs::metadata(&input_bin).expect("failed to get input binary metadata");
+        let output_meta =
+            std::fs::metadata(&output_bin).expect("failed to get output binary metadata");
         assert!(
             output_meta.len() > input_meta.len(),
             "rewritten binary should be larger than original"
         );
 
         // Verify the persistent_addr was patched with a branch instruction
-        let output_data = std::fs::read(&output_bin).unwrap();
-        let output_ctx = elf::ElfContext::parse(&output_data).unwrap();
+        let output_data = std::fs::read(&output_bin).expect("failed to read output binary");
+        let output_ctx = elf::ElfContext::parse(&output_data).expect("failed to parse output ELF");
         let text = &output_ctx.text;
         let file_offset = (persistent_addr - text.va) as usize + text.offset as usize;
         if cfg!(target_arch = "aarch64") {
@@ -1713,7 +1740,8 @@ int main(int argc, char **argv) {
         // persistent_data is at segment_va + DATA_SIZE
         let seg_va = result.segment_va;
         // Find the segment in the output file
-        let elf_obj = goblin::elf::Elf::parse(&output_data).unwrap();
+        let elf_obj = goblin::elf::Elf::parse(&output_data)
+            .expect("failed to parse output ELF for segment check");
         let new_seg = elf_obj
             .program_headers
             .iter()
@@ -1753,7 +1781,7 @@ int main(int argc, char **argv) {
                 return;
             }
         };
-        let td = tempfile::tempdir().unwrap();
+        let td = tempfile::tempdir().expect("failed to create temp dir");
         let config = RewriteConfig {
             input: path.into(),
             output: td.path().join("aarch64_test_out"),

@@ -202,12 +202,11 @@ const X86_64_REGS: &[&str] = &[
 fn validate_condition_register(register: &str, is_aarch64: bool) -> Result<()> {
     if is_aarch64 {
         // x0-x30
-        if let Some(rest) = register.strip_prefix('x') {
-            if let Ok(n) = rest.parse::<u32>() {
-                if n <= 30 {
-                    return Ok(());
-                }
-            }
+        if let Some(rest) = register.strip_prefix('x')
+            && let Ok(n) = rest.parse::<u32>()
+            && n <= 30
+        {
+            return Ok(());
         }
         bail!("invalid AArch64 register '{}' (expected x0-x30)", register);
     } else {
@@ -227,10 +226,9 @@ fn parse_target(target: &str) -> TargetSpec {
     if let Some(hex) = target
         .strip_prefix("0x")
         .or_else(|| target.strip_prefix("0X"))
+        && let Ok(va) = u64::from_str_radix(hex, 16)
     {
-        if let Ok(va) = u64::from_str_radix(hex, 16) {
-            return TargetSpec::Va(va);
-        }
+        return TargetSpec::Va(va);
     }
     TargetSpec::Symbol(target.to_string())
 }
@@ -397,23 +395,21 @@ fn build_symbol_map(data: &[u8]) -> Result<std::collections::HashMap<String, u64
 
     // .symtab
     for sym in &elf.syms {
-        if sym.st_value != 0 {
-            if let Some(name) = elf.strtab.get_at(sym.st_name) {
-                if !name.is_empty() {
-                    map.entry(name.to_string()).or_insert(sym.st_value);
-                }
-            }
+        if sym.st_value != 0
+            && let Some(name) = elf.strtab.get_at(sym.st_name)
+            && !name.is_empty()
+        {
+            map.entry(name.to_string()).or_insert(sym.st_value);
         }
     }
 
     // .dynsym (override symtab if present in both)
     for sym in &elf.dynsyms {
-        if sym.st_value != 0 {
-            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                if !name.is_empty() {
-                    map.insert(name.to_string(), sym.st_value);
-                }
-            }
+        if sym.st_value != 0
+            && let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+            && !name.is_empty()
+        {
+            map.insert(name.to_string(), sym.st_value);
         }
     }
 
@@ -667,12 +663,11 @@ fn build_symbol_map_pe(data: &[u8]) -> Result<std::collections::HashMap<String, 
         .unwrap_or(0);
 
     for export in &pe.exports {
-        if export.rva != 0 {
-            if let Some(name) = export.name {
-                if !name.is_empty() {
-                    map.insert(name.to_string(), image_base + export.rva as u64);
-                }
-            }
+        if export.rva != 0
+            && let Some(name) = export.name
+            && !name.is_empty()
+        {
+            map.insert(name.to_string(), image_base + export.rva as u64);
         }
     }
 
@@ -732,11 +727,14 @@ target = "0x4012a0"
 mode = "pre"
 shellcode = [0x90, 0x90, 0xC3]
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for shellcode test");
         assert_eq!(config.hook.len(), 1);
         assert_eq!(config.hook[0].mode, HookMode::Pre);
         assert_eq!(
-            config.hook[0].shellcode.as_ref().unwrap(),
+            config.hook[0]
+                .shellcode
+                .as_ref()
+                .expect("shellcode should be set"),
             &[0x90, 0x90, 0xC3]
         );
     }
@@ -752,20 +750,26 @@ target = "main"
 mode = "replace"
 handler = "my_handler"
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for handler test");
         assert_eq!(config.hook.len(), 1);
         assert_eq!(config.hook[0].mode, HookMode::Replace);
-        assert_eq!(config.hook[0].handler.as_ref().unwrap(), "my_handler");
+        assert_eq!(
+            config.hook[0]
+                .handler
+                .as_ref()
+                .expect("handler should be set"),
+            "my_handler"
+        );
         assert_eq!(
             config
                 .hooks
                 .as_ref()
-                .unwrap()
+                .expect("hooks table should be present")
                 .library
                 .as_ref()
-                .unwrap()
+                .expect("library should be set")
                 .to_str()
-                .unwrap(),
+                .expect("library path should be valid UTF-8"),
             "./my_hooks.so"
         );
     }
@@ -791,7 +795,7 @@ target = "0x401000"
 mode = "replace"
 handler = "replace_hook"
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for multiple hooks test");
         assert_eq!(config.hook.len(), 3);
         assert_eq!(config.hook[0].mode, HookMode::Pre);
         assert_eq!(config.hook[1].mode, HookMode::Post);
@@ -806,7 +810,8 @@ target = "main"
 mode = "pre"
 handler = "my_handler"
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig =
+            toml::from_str(toml).expect("valid TOML for handler-without-library test");
         let _path = Path::new("/dev/null");
         // parse_hook_config validates, but we can test validate logic directly
         for (i, hook) in config.hook.iter().enumerate() {
@@ -828,7 +833,8 @@ handler = "my_handler"
 target = "main"
 mode = "pre"
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig =
+            toml::from_str(toml).expect("valid TOML for neither-handler-nor-shellcode test");
         for hook in &config.hook {
             assert!(hook.handler.is_none() && hook.shellcode.is_none());
         }
@@ -841,7 +847,7 @@ mode = "pre"
                 r#"target = "x"
 mode = "pre""#
             )
-            .unwrap()
+            .expect("valid TOML for pre mode")
             .mode,
             HookMode::Pre,
         );
@@ -850,7 +856,7 @@ mode = "pre""#
                 r#"target = "x"
 mode = "post""#
             )
-            .unwrap()
+            .expect("valid TOML for post mode")
             .mode,
             HookMode::Post,
         );
@@ -859,7 +865,7 @@ mode = "post""#
                 r#"target = "x"
 mode = "replace""#
             )
-            .unwrap()
+            .expect("valid TOML for replace mode")
             .mode,
             HookMode::Replace,
         );
@@ -874,9 +880,12 @@ mode = "pre"
 shellcode = [0xC3]
 condition = { register = "rdi", op = "gte", value = 65536 }
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for condition test");
         assert_eq!(config.hook.len(), 1);
-        let cond = config.hook[0].condition.as_ref().unwrap();
+        let cond = config.hook[0]
+            .condition
+            .as_ref()
+            .expect("condition should be set");
         assert_eq!(cond.register, "rdi");
         assert_eq!(cond.op, CondOp::Gte);
         assert_eq!(cond.value, 65536);
@@ -890,7 +899,7 @@ target = "0x401000"
 mode = "pre"
 shellcode = [0xC3]
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for no-condition test");
         assert!(config.hook[0].condition.is_none());
     }
 
@@ -927,7 +936,7 @@ target = "0x401000"
 mode = "pre"
 shellcode = [0xC3]
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for enabled-default test");
         assert!(config.hook[0].enabled, "enabled should default to true");
     }
 
@@ -940,7 +949,7 @@ mode = "pre"
 shellcode = [0xC3]
 enabled = false
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for enabled-false test");
         assert!(
             !config.hook[0].enabled,
             "enabled should be false when explicitly set"
@@ -961,7 +970,7 @@ enabled = false
             r#"target = "x"
 mode = "return""#,
         )
-        .unwrap();
+        .expect("valid TOML for return mode");
         assert_eq!(def.mode, HookMode::Return);
     }
 
@@ -992,7 +1001,7 @@ target = "0x7000"
 mode = "post"
 handler = "post_fn"
 "#;
-        let config: HookConfig = toml::from_str(toml).unwrap();
+        let config: HookConfig = toml::from_str(toml).expect("valid TOML for return-slot test");
         assert_eq!(config.hook.len(), 4);
         assert_eq!(config.hook[0].mode, HookMode::Pre);
         assert_eq!(config.hook[1].mode, HookMode::Return);

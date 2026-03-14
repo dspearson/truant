@@ -206,7 +206,8 @@ pub fn patch(
     };
     let persistent_wrapper = if let Some(p_addr) = effective_persistent_addr {
         current_va = align_up(current_va, 16);
-        let pd_va = persistent_data_va.unwrap();
+        let pd_va =
+            persistent_data_va.expect("persistent_data_va required when persistent_addr is set");
         let min_displaced = if is_aarch64 { 4 } else { 5 };
         let (displaced_bytes, displaced_len) =
             crate::disasm::extract_displaced_bytes(&data, ctx, p_addr, min_displaced)
@@ -273,7 +274,10 @@ pub fn patch(
             tracing::info!(
                 "heap san: {} allocator functions found, wrappers at 0x{:x}",
                 alloc_syms.count(),
-                *hsw.wrappers.values().min().unwrap(),
+                *hsw.wrappers
+                    .values()
+                    .min()
+                    .expect("wrappers map should not be empty"),
             );
             Some((alloc_syms, hsw))
         } else {
@@ -324,7 +328,11 @@ pub fn patch(
         let mut found_null = false;
         let mut pos = 0;
         while pos + 16 <= relocated.len() {
-            let tag = i64::from_le_bytes(relocated[pos..pos + 8].try_into().unwrap());
+            let tag = i64::from_le_bytes(
+                relocated[pos..pos + 8]
+                    .try_into()
+                    .expect("slice is 8 bytes"),
+            );
             if tag == goblin::elf::dynamic::DT_NULL as i64 {
                 // Replace with DT_INIT
                 let dt_init_tag = goblin::elf::dynamic::DT_INIT as i64;
@@ -408,7 +416,12 @@ pub fn patch(
                     // Conservative estimate for entry trampoline size (aligned to 8).
                     let estimated_entry_size = 256u64;
                     let ret_tramp_va = align_up(entry_va + estimated_entry_size, 8);
-                    let slot_va = return_slot_va + hook.return_slot_index.unwrap() as u64 * 8;
+                    let slot_va = return_slot_va
+                        + hook
+                            .return_slot_index
+                            .expect("Return mode hook must have return_slot_index")
+                            as u64
+                            * 8;
 
                     match hook_trampoline::generate_return_hook_trampolines(
                         entry_va,
@@ -552,7 +565,11 @@ pub fn patch(
 
     // Heap san wrappers
     if let Some((_, ref hsw)) = heap_san_code {
-        let base = *hsw.wrappers.values().min().unwrap();
+        let base = *hsw
+            .wrappers
+            .values()
+            .min()
+            .expect("wrappers map should not be empty");
         let offset = (base - segment_va) as usize;
         segment_data[offset..offset + hsw.code.len()].copy_from_slice(&hsw.code);
     }
@@ -907,9 +924,14 @@ fn strip_bti_property(data: &mut [u8]) {
     // Scan for GNU note headers: [namesz=4][descsz][type=5]["GNU\0"][desc...]
     let mut pos = 0;
     while pos + 16 + 4 <= data.len() {
-        let namesz = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        let descsz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        let ntype = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
+        let namesz = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("slice is 4 bytes"));
+        let descsz =
+            u32::from_le_bytes(data[pos + 4..pos + 8].try_into().expect("slice is 4 bytes"));
+        let ntype = u32::from_le_bytes(
+            data[pos + 8..pos + 12]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
 
         if namesz == 4
             && ntype == NT_GNU_PROPERTY_TYPE_0
@@ -924,12 +946,17 @@ fn strip_bti_property(data: &mut [u8]) {
             }
             let mut pp = desc_start;
             while pp + 8 <= desc_end {
-                let pr_type = u32::from_le_bytes(data[pp..pp + 4].try_into().unwrap());
-                let pr_datasz = u32::from_le_bytes(data[pp + 4..pp + 8].try_into().unwrap());
+                let pr_type =
+                    u32::from_le_bytes(data[pp..pp + 4].try_into().expect("slice is 4 bytes"));
+                let pr_datasz =
+                    u32::from_le_bytes(data[pp + 4..pp + 8].try_into().expect("slice is 4 bytes"));
                 if pr_type == AARCH64_FEATURE_1_AND && pr_datasz >= 4 && pp + 8 + 4 <= desc_end {
                     let flags_off = pp + 8;
-                    let flags =
-                        u32::from_le_bytes(data[flags_off..flags_off + 4].try_into().unwrap());
+                    let flags = u32::from_le_bytes(
+                        data[flags_off..flags_off + 4]
+                            .try_into()
+                            .expect("slice is 4 bytes"),
+                    );
                     if flags & AARCH64_FEATURE_1_BTI != 0 {
                         let new_flags = flags & !AARCH64_FEATURE_1_BTI;
                         data[flags_off..flags_off + 4].copy_from_slice(&new_flags.to_le_bytes());
@@ -1030,18 +1057,28 @@ mod tests {
         // Set p_type = PT_NOTE (4)
         phdr[0..4].copy_from_slice(&4u32.to_le_bytes());
 
-        patch_phdr_note_to_load(&mut phdr, 0, 0x800000, 0x10000, 0x2000).unwrap();
+        patch_phdr_note_to_load(&mut phdr, 0, 0x800000, 0x10000, 0x2000)
+            .expect("patch_phdr_note_to_load should succeed");
 
         // Verify p_type = PT_LOAD (1)
-        assert_eq!(u32::from_le_bytes(phdr[0..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(phdr[0..4].try_into().expect("slice is 4 bytes")),
+            1
+        );
         // Verify p_flags = RWX (7)
-        assert_eq!(u32::from_le_bytes(phdr[4..8].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(phdr[4..8].try_into().expect("slice is 4 bytes")),
+            7
+        );
         // Verify p_vaddr
         assert_eq!(
-            u64::from_le_bytes(phdr[16..24].try_into().unwrap()),
+            u64::from_le_bytes(phdr[16..24].try_into().expect("slice is 8 bytes")),
             0x800000
         );
         // Verify p_filesz
-        assert_eq!(u64::from_le_bytes(phdr[32..40].try_into().unwrap()), 0x2000);
+        assert_eq!(
+            u64::from_le_bytes(phdr[32..40].try_into().expect("slice is 8 bytes")),
+            0x2000
+        );
     }
 }

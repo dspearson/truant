@@ -9,6 +9,32 @@ use crate::patcher::PatchResult;
 use crate::traits::{BinaryContext, Patcher, TrampolineGenerator};
 use crate::trampoline::{DATA_SIZE, PERSISTENT_DATA_SIZE};
 
+/// Return type for `generate_init_and_trampolines`.
+type InitAndTrampolines<'a> = (
+    crate::trampoline::InitCode,
+    Vec<(&'a BasicBlock, crate::trampoline::Trampoline)>,
+    usize,
+    u64,
+);
+
+/// Return type for `setup_hook_infrastructure`.
+type HookInfra = (
+    u64,
+    u64,
+    u64,
+    u64,
+    Vec<(usize, crate::trampoline::Trampoline)>,
+    Vec<(u64, Vec<u8>)>,
+    Vec<crate::trampoline::Trampoline>,
+);
+
+/// Return type for `generate_persistent_wrapper_helper`.
+type PersistentResult = (
+    u64,
+    Option<(u64, crate::trampoline::PersistentWrapper, usize)>,
+    u64,
+);
+
 /// Mach-O-specific patcher implementing the Patcher trait.
 ///
 /// Handles LC_SEGMENT_64 insertion, entry point redirection (LC_MAIN or
@@ -85,36 +111,43 @@ impl Patcher for MachOPatcher {
     }
 }
 
-/// Orchestrate Mach-O patching:
-/// 1. Strip code signature (reclaim LC space)
-/// 2. Compute new segment layout
-/// 3. Generate init code + trampolines
-/// 4. Insert LC_SEGMENT_64 load command
-/// 5. Redirect entry point
-/// 6. Patch basic blocks
-/// 7. Append segment data
-#[allow(clippy::too_many_arguments)]
-fn patch_macho(
-    ctx: &MachOContext,
-    blocks: &[BasicBlock],
-    mut data: Vec<u8>,
-    enable_forkserver: bool,
-    enable_heap_san: bool,
-    tramp_gen: &dyn TrampolineGenerator,
-    hooks: &[ResolvedHook],
-    persistent_addr: Option<u64>,
-    persistent_count: u32,
-    defer: bool,
-    no_coverage: bool,
-) -> Result<PatchResult> {
-    if blocks.is_empty() && !no_coverage {
-        bail!("no basic blocks to instrument");
-    }
+/// Layout parameters computed for the new Mach-O segments.
+struct MachoLayout {
+    is_arm64: bool,
+    use_got_shmat: bool,
+    arm64_split: bool,
+    segment_va: u64,
+    data_va: u64,
+    init_va: u64,
+    hook_abi: TargetAbi,
+    shmat_ordinal: u32,
+    page_sz: u64,
+    data_area_size: u64,
+}
 
-    let page_sz = page_size_for_arch(ctx);
+/// Computed segment sizes for the data and code segments.
+struct SegmentSizes {
+    segment_size: u64,
+    segment_vmsize: u64,
+    code_segment_size: u64,
+    code_segment_vmsize: u64,
+    needs_lc_routines_64: bool,
+}
 
-    // Step 1: Strip code signature if present (reclaims LC space).
-    let (mut ncmds, mut sizeofcmds) = (ctx.ncmds, ctx.sizeofcmds);
+/// File layout offsets after restructuring.
+struct FileLayout {
+    file_offset_of_segment: u64,
+    file_offset_of_code_seg: u64,
+    new_linkedit_fileoff: u64,
+    new_fixups_fileoff: u32,
+    new_fixups_size: u32,
+}
+
+/// Strip LC_CODE_SIGNATURE if present, reclaiming load command space.
+/// Returns (ncmds, sizeofcmds, available_lc_space) after stripping.
+fn strip_code_signature(data: &mut [u8], ctx: &MachOContext) -> (u32, u32, u64) {
+    let mut ncmds = ctx.ncmds;
+    let mut sizeofcmds = ctx.sizeofcmds;
     let mut available_lc_space = ctx.available_lc_space;
 
     if let Some(codesig_offset) = ctx.code_signature_lc_offset {
@@ -141,35 +174,28 @@ fn patch_macho(
         }
     }
 
-    // Step 2: Verify we have room for a new LC_SEGMENT_64 (72 bytes).
-    if available_lc_space < LC_SEGMENT_64_SIZE as u64 {
-        bail!(
-            "insufficient load command space for LC_SEGMENT_64: {} bytes available, {} needed.\n\
-             Strip unused load commands or rebuild with -headerpad_max_install_names",
-            available_lc_space,
-            LC_SEGMENT_64_SIZE,
-        );
-    }
+    (ncmds, sizeofcmds, available_lc_space)
+}
 
-    // Step 2b: Parse chained fixups metadata for GOT-based shmat.
-    // On ARM64, always use raw syscall: the __TR_COV segment is code-signed and
-    // the kernel maps it read-execute.  Dyld cannot write the resolved shmat
-    // address into a code-signed page → SIGBUS during fixup resolution.
-    // For dylibs, always use raw syscall: dylib init functions don't go through
-    // the same chained fixups mechanism as executables, and GOT slot resolution
-    // in __TR_COV is unreliable in the dylib loading context.
+/// Compute the layout for new segments: architecture, VAs, GOT strategy, page size.
+fn compute_layout(
+    ctx: &MachOContext,
+    data: &[u8],
+    hooks: &[ResolvedHook],
+    no_coverage: bool,
+    page_sz: u64,
+) -> MachoLayout {
     const CPU_TYPE_ARM64: u32 = 0x0100_000C;
     let use_got_shmat =
         ctx.chained_fixups_lc_offset.is_some() && ctx.cputype != CPU_TYPE_ARM64 && !ctx.is_dylib;
     let shmat_ordinal: u32 = if use_got_shmat {
         let fo = ctx.chained_fixups_dataoff as usize;
-        u32::from_le_bytes(data[fo + 16..fo + 20].try_into().unwrap()) // imports_count
+        u32::from_le_bytes(data[fo + 16..fo + 20].try_into().expect("slice is 4 bytes"))
     } else {
         0
     };
     let data_area_size: u64 = if use_got_shmat { 24 } else { DATA_SIZE };
 
-    // Detect ARM64 early — needed for segment layout decisions.
     let is_arm64 = ctx.cputype == CPU_TYPE_ARM64;
     let hook_abi = if is_arm64 {
         TargetAbi::Aarch64
@@ -178,139 +204,155 @@ fn patch_macho(
     };
 
     let segment_va = if ctx.linkedit_vmaddr > 0 {
-        ctx.linkedit_vmaddr // TR_COV takes LINKEDIT's spot; LINKEDIT shifts up
+        ctx.linkedit_vmaddr
     } else {
-        align_up(ctx.highest_va_end, page_sz) + page_sz // fallback if no LINKEDIT
+        align_up(ctx.highest_va_end, page_sz) + page_sz
     };
 
-    // On ARM64 macOS, the kernel enforces W^X: a page mapped executable cannot be
-    // written at the same time.  If __TR_COV has initprot=RWX, the kernel silently
-    // strips W, so any STR to data_va (within the same page as the code) causes
-    // SIGBUS.  Fix: give the 16-byte data area its own RW page (__TR_DAT) and keep
-    // the init code + trampolines in a separate RX page (__TR_COV).
-    // x86_64 macOS does not enforce W^X in userspace, so the original single-segment
-    // RWX layout continues to work there.
     let has_library_hooks =
         crate::hooks::count_library_hooks(hooks) > 0 || crate::hooks::count_return_hooks(hooks) > 0;
     let arm64_split = is_arm64 && (!no_coverage || has_library_hooks);
     let data_va = segment_va;
     let init_va = if arm64_split {
-        // Data lives in page 0 (RW); code starts at page 1 (RX).
         segment_va + page_sz
     } else {
         segment_va + data_area_size
     };
 
-    // Step 4: Generate init code + trampolines (skip in no-coverage mode).
+    MachoLayout {
+        is_arm64,
+        use_got_shmat,
+        arm64_split,
+        segment_va,
+        data_va,
+        init_va,
+        hook_abi,
+        shmat_ordinal,
+        page_sz,
+        data_area_size,
+    }
+}
 
-    let init_code;
-    let mut trampolines: Vec<(&BasicBlock, crate::trampoline::Trampoline)> = Vec::new();
-    let mut blocks_skipped = 0;
-    let mut current_va;
-
+/// Generate init code and coverage trampolines.
+/// Returns (init_code, trampolines, blocks_skipped, current_va).
+fn generate_init_and_trampolines<'a>(
+    ctx: &MachOContext,
+    blocks: &'a [BasicBlock],
+    layout: &MachoLayout,
+    enable_forkserver: bool,
+    tramp_gen: &dyn TrampolineGenerator,
+    no_coverage: bool,
+) -> Result<InitAndTrampolines<'a>> {
     if no_coverage {
-        init_code = crate::trampoline::InitCode {
-            va: init_va,
+        let init_code = crate::trampoline::InitCode {
+            va: layout.init_va,
             code: Vec::new(),
-            entry_va: init_va,
+            entry_va: layout.init_va,
         };
-        current_va = init_va;
-    } else {
-        init_code = if ctx.is_dylib {
-            let chain_to = ctx.mod_init_func_pointers.first().copied();
-            if is_arm64 {
-                macho_trampoline::generate_macho_dylib_init_aarch64(
-                    init_va,
-                    data_va,
-                    chain_to,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS ARM64 dylib init code")?
-            } else {
-                macho_trampoline::generate_macho_dylib_init_x86_64(
-                    init_va,
-                    data_va,
-                    chain_to,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS dylib init code")?
-            }
-        } else if ctx.lc_main_entryoff_offset.is_some() {
-            if is_arm64 {
-                macho_trampoline::generate_macho_exec_init_aarch64(
-                    init_va,
-                    data_va,
-                    ctx.entry_point,
-                    enable_forkserver,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS ARM64 exec init code")?
-            } else {
-                macho_trampoline::generate_macho_exec_init_x86_64(
-                    init_va,
-                    data_va,
-                    ctx.entry_point,
-                    enable_forkserver,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS exec init code")?
-            }
-        } else if ctx.lc_unixthread_pc_offset.is_some() {
-            if is_arm64 {
-                macho_trampoline::generate_macho_unixthread_init_aarch64(
-                    init_va,
-                    data_va,
-                    ctx.entry_point,
-                    enable_forkserver,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS ARM64 LC_UNIXTHREAD init code")?
-            } else {
-                macho_trampoline::generate_macho_unixthread_init_x86_64(
-                    init_va,
-                    data_va,
-                    ctx.entry_point,
-                    enable_forkserver,
-                    use_got_shmat,
-                )
-                .context("failed to generate macOS LC_UNIXTHREAD init code")?
-            }
+        return Ok((init_code, Vec::new(), 0, layout.init_va));
+    }
+
+    let init_code = if ctx.is_dylib {
+        let chain_to = ctx.mod_init_func_pointers.first().copied();
+        if layout.is_arm64 {
+            macho_trampoline::generate_macho_dylib_init_aarch64(
+                layout.init_va,
+                layout.data_va,
+                chain_to,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS ARM64 dylib init code")?
         } else {
-            bail!("no LC_MAIN or LC_UNIXTHREAD found — cannot determine entry point");
-        };
-
-        // Step 5: Generate trampolines.
-        let mut trampolines_start_va = init_va + init_code.code.len() as u64;
-        trampolines_start_va = align_up(trampolines_start_va, 16);
-
-        trampolines.reserve(blocks.len());
-        current_va = trampolines_start_va;
-
-        for block in blocks {
-            match tramp_gen.generate_trampoline(current_va, data_va, block) {
-                Ok(tramp) => {
-                    current_va += tramp.code.len() as u64;
-                    current_va = align_up(current_va, 8);
-                    trampolines.push((block, tramp));
-                }
-                Err(e) => {
-                    tracing::warn!("skipping block at 0x{:x}: {}", block.va, e);
-                    blocks_skipped += 1;
-                }
-            }
+            macho_trampoline::generate_macho_dylib_init_x86_64(
+                layout.init_va,
+                layout.data_va,
+                chain_to,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS dylib init code")?
         }
+    } else if ctx.lc_main_entryoff_offset.is_some() {
+        if layout.is_arm64 {
+            macho_trampoline::generate_macho_exec_init_aarch64(
+                layout.init_va,
+                layout.data_va,
+                ctx.entry_point,
+                enable_forkserver,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS ARM64 exec init code")?
+        } else {
+            macho_trampoline::generate_macho_exec_init_x86_64(
+                layout.init_va,
+                layout.data_va,
+                ctx.entry_point,
+                enable_forkserver,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS exec init code")?
+        }
+    } else if ctx.lc_unixthread_pc_offset.is_some() {
+        if layout.is_arm64 {
+            macho_trampoline::generate_macho_unixthread_init_aarch64(
+                layout.init_va,
+                layout.data_va,
+                ctx.entry_point,
+                enable_forkserver,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS ARM64 LC_UNIXTHREAD init code")?
+        } else {
+            macho_trampoline::generate_macho_unixthread_init_x86_64(
+                layout.init_va,
+                layout.data_va,
+                ctx.entry_point,
+                enable_forkserver,
+                layout.use_got_shmat,
+            )
+            .context("failed to generate macOS LC_UNIXTHREAD init code")?
+        }
+    } else {
+        bail!("no LC_MAIN or LC_UNIXTHREAD found — cannot determine entry point");
+    };
 
-        if trampolines.is_empty() {
-            bail!("all basic blocks failed trampoline generation");
+    let mut trampolines_start_va = layout.init_va + init_code.code.len() as u64;
+    trampolines_start_va = align_up(trampolines_start_va, 16);
+
+    let mut trampolines = Vec::with_capacity(blocks.len());
+    let mut current_va = trampolines_start_va;
+    let mut blocks_skipped = 0;
+
+    for block in blocks {
+        match tramp_gen.generate_trampoline(current_va, layout.data_va, block) {
+            Ok(tramp) => {
+                current_va += tramp.code.len() as u64;
+                current_va = align_up(current_va, 8);
+                trampolines.push((block, tramp));
+            }
+            Err(e) => {
+                tracing::warn!("skipping block at 0x{:x}: {}", block.va, e);
+                blocks_skipped += 1;
+            }
         }
     }
 
-    // Hook data slots, toggle bytes, and return-address slots.
-    //
-    // On ARM64 macOS (arm64_split), these MUST live in the RW data page (__TR_DAT),
-    // NOT in the RX code page (__TR_COV).  The preload library's constructor writes
-    // function pointers into hook data slots at runtime — writing to an RX page
-    // triggers SEGFAULT under W^X enforcement.
+    if trampolines.is_empty() {
+        bail!("all basic blocks failed trampoline generation");
+    }
+
+    Ok((init_code, trampolines, blocks_skipped, current_va))
+}
+
+/// Set up hook infrastructure: hook data slots, toggle bytes, return slots,
+/// shellcode blobs, and hook trampolines.
+/// Returns (hook_data_va, toggle_data_va, current_va, hook_trampolines,
+///          shellcode_blobs, return_trampolines).
+#[allow(clippy::too_many_arguments)]
+fn setup_hook_infrastructure(
+    hooks: &[ResolvedHook],
+    layout: &MachoLayout,
+    mut current_va: u64,
+) -> HookInfra {
     let num_hook_slots = crate::hooks::count_library_hooks(hooks);
     let hook_data_size = (num_hook_slots * 8) as u64;
     let toggle_area_size = if hooks.is_empty() {
@@ -322,9 +364,8 @@ fn patch_macho(
     let return_slot_area_size = (return_slot_count as u64) * 8;
 
     let (hook_data_va, toggle_data_va, return_slot_va);
-    if arm64_split {
-        // Place writable hook metadata in the data page after the coverage data area.
-        let mut data_cursor = data_va + data_area_size;
+    if layout.arm64_split {
+        let mut data_cursor = layout.data_va + layout.data_area_size;
         data_cursor = align_up(data_cursor, 8);
         hook_data_va = data_cursor;
         data_cursor += hook_data_size;
@@ -332,15 +373,13 @@ fn patch_macho(
         data_cursor += toggle_area_size;
         return_slot_va = data_cursor;
         data_cursor += return_slot_area_size;
-        // Verify it fits in one data page.
         assert!(
-            data_cursor <= data_va + page_sz,
+            data_cursor <= layout.data_va + layout.page_sz,
             "hook metadata ({} bytes) exceeds data page size ({})",
-            data_cursor - data_va,
-            page_sz,
+            data_cursor - layout.data_va,
+            layout.page_sz,
         );
     } else {
-        // x86_64 / non-split: allocate in the combined segment as before.
         hook_data_va = current_va;
         current_va += hook_data_size;
         toggle_data_va = current_va;
@@ -367,7 +406,7 @@ fn patch_macho(
         }
     }
 
-    // Group hooks by target_va for chaining (same as ELF patcher).
+    // Group hooks by target_va for chaining.
     current_va = align_up(current_va, 16);
     let mut va_groups: std::collections::BTreeMap<u64, Vec<usize>> =
         std::collections::BTreeMap::new();
@@ -375,7 +414,6 @@ fn patch_macho(
         va_groups.entry(hook.target_va).or_default().push(i);
     }
 
-    // Separate vec for return trampolines (not site-patched).
     let mut return_trampolines: Vec<crate::trampoline::Trampoline> = Vec::new();
 
     for indices in va_groups.values() {
@@ -386,11 +424,15 @@ fn patch_macho(
             let toggle_va = Some(toggle_data_va + hook.toggle_index as u64);
 
             if hook.mode == crate::hooks::HookMode::Return {
-                // Return mode: generate entry + return trampoline pair.
                 let entry_va = current_va;
                 let estimated_entry_size = 256u64;
                 let ret_tramp_va = align_up(entry_va + estimated_entry_size, 8);
-                let slot_va = return_slot_va + hook.return_slot_index.unwrap() as u64 * 8;
+                let slot_va = return_slot_va
+                    + hook
+                        .return_slot_index
+                        .expect("return hook must have return_slot_index")
+                        as u64
+                        * 8;
 
                 match crate::hook_trampoline::generate_return_hook_trampolines(
                     entry_va,
@@ -398,7 +440,7 @@ fn patch_macho(
                     hook,
                     hook_data_va,
                     sc_va,
-                    hook_abi,
+                    layout.hook_abi,
                     toggle_va,
                     slot_va,
                 ) {
@@ -428,7 +470,7 @@ fn patch_macho(
                     hook,
                     hook_data_va,
                     sc_va,
-                    hook_abi,
+                    layout.hook_abi,
                     toggle_va,
                 ) {
                     Ok(tramp) => {
@@ -458,7 +500,7 @@ fn patch_macho(
                 &chain_hooks,
                 hook_data_va,
                 &chain_sc_vas,
-                hook_abi,
+                layout.hook_abi,
                 &chain_toggle_vas,
             ) {
                 Ok(tramp) => {
@@ -477,7 +519,31 @@ fn patch_macho(
         }
     }
 
-    // Persistent mode: allocate data area and generate wrapper.
+    (
+        hook_data_va,
+        toggle_data_va,
+        current_va,
+        return_slot_va,
+        hook_trampolines,
+        shellcode_blobs,
+        return_trampolines,
+    )
+}
+
+/// Generate persistent mode wrapper and data area.
+/// Returns (persistent_data_va, persistent_wrapper, current_va).
+#[allow(clippy::too_many_arguments)]
+fn generate_persistent_wrapper(
+    ctx: &MachOContext,
+    data: &[u8],
+    layout: &MachoLayout,
+    mut current_va: u64,
+    persistent_addr: Option<u64>,
+    persistent_count: u32,
+    enable_forkserver: bool,
+    defer: bool,
+    tramp_gen: &dyn TrampolineGenerator,
+) -> Result<PersistentResult> {
     let persistent_data_va;
     let persistent_wrapper = if let Some(p_addr) = persistent_addr {
         if ctx.is_dylib {
@@ -488,20 +554,18 @@ fn patch_macho(
         current_va += PERSISTENT_DATA_SIZE;
         current_va = align_up(current_va, 16);
 
-        // Extract displaced bytes at the persistent function entry.
         let branch_sz = tramp_gen.branch_instruction_size();
-        let (displaced_bytes, displaced_len) = if is_arm64 {
-            // AArch64: fixed-width 4-byte instructions.
+        let (displaced_bytes, displaced_len) = if layout.is_arm64 {
             let foff = crate::macho::va_to_file_offset_macho(p_addr, ctx).ok_or_else(|| {
                 anyhow::anyhow!("persistent addr 0x{:x} has no file mapping", p_addr,)
             })?;
-            let n = branch_sz.div_ceil(4) * 4; // round up to instruction boundary
+            let n = branch_sz.div_ceil(4) * 4;
             if foff + n > data.len() {
                 bail!("persistent addr 0x{:x} too close to end of file", p_addr);
             }
             (data[foff..foff + n].to_vec(), n)
         } else {
-            crate::macho_disasm::extract_displaced_bytes_macho(&data, ctx, p_addr, branch_sz)
+            crate::macho_disasm::extract_displaced_bytes_macho(data, ctx, p_addr, branch_sz)
                 .with_context(|| {
                     format!(
                         "failed to extract displaced bytes at persistent addr 0x{:x}",
@@ -512,11 +576,11 @@ fn patch_macho(
 
         let include_forkserver = enable_forkserver && defer;
         let wrapper_va = current_va;
-        let wrapper = if is_arm64 {
+        let wrapper = if layout.is_arm64 {
             macho_trampoline::generate_macho_persistent_wrapper_aarch64(
                 wrapper_va,
                 persistent_data_va,
-                data_va,
+                layout.data_va,
                 p_addr,
                 &displaced_bytes,
                 displaced_len,
@@ -528,7 +592,7 @@ fn patch_macho(
             macho_trampoline::generate_macho_persistent_wrapper_x86_64(
                 wrapper_va,
                 persistent_data_va,
-                data_va,
+                layout.data_va,
                 p_addr,
                 &displaced_bytes,
                 displaced_len,
@@ -555,15 +619,23 @@ fn patch_macho(
         None
     };
 
-    // --- Heap sanitiser wrappers (optional) ---
-    // The heap san wrappers use x86_64 raw syscalls (SYS_mmap, SYS_mprotect) —
-    // these are Linux-only and will not work on macOS where syscall numbers differ.
-    // For now we only support heap san on x86_64 Mach-O as a proof of concept
-    // (the wrappers can be used in cross-compiled Linux test scenarios).
-    // ARM64 macOS heap san requires macOS-specific syscall wrappers (deferred).
-    let mut heap_san_intercepted = 0;
-    let heap_san_code = if enable_heap_san && !is_arm64 {
-        let alloc_syms = crate::macho::find_allocator_symbols_macho(ctx, &data);
+    Ok((persistent_data_va, persistent_wrapper, current_va))
+}
+
+/// Generate heap sanitiser wrappers (x86_64 only).
+/// Returns (heap_san_code, current_va).
+fn generate_heap_san(
+    ctx: &MachOContext,
+    data: &[u8],
+    layout: &MachoLayout,
+    mut current_va: u64,
+    enable_heap_san: bool,
+) -> (
+    Option<(crate::elf::AllocatorSymbols, crate::trampoline::HeapSanCode)>,
+    u64,
+) {
+    let heap_san_code = if enable_heap_san && !layout.is_arm64 {
+        let alloc_syms = crate::macho::find_allocator_symbols_macho(ctx, data);
         if alloc_syms.get("malloc").is_some() && alloc_syms.get("free").is_some() {
             current_va = align_up(current_va, 16);
             let hsw = crate::trampoline::generate_heap_san_wrappers(current_va);
@@ -571,7 +643,10 @@ fn patch_macho(
             tracing::info!(
                 "heap san (Mach-O): {} allocator functions found, wrappers at 0x{:x}",
                 alloc_syms.count(),
-                *hsw.wrappers.values().min().unwrap(),
+                *hsw.wrappers
+                    .values()
+                    .min()
+                    .expect("heap san wrappers are non-empty"),
             );
             Some((alloc_syms, hsw))
         } else {
@@ -581,7 +656,7 @@ fn patch_macho(
             );
             None
         }
-    } else if enable_heap_san && is_arm64 {
+    } else if enable_heap_san && layout.is_arm64 {
         tracing::warn!(
             "heap san: ARM64 macOS not yet supported (Linux x86_64 syscalls only), skipping"
         );
@@ -590,186 +665,193 @@ fn patch_macho(
         None
     };
 
-    let segment_end_va = current_va;
+    (heap_san_code, current_va)
+}
 
-    // For dylibs without an existing init section (__mod_init_func / __init_offsets),
-    // we will emit LC_ROUTINES_64 (cmd=0x1A, 72 bytes) which instructs dyld to call
-    // the specified VA before any section-based initialisers.  This is more robust than
-    // synthesising a section in a custom segment, because dyld only processes
-    // __mod_init_func / __init_offsets from __TEXT and __DATA; custom segment names
-    // are ignored for initialisation purposes.
-    //
-    // LC_ROUTINES_64 does not require any fixup chain entries and works with both
-    // legacy rebase/bind opcodes and LC_DYLD_CHAINED_FIXUPS.
+/// Compute segment sizes and determine if LC_ROUTINES_64 is needed.
+fn compute_segment_sizes(
+    ctx: &MachOContext,
+    layout: &MachoLayout,
+    segment_end_va: u64,
+    no_coverage: bool,
+) -> SegmentSizes {
     let needs_lc_routines_64 = ctx.is_dylib
         && ctx.mod_init_func_section.is_none()
         && ctx.init_offsets_section.is_none()
         && !no_coverage;
-    // Segment size does not change — LC_ROUTINES_64 is a load command, not segment data.
     let final_end_va = segment_end_va;
 
-    // For the ARM64 split layout the two segments span:
-    //   __TR_DAT: [segment_va, segment_va + page_sz)  — 16-byte data area (RW)
-    //   __TR_COV: [segment_va + page_sz, current_va)  — init code + trampolines (RX)
-    // For x86_64 (or no-coverage) we keep a single combined segment as before.
     let (segment_size, segment_vmsize, code_segment_size, code_segment_vmsize);
-    if arm64_split {
-        // Data segment is exactly one page.
-        segment_size = page_sz;
-        segment_vmsize = page_sz;
-        // Code segment spans from init_va to current_va.
-        code_segment_size = final_end_va - init_va;
-        code_segment_vmsize = align_up(code_segment_size, page_sz);
+    if layout.arm64_split {
+        segment_size = layout.page_sz;
+        segment_vmsize = layout.page_sz;
+        code_segment_size = final_end_va - layout.init_va;
+        code_segment_vmsize = align_up(code_segment_size, layout.page_sz);
     } else {
-        segment_size = final_end_va - segment_va;
-        segment_vmsize = align_up(segment_size, page_sz);
-        // Unused for x86_64 path.
+        segment_size = final_end_va - layout.segment_va;
+        segment_vmsize = align_up(segment_size, layout.page_sz);
         code_segment_size = 0;
         code_segment_vmsize = 0;
     }
 
-    // Step 6: Build segment data.
-    //
-    // For ARM64 split: two separate byte buffers (data_page_data, code_page_data).
-    // For x86_64: one combined buffer (segment_data).
-    let mut segment_data: Vec<u8>;
-    let mut code_segment_data: Vec<u8>;
+    SegmentSizes {
+        segment_size,
+        segment_vmsize,
+        code_segment_size,
+        code_segment_vmsize,
+        needs_lc_routines_64,
+    }
+}
 
-    if arm64_split {
-        // Data page: zeroed, 16-byte data area at offset 0.
-        segment_data = vec![0u8; segment_size as usize];
-        // Code page: zeroed, code starts at offset 0 relative to init_va.
-        code_segment_data = vec![0u8; code_segment_size as usize];
+/// Assemble all binary artifacts into segment data buffers.
+#[allow(clippy::too_many_arguments)]
+fn assemble_segment_data(
+    layout: &MachoLayout,
+    sizes: &SegmentSizes,
+    init_code: &crate::trampoline::InitCode,
+    trampolines: &[(&BasicBlock, crate::trampoline::Trampoline)],
+    hooks: &[ResolvedHook],
+    toggle_data_va: u64,
+    hook_trampolines: &[(usize, crate::trampoline::Trampoline)],
+    shellcode_blobs: &[(u64, Vec<u8>)],
+    return_trampolines: &[crate::trampoline::Trampoline],
+    persistent_data_va: u64,
+    persistent_wrapper: &Option<(u64, crate::trampoline::PersistentWrapper, usize)>,
+    heap_san_code: &Option<(crate::elf::AllocatorSymbols, crate::trampoline::HeapSanCode)>,
+) -> (Vec<u8>, Vec<u8>) {
+    if layout.arm64_split {
+        let mut segment_data = vec![0u8; sizes.segment_size as usize];
+        let mut code_segment_data = vec![0u8; sizes.code_segment_size as usize];
 
-        // GOT-based shmat is disabled for ARM64 (use_got_shmat is always false).
-        // Init code (relative to code page start = init_va).
         code_segment_data[..init_code.code.len()].copy_from_slice(&init_code.code);
 
-        // Trampolines (relative to code page).
-        for (_, tramp) in &trampolines {
-            let offset = (tramp.va - init_va) as usize;
+        for (_, tramp) in trampolines {
+            let offset = (tramp.va - layout.init_va) as usize;
             code_segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Toggle area (in data page, relative to data_va).
         for hook in hooks {
-            let byte_offset = (toggle_data_va - data_va) as usize + hook.toggle_index;
+            let byte_offset = (toggle_data_va - layout.data_va) as usize + hook.toggle_index;
             if byte_offset < segment_data.len() {
                 segment_data[byte_offset] = if hook.initial_enabled { 1 } else { 0 };
             }
         }
 
-        // Hook shellcode blobs (relative to code page).
-        for (sc_va, sc_bytes) in &shellcode_blobs {
-            let offset = (*sc_va - init_va) as usize;
+        for (sc_va, sc_bytes) in shellcode_blobs {
+            let offset = (*sc_va - layout.init_va) as usize;
             code_segment_data[offset..offset + sc_bytes.len()].copy_from_slice(sc_bytes);
         }
 
-        // Hook trampolines (relative to code page).
-        for (_, tramp) in &hook_trampolines {
-            let offset = (tramp.va - init_va) as usize;
+        for (_, tramp) in hook_trampolines {
+            let offset = (tramp.va - layout.init_va) as usize;
             code_segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Return trampolines (relative to code page).
-        for tramp in &return_trampolines {
-            let offset = (tramp.va - init_va) as usize;
+        for tramp in return_trampolines {
+            let offset = (tramp.va - layout.init_va) as usize;
             code_segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Persistent data + wrapper (relative to code page).
-        if let Some((wrapper_va, ref wrapper, _)) = persistent_wrapper {
-            let pd_offset = (persistent_data_va - init_va) as usize;
+        if let Some((wrapper_va, ref wrapper, _)) = *persistent_wrapper {
+            let pd_offset = (persistent_data_va - layout.init_va) as usize;
             if pd_offset < code_segment_data.len() {
-                code_segment_data[pd_offset] = 1; // first_pass = 1
+                code_segment_data[pd_offset] = 1;
             }
-            let w_offset = (wrapper_va - init_va) as usize;
+            let w_offset = (wrapper_va - layout.init_va) as usize;
             code_segment_data[w_offset..w_offset + wrapper.code.len()]
                 .copy_from_slice(&wrapper.code);
         }
 
-        // Heap san wrappers (relative to code page).
-        if let Some((_, ref hsw)) = heap_san_code {
-            let base = *hsw.wrappers.values().min().unwrap();
-            let offset = (base - init_va) as usize;
+        if let Some((_, ref hsw)) = *heap_san_code {
+            let base = *hsw
+                .wrappers
+                .values()
+                .min()
+                .expect("heap san wrappers are non-empty");
+            let offset = (base - layout.init_va) as usize;
             code_segment_data[offset..offset + hsw.code.len()].copy_from_slice(&hsw.code);
         }
+
+        (segment_data, code_segment_data)
     } else {
-        code_segment_data = Vec::new(); // unused for x86_64
+        let mut segment_data = vec![0u8; sizes.segment_size as usize];
 
-        segment_data = vec![0u8; segment_size as usize];
-
-        // Write GOT slot bind entry for dyld to resolve _shmat at load time.
-        // dyld_chained_ptr_64_bind: ordinal(24) | addend(8) | reserved(19) | next(12) | bind(1)
-        if use_got_shmat {
-            let bind_entry: u64 = (shmat_ordinal as u64 & 0xFFFFFF) | (1u64 << 63);
+        if layout.use_got_shmat {
+            let bind_entry: u64 = (layout.shmat_ordinal as u64 & 0xFFFFFF) | (1u64 << 63);
             segment_data[16..24].copy_from_slice(&bind_entry.to_le_bytes());
         }
 
-        // Init code
-        let init_offset = (init_va - segment_va) as usize;
+        let init_offset = (layout.init_va - layout.segment_va) as usize;
         segment_data[init_offset..init_offset + init_code.code.len()]
             .copy_from_slice(&init_code.code);
 
-        // Trampolines
-        for (_, tramp) in &trampolines {
-            let offset = (tramp.va - segment_va) as usize;
+        for (_, tramp) in trampolines {
+            let offset = (tramp.va - layout.segment_va) as usize;
             segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Toggle area: write initial enabled values.
         for hook in hooks {
-            let byte_offset = (toggle_data_va - segment_va) as usize + hook.toggle_index;
+            let byte_offset = (toggle_data_va - layout.segment_va) as usize + hook.toggle_index;
             if byte_offset < segment_data.len() {
                 segment_data[byte_offset] = if hook.initial_enabled { 1 } else { 0 };
             }
         }
 
-        // Hook shellcode blobs
-        for (sc_va, sc_bytes) in &shellcode_blobs {
-            let offset = (*sc_va - segment_va) as usize;
+        for (sc_va, sc_bytes) in shellcode_blobs {
+            let offset = (*sc_va - layout.segment_va) as usize;
             segment_data[offset..offset + sc_bytes.len()].copy_from_slice(sc_bytes);
         }
 
-        // Hook trampolines
-        for (_, tramp) in &hook_trampolines {
-            let offset = (tramp.va - segment_va) as usize;
+        for (_, tramp) in hook_trampolines {
+            let offset = (tramp.va - layout.segment_va) as usize;
             segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Return trampolines (return-hook-specific, not site-patched)
-        for tramp in &return_trampolines {
-            let offset = (tramp.va - segment_va) as usize;
+        for tramp in return_trampolines {
+            let offset = (tramp.va - layout.segment_va) as usize;
             segment_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
         }
 
-        // Persistent data + wrapper
-        if let Some((wrapper_va, ref wrapper, _)) = persistent_wrapper {
-            // Write persistent data area (first_pass=1 at offset 0)
-            let pd_offset = (persistent_data_va - segment_va) as usize;
-            segment_data[pd_offset] = 1; // first_pass = 1
-
-            // Write persistent wrapper code
-            let w_offset = (wrapper_va - segment_va) as usize;
+        if let Some((wrapper_va, ref wrapper, _)) = *persistent_wrapper {
+            let pd_offset = (persistent_data_va - layout.segment_va) as usize;
+            segment_data[pd_offset] = 1;
+            let w_offset = (wrapper_va - layout.segment_va) as usize;
             segment_data[w_offset..w_offset + wrapper.code.len()].copy_from_slice(&wrapper.code);
         }
 
-        // Heap san wrappers
-        if let Some((_, ref hsw)) = heap_san_code {
-            let base = *hsw.wrappers.values().min().unwrap();
-            let offset = (base - segment_va) as usize;
+        if let Some((_, ref hsw)) = *heap_san_code {
+            let base = *hsw
+                .wrappers
+                .values()
+                .min()
+                .expect("heap san wrappers are non-empty");
+            let offset = (base - layout.segment_va) as usize;
             segment_data[offset..offset + hsw.code.len()].copy_from_slice(&hsw.code);
         }
+
+        (segment_data, Vec::new())
     }
+}
 
-    // Note: when needs_lc_routines_64, the init function VA is registered via
-    // LC_ROUTINES_64 (added to the load commands below) — no segment data needed.
-
-    // Step 7: Patch basic blocks with branch to trampoline.
+/// Patch basic blocks, hooks, persistent entry, and heap san sites in the binary data.
+#[allow(clippy::too_many_arguments)]
+fn patch_code_sites(
+    data: &mut [u8],
+    ctx: &MachOContext,
+    layout: &MachoLayout,
+    trampolines: &[(&BasicBlock, crate::trampoline::Trampoline)],
+    hook_trampolines: &[(usize, crate::trampoline::Trampoline)],
+    hooks: &[ResolvedHook],
+    persistent_wrapper: &Option<(u64, crate::trampoline::PersistentWrapper, usize)>,
+    persistent_addr: Option<u64>,
+    heap_san_code: &Option<(crate::elf::AllocatorSymbols, crate::trampoline::HeapSanCode)>,
+    tramp_gen: &dyn TrampolineGenerator,
+) -> Result<(usize, usize)> {
     let branch_size = tramp_gen.branch_instruction_size();
-    for (block, tramp) in &trampolines {
-        let file_offset = block.file_offset as usize;
 
+    // Patch basic blocks with branch to trampoline.
+    for (block, tramp) in trampolines {
+        let file_offset = block.file_offset as usize;
         match tramp_gen.encode_branch(block.va, tramp.va) {
             Ok(branch_bytes) => {
                 data[file_offset..file_offset + branch_bytes.len()].copy_from_slice(&branch_bytes);
@@ -783,9 +865,9 @@ fn patch_macho(
         }
     }
 
-    // Step 7.5: Patch hook target sites with JMP rel32 to hook trampoline.
+    // Patch hook target sites.
     let mut hooks_applied = 0;
-    for (hook_idx, tramp) in &hook_trampolines {
+    for (hook_idx, tramp) in hook_trampolines {
         let hook = &hooks[*hook_idx];
         let file_offset = hook.file_offset as usize;
         match tramp_gen.encode_branch(hook.target_va, tramp.va) {
@@ -807,9 +889,10 @@ fn patch_macho(
         }
     }
 
-    // Step 7.6: Patch persistent function entry with branch to wrapper.
-    if let Some((wrapper_va, _, displaced_len)) = &persistent_wrapper {
-        let p_addr = persistent_addr.unwrap();
+    // Patch persistent function entry with branch to wrapper.
+    if let Some((wrapper_va, _, displaced_len)) = persistent_wrapper {
+        let p_addr =
+            persistent_addr.expect("persistent_addr is Some when persistent_wrapper is set");
         let file_offset = crate::macho::va_to_file_offset_macho(p_addr, ctx).ok_or_else(|| {
             anyhow::anyhow!("persistent addr 0x{:x}: VA to file offset failed", p_addr)
         })?;
@@ -817,7 +900,7 @@ fn patch_macho(
             Ok(branch_bytes) => {
                 data[file_offset..file_offset + branch_bytes.len()].copy_from_slice(&branch_bytes);
                 let branch_size = tramp_gen.branch_instruction_size();
-                let nop = if is_arm64 {
+                let nop = if layout.is_arm64 {
                     &[0x1F, 0x20, 0x03, 0xD5][..]
                 } else {
                     &[0x90][..]
@@ -844,16 +927,15 @@ fn patch_macho(
         }
     }
 
-    // Step 7.65: Patch allocator function entries for heap san.
-    if let Some((ref alloc_syms, ref hsw)) = heap_san_code {
+    // Patch allocator function entries for heap san.
+    let mut heap_san_intercepted = 0;
+    if let Some((ref alloc_syms, ref hsw)) = *heap_san_code {
         for (name, alloc) in &alloc_syms.entries {
             let wrapper_va = match hsw.wrappers.get(name) {
                 Some(&va) => va,
                 None => continue,
             };
             let off = alloc.patch_offset as usize;
-            // Mach-O allocator symbols are always FuncEntry (direct function patching).
-            // Overwrite the first 5 bytes with JMP rel32 to wrapper.
             if off + 5 <= data.len() {
                 let rel32 = (wrapper_va as i64 - (alloc.patch_va as i64 + 5)) as i32;
                 data[off] = 0xE9;
@@ -869,27 +951,36 @@ fn patch_macho(
         }
     }
 
-    // Step 7.7: Build chained fixups FIRST (needs original LINKEDIT data intact).
-    // We MUST update seg_count whenever we add __TR_COV, because dyld validates
-    // that the number of LC_SEGMENT_64 commands matches the chained fixups seg_count.
-    // Failure to update causes dyld to reject the binary with "seg_count does not match".
-    let new_fixups_blob: Option<Vec<u8>> = if use_got_shmat {
-        let (blob, _ordinal) =
-            build_chained_fixups_with_shmat(&data, ctx, segment_va, page_sz, ctx.libsystem_ordinal)
-                .context("failed to rebuild chained fixups with _shmat")?;
+    Ok((hooks_applied, heap_san_intercepted))
+}
+
+/// Build chained fixups blob if needed (must happen before file layout restructuring).
+fn build_fixups_blob(
+    data: &[u8],
+    ctx: &MachOContext,
+    layout: &MachoLayout,
+    no_coverage: bool,
+) -> Result<Option<Vec<u8>>> {
+    if layout.use_got_shmat {
+        let (blob, _ordinal) = build_chained_fixups_with_shmat(
+            data,
+            ctx,
+            layout.segment_va,
+            layout.page_sz,
+            ctx.libsystem_ordinal,
+        )
+        .context("failed to rebuild chained fixups with _shmat")?;
         tracing::info!(
             "rebuilt chained fixups: {} → {} bytes (shmat ordinal={}, libsystem_ordinal={})",
             ctx.chained_fixups_datasize,
             blob.len(),
-            shmat_ordinal,
+            layout.shmat_ordinal,
             ctx.libsystem_ordinal,
         );
-        Some(blob)
+        Ok(Some(blob))
     } else if ctx.chained_fixups_lc_offset.is_some() && !no_coverage {
-        // No GOT slot needed, but must still add empty seg entries.
-        // ARM64 split adds __TR_DAT + __TR_COV (2 segments); x86_64 adds __TR_COV (1 segment).
-        let extra_segs: u32 = if arm64_split { 2 } else { 1 };
-        let blob = rebuild_chained_fixups_add_n_empty_segments(&data, ctx, extra_segs)
+        let extra_segs: u32 = if layout.arm64_split { 2 } else { 1 };
+        let blob = rebuild_chained_fixups_add_n_empty_segments(data, ctx, extra_segs)
             .context("failed to rebuild chained fixups (empty segment entries)")?;
         tracing::info!(
             "rebuilt chained fixups ({} empty seg entries): {} → {} bytes",
@@ -897,52 +988,51 @@ fn patch_macho(
             ctx.chained_fixups_datasize,
             blob.len(),
         );
-        Some(blob)
+        Ok(Some(blob))
     } else {
-        None
-    };
+        Ok(None)
+    }
+}
 
-    // Step 8: Restructure file layout — place our new segment(s) BEFORE __LINKEDIT.
-    // macOS requires __LINKEDIT to be the last segment (highest vmaddr, data to EOF).
-    // ARM64 macOS enforces this at the kernel level (SIGKILL on launch).
-    //
-    // For ARM64 split: write __TR_DAT (data page) + __TR_COV (code pages) consecutively.
-    // For x86_64: write a single __TR_COV blob (unchanged from before).
-    let file_offset_of_segment; // fileoff of __TR_DAT (ARM64) or __TR_COV (x86_64)
-    let file_offset_of_code_seg; // fileoff of __TR_COV (ARM64 only)
+/// Restructure the file layout: insert segment data before __LINKEDIT.
+fn restructure_file_layout(
+    data: &mut Vec<u8>,
+    ctx: &MachOContext,
+    layout: &MachoLayout,
+    segment_data: &[u8],
+    code_segment_data: &[u8],
+    new_fixups_blob: &Option<Vec<u8>>,
+) -> FileLayout {
+    let file_offset_of_segment;
+    let file_offset_of_code_seg;
     let new_linkedit_fileoff: u64;
     let new_fixups_fileoff: u32;
     let new_fixups_size: u32;
 
     if ctx.linkedit_segment_offset.is_some() {
-        // Save original LINKEDIT data (everything from linkedit_fileoff to EOF).
         let linkedit_data = data[ctx.linkedit_fileoff as usize..].to_vec();
         data.truncate(ctx.linkedit_fileoff as usize);
 
-        // Pad to page boundary, append data segment.
-        let pad1 = align_up(data.len() as u64, page_sz) - data.len() as u64;
+        let pad1 = align_up(data.len() as u64, layout.page_sz) - data.len() as u64;
         data.extend(std::iter::repeat_n(0u8, pad1 as usize));
         file_offset_of_segment = data.len() as u64;
-        data.extend_from_slice(&segment_data);
+        data.extend_from_slice(segment_data);
 
-        if arm64_split {
-            // Pad to next page boundary, append code segment.
-            let pad_code = align_up(data.len() as u64, page_sz) - data.len() as u64;
+        if layout.arm64_split {
+            let pad_code = align_up(data.len() as u64, layout.page_sz) - data.len() as u64;
             data.extend(std::iter::repeat_n(0u8, pad_code as usize));
             file_offset_of_code_seg = data.len() as u64;
-            data.extend_from_slice(&code_segment_data);
+            data.extend_from_slice(code_segment_data);
         } else {
-            file_offset_of_code_seg = 0; // unused
+            file_offset_of_code_seg = 0;
         }
 
-        // Pad to page boundary, re-append original LINKEDIT data.
-        let pad2 = align_up(data.len() as u64, page_sz) - data.len() as u64;
+        let pad2 = align_up(data.len() as u64, layout.page_sz) - data.len() as u64;
         data.extend(std::iter::repeat_n(0u8, pad2 as usize));
         new_linkedit_fileoff = data.len() as u64;
         data.extend_from_slice(&linkedit_data);
 
-        // Append new chained fixups blob at EOF (within LINKEDIT extent).
-        if let Some(ref blob) = new_fixups_blob {
+        if let Some(ref blob) = *new_fixups_blob {
             new_fixups_fileoff = data.len() as u32;
             new_fixups_size = blob.len() as u32;
             data.extend_from_slice(blob);
@@ -951,9 +1041,8 @@ fn patch_macho(
             new_fixups_size = 0;
         }
     } else {
-        // No LINKEDIT — fall back to old layout (append at EOF).
         new_linkedit_fileoff = 0;
-        if let Some(ref blob) = new_fixups_blob {
+        if let Some(ref blob) = *new_fixups_blob {
             new_fixups_fileoff = data.len() as u32;
             new_fixups_size = blob.len() as u32;
             data.extend_from_slice(blob);
@@ -961,99 +1050,93 @@ fn patch_macho(
             new_fixups_fileoff = 0;
             new_fixups_size = 0;
         }
-        let pad = align_up(data.len() as u64, page_sz) - data.len() as u64;
+        let pad = align_up(data.len() as u64, layout.page_sz) - data.len() as u64;
         data.extend(std::iter::repeat_n(0u8, pad as usize));
         file_offset_of_segment = data.len() as u64;
-        data.extend_from_slice(&segment_data);
-        if arm64_split {
-            let pad_code = align_up(data.len() as u64, page_sz) - data.len() as u64;
+        data.extend_from_slice(segment_data);
+        if layout.arm64_split {
+            let pad_code = align_up(data.len() as u64, layout.page_sz) - data.len() as u64;
             data.extend(std::iter::repeat_n(0u8, pad_code as usize));
             file_offset_of_code_seg = data.len() as u64;
-            data.extend_from_slice(&code_segment_data);
+            data.extend_from_slice(code_segment_data);
         } else {
             file_offset_of_code_seg = 0;
         }
     }
 
-    // Step 9: Insert LC_SEGMENT_64 load command(s) (and LC_ROUTINES_64 if needed).
-    // Find insertion point: use the end of existing load commands.
-    // We must write into the space after the last valid LC.
-    //
-    // ARM64 split: 2 × LC_SEGMENT_64 (__TR_DAT + __TR_COV) = 144 bytes.
-    // x86_64:      1 × LC_SEGMENT_64 (__TR_COV) = 72 bytes.
-    const LC_ROUTINES_64_SIZE: u32 = 72; // cmd(4) + cmdsize(4) + init_address(8) + init_module(8) + reserved[8*8]
-    let lc_seg_count: u32 = if arm64_split { 2 } else { 1 };
+    FileLayout {
+        file_offset_of_segment,
+        file_offset_of_code_seg,
+        new_linkedit_fileoff,
+        new_fixups_fileoff,
+        new_fixups_size,
+    }
+}
+
+/// Insert LC_SEGMENT_64 load commands, LC_ROUTINES_64 if needed,
+/// update headers, LINKEDIT offsets, and redirect the entry point.
+#[allow(clippy::too_many_arguments)]
+fn insert_load_commands_and_update_entry(
+    data: &mut [u8],
+    ctx: &MachOContext,
+    layout: &MachoLayout,
+    sizes: &SegmentSizes,
+    file_layout: &FileLayout,
+    init_code: &crate::trampoline::InitCode,
+    mut ncmds: u32,
+    mut sizeofcmds: u32,
+    no_coverage: bool,
+) -> Result<()> {
+    const LC_ROUTINES_64_SIZE: u32 = 72;
+    let lc_seg_count: u32 = if layout.arm64_split { 2 } else { 1 };
     let lc_total_size = LC_SEGMENT_64_SIZE * lc_seg_count
-        + if needs_lc_routines_64 {
+        + if sizes.needs_lc_routines_64 {
             LC_ROUTINES_64_SIZE
         } else {
             0
         };
-    let (lc_insert_offset, _lc_end_post_shift) =
-        find_lc_insert_offset(&mut data, ctx, lc_total_size);
+    let (lc_insert_offset, _lc_end_post_shift) = find_lc_insert_offset(data, ctx, lc_total_size);
 
-    if arm64_split {
-        // __TR_DAT: RW page at segment_va — holds the 16-byte coverage data area.
+    if layout.arm64_split {
         write_lc_segment_64_named(
-            &mut data,
+            data,
             lc_insert_offset,
             b"__TR_DAT\0\0\0\0\0\0\0\0",
-            segment_va,
-            segment_vmsize,
-            file_offset_of_segment,
-            segment_size,
-            0x3, // initprot = VM_PROT_READ | VM_PROT_WRITE (no execute)
+            layout.segment_va,
+            sizes.segment_vmsize,
+            file_layout.file_offset_of_segment,
+            sizes.segment_size,
+            0x3,
         );
-        // __TR_COV: RWX page(s) at segment_va + page_sz — holds init code + trampolines.
-        //
-        // initprot=0x7 (RWX) instead of 0x5 (RX) is intentional on ARM64 macOS:
-        // The code signing executable segment limit (CS_EXECSEG) only covers the
-        // __TEXT segment.  A separate RX segment outside this range causes the kernel
-        // to SIGKILL the process when it tries to execute code there.
-        // RWX segments bypass CS_EXECSEG enforcement on ad-hoc signed binaries (no
-        // hardened runtime).  W^X enforcement is only applied under CS_RUNTIME, which
-        // is NOT set by ad-hoc codesign (`codesign -s -`).
         write_lc_segment_64_named(
-            &mut data,
+            data,
             lc_insert_offset + LC_SEGMENT_64_SIZE as usize,
             b"__TR_COV\0\0\0\0\0\0\0\0",
-            segment_va + page_sz,
-            code_segment_vmsize,
-            file_offset_of_code_seg,
-            code_segment_size,
-            0x7, // initprot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE
+            layout.segment_va + layout.page_sz,
+            sizes.code_segment_vmsize,
+            file_layout.file_offset_of_code_seg,
+            sizes.code_segment_size,
+            0x7,
         );
     } else {
-        // Single combined RWX segment (x86_64 — W^X not enforced).
         write_lc_segment_64(
-            &mut data,
+            data,
             lc_insert_offset,
-            segment_va,
-            segment_vmsize,
-            file_offset_of_segment,
-            segment_size,
-            0x7, // initprot = RWX
+            layout.segment_va,
+            sizes.segment_vmsize,
+            file_layout.file_offset_of_segment,
+            sizes.segment_size,
+            0x7,
         );
     }
 
-    // Insert LC_ROUTINES_64 immediately after the last LC_SEGMENT_64 for dylibs without
-    // an existing init section.  dyld calls the `init_address` field as the dylib init
-    // function before any section-based initialisers (__mod_init_func / __init_offsets).
-    // LC_ROUTINES_64 (cmd = 0x1A) layout:
-    //   [0]  u32 cmd          = 0x1A
-    //   [4]  u32 cmdsize      = 72
-    //   [8]  u64 init_address = init_code.entry_va
-    //   [16] u64 init_module  = 0
-    //   [24] u64[8] reserved  = 0
-    if needs_lc_routines_64 {
+    if sizes.needs_lc_routines_64 {
         const LC_ROUTINES_64_CMD: u32 = 0x1A;
         let r = lc_insert_offset + (LC_SEGMENT_64_SIZE * lc_seg_count) as usize;
-        // Zero the whole struct first
         data[r..r + LC_ROUTINES_64_SIZE as usize].fill(0);
         data[r..r + 4].copy_from_slice(&LC_ROUTINES_64_CMD.to_le_bytes());
         data[r + 4..r + 8].copy_from_slice(&LC_ROUTINES_64_SIZE.to_le_bytes());
         data[r + 8..r + 16].copy_from_slice(&init_code.entry_va.to_le_bytes());
-        // init_module = 0, all reserved fields = 0 (already zeroed)
         tracing::info!(
             "inserted LC_ROUTINES_64 init_address=0x{:x} (dylib has no existing init section)",
             init_code.entry_va,
@@ -1061,7 +1144,7 @@ fn patch_macho(
     }
 
     // Update ncmds and sizeofcmds in the header.
-    let added_ncmds: u32 = lc_seg_count + if needs_lc_routines_64 { 1 } else { 0 };
+    let added_ncmds: u32 = lc_seg_count + if sizes.needs_lc_routines_64 { 1 } else { 0 };
     ncmds += added_ncmds;
     sizeofcmds += lc_total_size;
     data[ctx.ncmds_offset as usize..ctx.ncmds_offset as usize + 4]
@@ -1069,28 +1152,30 @@ fn patch_macho(
     data[ctx.sizeofcmds_offset as usize..ctx.sizeofcmds_offset as usize + 4]
         .copy_from_slice(&sizeofcmds.to_le_bytes());
 
-    // Step 9b: Update __LINKEDIT and all LCs that reference LINKEDIT file offsets.
-    // Our new segment(s) are placed before LINKEDIT in the file, shifting all LINKEDIT
-    // data to a higher file offset. Walk all load commands and adjust.
-    if ctx.linkedit_segment_offset.is_some() && new_linkedit_fileoff > 0 {
-        let linkedit_shift = new_linkedit_fileoff - ctx.linkedit_fileoff;
-        // For ARM64 split: LINKEDIT comes after both __TR_DAT + __TR_COV.
-        let total_tr_vmsize = segment_vmsize + if arm64_split { code_segment_vmsize } else { 0 };
-        let new_linkedit_vmaddr = segment_va + total_tr_vmsize;
-        let new_linkedit_filesize = data.len() as u64 - new_linkedit_fileoff;
-        let new_linkedit_vmsize = align_up(new_linkedit_filesize, page_sz);
+    // Update __LINKEDIT and all LCs that reference LINKEDIT file offsets.
+    if ctx.linkedit_segment_offset.is_some() && file_layout.new_linkedit_fileoff > 0 {
+        let linkedit_shift = file_layout.new_linkedit_fileoff - ctx.linkedit_fileoff;
+        let total_tr_vmsize = sizes.segment_vmsize
+            + if layout.arm64_split {
+                sizes.code_segment_vmsize
+            } else {
+                0
+            };
+        let new_linkedit_vmaddr = layout.segment_va + total_tr_vmsize;
+        let new_linkedit_filesize = data.len() as u64 - file_layout.new_linkedit_fileoff;
+        let new_linkedit_vmsize = align_up(new_linkedit_filesize, layout.page_sz);
 
         update_linkedit_lc_offsets(
-            &mut data,
+            data,
             ctx,
             ncmds,
             linkedit_shift,
             new_linkedit_vmaddr,
             new_linkedit_vmsize,
-            new_linkedit_fileoff,
+            file_layout.new_linkedit_fileoff,
             new_linkedit_filesize,
-            new_fixups_fileoff,
-            new_fixups_size,
+            file_layout.new_fixups_fileoff,
+            file_layout.new_fixups_size,
         );
 
         tracing::info!(
@@ -1098,29 +1183,23 @@ fn patch_macho(
             ctx.linkedit_vmaddr,
             new_linkedit_vmaddr,
             ctx.linkedit_fileoff,
-            new_linkedit_fileoff,
+            file_layout.new_linkedit_fileoff,
             linkedit_shift,
         );
     }
 
-    // Step 10: Redirect entry point (skip in no-coverage mode).
-    //
-    // IMPORTANT: Step 9 inserted a 72-byte LC_SEGMENT_64 at `lc_insert_offset`,
-    // shifting all subsequent load commands forward by 72 bytes. The offsets
-    // stored in ctx (lc_main_entryoff_offset, lc_unixthread_pc_offset) are
-    // pre-shift values. Adjust them if they fall at or after the insertion point.
+    // Redirect entry point (skip in no-coverage mode).
     let lc_shift = lc_total_size as u64;
     if no_coverage {
         // No entry point redirect — hooks only.
     } else if ctx.is_dylib {
-        redirect_dylib_entry(&mut data, ctx, init_code.entry_va)?;
+        redirect_dylib_entry(data, ctx, init_code.entry_va)?;
     } else if let Some(lc_main_off) = ctx.lc_main_entryoff_offset {
         let adjusted_off = if lc_main_off >= lc_insert_offset as u64 {
             lc_main_off + lc_shift
         } else {
             lc_main_off
         };
-        // LC_MAIN: entryoff = init_va - __TEXT vmaddr
         let new_entryoff = init_code.entry_va - ctx.text_segment_vmaddr;
         let off = adjusted_off as usize;
         if off + 8 <= data.len() {
@@ -1139,7 +1218,6 @@ fn patch_macho(
         } else {
             pc_off
         };
-        // LC_UNIXTHREAD: patch PC register in thread state
         let off = adjusted_off as usize;
         if off + 8 <= data.len() {
             data[off..off + 8].copy_from_slice(&init_code.entry_va.to_le_bytes());
@@ -1152,21 +1230,173 @@ fn patch_macho(
         }
     }
 
+    Ok(())
+}
+
+/// Orchestrate Mach-O patching:
+/// 1. Strip code signature (reclaim LC space)
+/// 2. Compute new segment layout
+/// 3. Generate init code + trampolines
+/// 4. Set up hook infrastructure
+/// 5. Generate persistent wrapper
+/// 6. Generate heap san wrappers
+/// 7. Assemble segment data
+/// 8. Patch code sites
+/// 9. Restructure file layout
+/// 10. Insert load commands + update entry point
+#[allow(clippy::too_many_arguments)]
+fn patch_macho(
+    ctx: &MachOContext,
+    blocks: &[BasicBlock],
+    mut data: Vec<u8>,
+    enable_forkserver: bool,
+    enable_heap_san: bool,
+    tramp_gen: &dyn TrampolineGenerator,
+    hooks: &[ResolvedHook],
+    persistent_addr: Option<u64>,
+    persistent_count: u32,
+    defer: bool,
+    no_coverage: bool,
+) -> Result<PatchResult> {
+    if blocks.is_empty() && !no_coverage {
+        bail!("no basic blocks to instrument");
+    }
+
+    let page_sz = page_size_for_arch(ctx);
+
+    // Step 1: Strip code signature if present (reclaims LC space).
+    let (ncmds, sizeofcmds, available_lc_space) = strip_code_signature(&mut data, ctx);
+
+    // Step 2: Verify we have room for a new LC_SEGMENT_64 (72 bytes).
+    if available_lc_space < LC_SEGMENT_64_SIZE as u64 {
+        bail!(
+            "insufficient load command space for LC_SEGMENT_64: {} bytes available, {} needed.\n\
+             Strip unused load commands or rebuild with -headerpad_max_install_names",
+            available_lc_space,
+            LC_SEGMENT_64_SIZE,
+        );
+    }
+
+    // Step 3: Compute layout parameters.
+    let layout = compute_layout(ctx, &data, hooks, no_coverage, page_sz);
+
+    // Step 4: Generate init code + coverage trampolines.
+    let (init_code, trampolines, blocks_skipped, mut current_va) = generate_init_and_trampolines(
+        ctx,
+        blocks,
+        &layout,
+        enable_forkserver,
+        tramp_gen,
+        no_coverage,
+    )?;
+
+    // Step 5: Set up hook infrastructure.
+    let (
+        hook_data_va,
+        toggle_data_va,
+        new_current_va,
+        _return_slot_va,
+        hook_trampolines,
+        shellcode_blobs,
+        return_trampolines,
+    ) = setup_hook_infrastructure(hooks, &layout, current_va);
+    current_va = new_current_va;
+
+    // Step 6: Generate persistent wrapper.
+    let (persistent_data_va, persistent_wrapper, new_current_va) = generate_persistent_wrapper(
+        ctx,
+        &data,
+        &layout,
+        current_va,
+        persistent_addr,
+        persistent_count,
+        enable_forkserver,
+        defer,
+        tramp_gen,
+    )?;
+    current_va = new_current_va;
+
+    // Step 7: Generate heap san wrappers.
+    let (heap_san_code, new_current_va) =
+        generate_heap_san(ctx, &data, &layout, current_va, enable_heap_san);
+    current_va = new_current_va;
+
+    let segment_end_va = current_va;
+
+    // Step 8: Compute segment sizes.
+    let sizes = compute_segment_sizes(ctx, &layout, segment_end_va, no_coverage);
+
+    // Step 9: Assemble segment data buffers.
+    let (segment_data, code_segment_data) = assemble_segment_data(
+        &layout,
+        &sizes,
+        &init_code,
+        &trampolines,
+        hooks,
+        toggle_data_va,
+        &hook_trampolines,
+        &shellcode_blobs,
+        &return_trampolines,
+        persistent_data_va,
+        &persistent_wrapper,
+        &heap_san_code,
+    );
+
+    // Step 10: Patch code sites (basic blocks, hooks, persistent, heap san).
+    let (hooks_applied, heap_san_intercepted) = patch_code_sites(
+        &mut data,
+        ctx,
+        &layout,
+        &trampolines,
+        &hook_trampolines,
+        hooks,
+        &persistent_wrapper,
+        persistent_addr,
+        &heap_san_code,
+        tramp_gen,
+    )?;
+
+    // Step 11: Build chained fixups blob (needs original LINKEDIT data intact).
+    let new_fixups_blob = build_fixups_blob(&data, ctx, &layout, no_coverage)?;
+
+    // Step 12: Restructure file layout — insert segments before __LINKEDIT.
+    let file_layout = restructure_file_layout(
+        &mut data,
+        ctx,
+        &layout,
+        &segment_data,
+        &code_segment_data,
+        &new_fixups_blob,
+    );
+
+    // Step 13: Insert load commands, update LINKEDIT offsets, redirect entry point.
+    insert_load_commands_and_update_entry(
+        &mut data,
+        ctx,
+        &layout,
+        &sizes,
+        &file_layout,
+        &init_code,
+        ncmds,
+        sizeofcmds,
+        no_coverage,
+    )?;
+
     let blocks_instrumented = trampolines.len();
 
     tracing::info!(
         "Mach-O: patched {} blocks, new segment __TR_COV at VA 0x{:x} ({} bytes)",
         blocks_instrumented,
-        segment_va,
-        segment_size,
+        layout.segment_va,
+        sizes.segment_size,
     );
 
     Ok(PatchResult {
         data,
         blocks_instrumented,
         blocks_skipped,
-        segment_va,
-        segment_size,
+        segment_va: layout.segment_va,
+        segment_size: sizes.segment_size,
         heap_san_intercepted,
         hooks_applied,
         hook_data_va,
@@ -1193,7 +1423,7 @@ fn find_lc_insert_offset(data: &mut [u8], ctx: &MachOContext, lc_size: u32) -> (
         let ncmds = u32::from_le_bytes(
             data[ctx.ncmds_offset as usize..ctx.ncmds_offset as usize + 4]
                 .try_into()
-                .unwrap(),
+                .expect("slice is 4 bytes"),
         );
         // Walk LCs to find the end of valid load commands
         let mut offset = ctx.header_size;
@@ -1201,8 +1431,16 @@ fn find_lc_insert_offset(data: &mut [u8], ctx: &MachOContext, lc_size: u32) -> (
             if offset + 8 > data.len() {
                 break;
             }
-            let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cmdsize = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+            let cmd = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let cmdsize = u32::from_le_bytes(
+                data[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
             if cmd == 0 || cmdsize < 8 {
                 break;
             }
@@ -1224,14 +1462,22 @@ fn find_lc_insert_offset(data: &mut [u8], ctx: &MachOContext, lc_size: u32) -> (
         let ncmds = u32::from_le_bytes(
             data[ctx.ncmds_offset as usize..ctx.ncmds_offset as usize + 4]
                 .try_into()
-                .unwrap(),
+                .expect("slice is 4 bytes"),
         );
         for _ in 0..ncmds {
             if offset + 8 > data.len() {
                 break;
             }
-            let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cmdsize = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+            let cmd = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
+            let cmdsize = u32::from_le_bytes(
+                data[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("slice is 4 bytes"),
+            );
             if cmd == 0 || cmdsize < 8 {
                 break;
             }
@@ -1326,7 +1572,11 @@ fn shift_lc_u32_field(data: &mut [u8], offset: usize, shift: u64) {
     if offset + 4 > data.len() {
         return;
     }
-    let val = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    let val = u32::from_le_bytes(
+        data[offset..offset + 4]
+            .try_into()
+            .expect("slice is 4 bytes"),
+    );
     if val == 0 {
         return; // Skip unused fields
     }
@@ -1358,8 +1608,16 @@ fn update_linkedit_lc_offsets(
         if lc_off + 8 > data.len() {
             break;
         }
-        let cmd = u32::from_le_bytes(data[lc_off..lc_off + 4].try_into().unwrap());
-        let cmdsize = u32::from_le_bytes(data[lc_off + 4..lc_off + 8].try_into().unwrap());
+        let cmd = u32::from_le_bytes(
+            data[lc_off..lc_off + 4]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
+        let cmdsize = u32::from_le_bytes(
+            data[lc_off + 4..lc_off + 8]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
         if cmd == 0 || cmdsize < 8 {
             break;
         }
@@ -1441,17 +1699,23 @@ fn rebuild_chained_fixups_add_n_empty_segments(
     let orig = &data[orig_off..orig_off + orig_size];
 
     // Parse header (28 bytes)
-    let fixups_version = u32::from_le_bytes(orig[0..4].try_into().unwrap());
-    let starts_offset = u32::from_le_bytes(orig[4..8].try_into().unwrap()) as usize;
-    let imports_offset = u32::from_le_bytes(orig[8..12].try_into().unwrap()) as usize;
-    let symbols_offset = u32::from_le_bytes(orig[12..16].try_into().unwrap()) as usize;
-    let imports_count = u32::from_le_bytes(orig[16..20].try_into().unwrap());
-    let imports_format = u32::from_le_bytes(orig[20..24].try_into().unwrap());
-    let symbols_format = u32::from_le_bytes(orig[24..28].try_into().unwrap());
+    let fixups_version = u32::from_le_bytes(orig[0..4].try_into().expect("slice is 4 bytes"));
+    let starts_offset =
+        u32::from_le_bytes(orig[4..8].try_into().expect("slice is 4 bytes")) as usize;
+    let imports_offset =
+        u32::from_le_bytes(orig[8..12].try_into().expect("slice is 4 bytes")) as usize;
+    let symbols_offset =
+        u32::from_le_bytes(orig[12..16].try_into().expect("slice is 4 bytes")) as usize;
+    let imports_count = u32::from_le_bytes(orig[16..20].try_into().expect("slice is 4 bytes"));
+    let imports_format = u32::from_le_bytes(orig[20..24].try_into().expect("slice is 4 bytes"));
+    let symbols_format = u32::from_le_bytes(orig[24..28].try_into().expect("slice is 4 bytes"));
 
     // Parse starts_in_image
-    let orig_seg_count =
-        u32::from_le_bytes(orig[starts_offset..starts_offset + 4].try_into().unwrap());
+    let orig_seg_count = u32::from_le_bytes(
+        orig[starts_offset..starts_offset + 4]
+            .try_into()
+            .expect("slice is 4 bytes"),
+    );
     let new_seg_count = orig_seg_count + extra_count;
     let orig_starts_hdr_end = starts_offset + 4 + orig_seg_count as usize * 4;
 
@@ -1459,7 +1723,9 @@ fn rebuild_chained_fixups_add_n_empty_segments(
     let mut orig_seg_offsets = Vec::with_capacity(orig_seg_count as usize);
     for i in 0..orig_seg_count as usize {
         let off = starts_offset + 4 + i * 4;
-        orig_seg_offsets.push(u32::from_le_bytes(orig[off..off + 4].try_into().unwrap()));
+        orig_seg_offsets.push(u32::from_le_bytes(
+            orig[off..off + 4].try_into().expect("slice is 4 bytes"),
+        ));
     }
 
     // New segments are inserted before __LINKEDIT.
@@ -1570,13 +1836,16 @@ fn build_chained_fixups_with_shmat(
     let orig = &data[orig_off..orig_off + orig_size];
 
     // Parse header (28 bytes)
-    let fixups_version = u32::from_le_bytes(orig[0..4].try_into().unwrap());
-    let starts_offset = u32::from_le_bytes(orig[4..8].try_into().unwrap()) as usize;
-    let imports_offset = u32::from_le_bytes(orig[8..12].try_into().unwrap()) as usize;
-    let symbols_offset = u32::from_le_bytes(orig[12..16].try_into().unwrap()) as usize;
-    let imports_count = u32::from_le_bytes(orig[16..20].try_into().unwrap());
-    let imports_format = u32::from_le_bytes(orig[20..24].try_into().unwrap());
-    let symbols_format = u32::from_le_bytes(orig[24..28].try_into().unwrap());
+    let fixups_version = u32::from_le_bytes(orig[0..4].try_into().expect("slice is 4 bytes"));
+    let starts_offset =
+        u32::from_le_bytes(orig[4..8].try_into().expect("slice is 4 bytes")) as usize;
+    let imports_offset =
+        u32::from_le_bytes(orig[8..12].try_into().expect("slice is 4 bytes")) as usize;
+    let symbols_offset =
+        u32::from_le_bytes(orig[12..16].try_into().expect("slice is 4 bytes")) as usize;
+    let imports_count = u32::from_le_bytes(orig[16..20].try_into().expect("slice is 4 bytes"));
+    let imports_format = u32::from_le_bytes(orig[20..24].try_into().expect("slice is 4 bytes"));
+    let symbols_format = u32::from_le_bytes(orig[24..28].try_into().expect("slice is 4 bytes"));
 
     if imports_format != 1 {
         bail!(
@@ -1586,8 +1855,11 @@ fn build_chained_fixups_with_shmat(
     }
 
     // Parse starts_in_image
-    let orig_seg_count =
-        u32::from_le_bytes(orig[starts_offset..starts_offset + 4].try_into().unwrap());
+    let orig_seg_count = u32::from_le_bytes(
+        orig[starts_offset..starts_offset + 4]
+            .try_into()
+            .expect("slice is 4 bytes"),
+    );
     let new_seg_count = orig_seg_count + 1;
     let orig_starts_hdr_end = starts_offset + 4 + orig_seg_count as usize * 4;
 
@@ -1595,7 +1867,9 @@ fn build_chained_fixups_with_shmat(
     let mut orig_seg_offsets = Vec::with_capacity(orig_seg_count as usize);
     for i in 0..orig_seg_count as usize {
         let off = starts_offset + 4 + i * 4;
-        orig_seg_offsets.push(u32::from_le_bytes(orig[off..off + 4].try_into().unwrap()));
+        orig_seg_offsets.push(u32::from_le_bytes(
+            orig[off..off + 4].try_into().expect("slice is 4 bytes"),
+        ));
     }
 
     // Find pointer_format from first segment with fixups.
@@ -1605,8 +1879,11 @@ fn build_chained_fixups_with_shmat(
         if off != 0 {
             let sis_base = starts_offset + off as usize;
             if sis_base + 8 <= orig.len() {
-                pointer_format =
-                    u16::from_le_bytes(orig[sis_base + 6..sis_base + 8].try_into().unwrap());
+                pointer_format = u16::from_le_bytes(
+                    orig[sis_base + 6..sis_base + 8]
+                        .try_into()
+                        .expect("slice is 2 bytes"),
+                );
             }
             break;
         }
@@ -1729,34 +2006,34 @@ fn build_chained_fixups_with_shmat(
 /// If neither exists, do nothing here — the caller will add LC_ROUTINES_64.
 fn redirect_dylib_entry(data: &mut [u8], ctx: &MachOContext, init_va: u64) -> Result<()> {
     // Prefer __mod_init_func (64-bit absolute pointers)
-    if let Some(ref mod_init) = ctx.mod_init_func_section {
-        if mod_init.section_size >= 8 {
-            let off = mod_init.section_offset as usize;
-            if off + 8 <= data.len() {
-                data[off..off + 8].copy_from_slice(&init_va.to_le_bytes());
-                tracing::info!(
-                    "patched __mod_init_func[0] to 0x{:x} (chains to original)",
-                    init_va,
-                );
-                return Ok(());
-            }
+    if let Some(ref mod_init) = ctx.mod_init_func_section
+        && mod_init.section_size >= 8
+    {
+        let off = mod_init.section_offset as usize;
+        if off + 8 <= data.len() {
+            data[off..off + 8].copy_from_slice(&init_va.to_le_bytes());
+            tracing::info!(
+                "patched __mod_init_func[0] to 0x{:x} (chains to original)",
+                init_va,
+            );
+            return Ok(());
         }
     }
 
     // Fall back to __init_offsets (32-bit offsets from __TEXT base)
-    if let Some(ref init_off) = ctx.init_offsets_section {
-        if init_off.section_size >= 4 {
-            let off = init_off.section_offset as usize;
-            if off + 4 <= data.len() {
-                let offset32 = (init_va - init_off.text_segment_vmaddr) as u32;
-                data[off..off + 4].copy_from_slice(&offset32.to_le_bytes());
-                tracing::info!(
-                    "patched __init_offsets[0] to offset 0x{:x} (VA 0x{:x}, chains to original)",
-                    offset32,
-                    init_va,
-                );
-                return Ok(());
-            }
+    if let Some(ref init_off) = ctx.init_offsets_section
+        && init_off.section_size >= 4
+    {
+        let off = init_off.section_offset as usize;
+        if off + 4 <= data.len() {
+            let offset32 = (init_va - init_off.text_segment_vmaddr) as u32;
+            data[off..off + 4].copy_from_slice(&offset32.to_le_bytes());
+            tracing::info!(
+                "patched __init_offsets[0] to offset 0x{:x} (VA 0x{:x}, chains to original)",
+                offset32,
+                init_va,
+            );
+            return Ok(());
         }
     }
 
@@ -1786,24 +2063,42 @@ mod tests {
         write_lc_segment_64(&mut data, 0, 0x200000, 0x4000, 0x8000, 0x1234, 0x7);
 
         // cmd = LC_SEGMENT_64
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 0x19);
+        assert_eq!(
+            u32::from_le_bytes(data[0..4].try_into().expect("slice is 4 bytes")),
+            0x19
+        );
         // cmdsize = 72
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 72);
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().expect("slice is 4 bytes")),
+            72
+        );
         // segname starts with "__TR_COV"
         assert_eq!(&data[8..16], b"__TR_COV");
         // vmaddr
         assert_eq!(
-            u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            u64::from_le_bytes(data[24..32].try_into().expect("slice is 8 bytes")),
             0x200000
         );
         // vmsize
-        assert_eq!(u64::from_le_bytes(data[32..40].try_into().unwrap()), 0x4000);
+        assert_eq!(
+            u64::from_le_bytes(data[32..40].try_into().expect("slice is 8 bytes")),
+            0x4000
+        );
         // fileoff
-        assert_eq!(u64::from_le_bytes(data[40..48].try_into().unwrap()), 0x8000);
+        assert_eq!(
+            u64::from_le_bytes(data[40..48].try_into().expect("slice is 8 bytes")),
+            0x8000
+        );
         // filesize
-        assert_eq!(u64::from_le_bytes(data[48..56].try_into().unwrap()), 0x1234);
+        assert_eq!(
+            u64::from_le_bytes(data[48..56].try_into().expect("slice is 8 bytes")),
+            0x1234
+        );
         // maxprot = 7
-        assert_eq!(u32::from_le_bytes(data[56..60].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(data[56..60].try_into().expect("slice is 4 bytes")),
+            7
+        );
     }
 
     // --- shift_lc_u32_field tests ---
@@ -1814,7 +2109,7 @@ mod tests {
         data[0..4].copy_from_slice(&1000u32.to_le_bytes());
         shift_lc_u32_field(&mut data, 0, 0x2000);
         assert_eq!(
-            u32::from_le_bytes(data[0..4].try_into().unwrap()),
+            u32::from_le_bytes(data[0..4].try_into().expect("slice is 4 bytes")),
             1000 + 0x2000,
         );
     }
@@ -1824,7 +2119,10 @@ mod tests {
         let mut data = vec![0u8; 8];
         // Zero field should remain zero (unused LC_DYSYMTAB fields).
         shift_lc_u32_field(&mut data, 0, 0x5000);
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(data[0..4].try_into().expect("slice is 4 bytes")),
+            0
+        );
     }
 
     #[test]
@@ -1843,7 +2141,7 @@ mod tests {
         // Shift by a large amount (simulating TR_COV + padding between LINKEDIT)
         shift_lc_u32_field(&mut data, 0, 0x10_0000);
         assert_eq!(
-            u32::from_le_bytes(data[0..4].try_into().unwrap()),
+            u32::from_le_bytes(data[0..4].try_into().expect("slice is 4 bytes")),
             0x8000 + 0x10_0000,
         );
     }
@@ -1862,12 +2160,12 @@ mod tests {
 
     /// Helper: read a u32 from offset.
     fn get_u32(data: &[u8], off: usize) -> u32 {
-        u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+        u32::from_le_bytes(data[off..off + 4].try_into().expect("slice is 4 bytes"))
     }
 
     /// Helper: read a u64 from offset.
     fn get_u64(data: &[u8], off: usize) -> u64 {
-        u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+        u64::from_le_bytes(data[off..off + 8].try_into().expect("slice is 8 bytes"))
     }
 
     /// Build a synthetic Mach-O header with __TEXT, __LINKEDIT, LC_MAIN,
@@ -2188,7 +2486,9 @@ mod tests {
     #[test]
     fn test_update_linkedit_lc_offsets_linkedit_segment() {
         let (mut data, ctx) = build_macho_with_linkedit(0x0100_000C); // ARM64
-        let linkedit_lc = ctx.linkedit_segment_offset.unwrap() as usize;
+        let linkedit_lc = ctx
+            .linkedit_segment_offset
+            .expect("linkedit_segment_offset must be set") as usize;
         let shift = 0x10000u64;
         let new_vmaddr = ctx.linkedit_vmaddr + shift;
         let new_fileoff = ctx.linkedit_fileoff + shift;
@@ -2468,8 +2768,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // In file layout, TR_COV data must come before LINKEDIT data.
         assert!(
@@ -2513,7 +2819,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // LINKEDIT fileoff + filesize must equal total file size (extends to EOF).
         assert_eq!(
@@ -2556,7 +2865,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let new_off = linkedit.3 as usize;
 
         // Original LINKEDIT data should appear at the new offset, byte-for-byte.
@@ -2571,7 +2883,7 @@ mod tests {
     #[test]
     fn test_patch_macho_x86_64_lc_symtab_shifted() {
         let (data, ctx) = build_macho_with_linkedit(0x0100_0007);
-        let orig_symtab = read_symtab(&data, ctx.header_size).unwrap();
+        let orig_symtab = read_symtab(&data, ctx.header_size).expect("read_symtab should succeed");
 
         let block = BasicBlock {
             va: ctx.text.va,
@@ -2597,10 +2909,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = linkedit.3 - ctx.linkedit_fileoff;
 
-        let new_symtab = read_symtab(&result.data, ctx.header_size).unwrap();
+        let new_symtab =
+            read_symtab(&result.data, ctx.header_size).expect("read_symtab should succeed");
         assert_eq!(
             new_symtab.0,
             orig_symtab.0 + shift as u32,
@@ -2618,7 +2934,8 @@ mod tests {
     #[test]
     fn test_patch_macho_x86_64_lc_function_starts_shifted() {
         let (data, ctx) = build_macho_with_linkedit(0x0100_0007);
-        let orig_fs = read_function_starts_offset(&data, ctx.header_size).unwrap();
+        let orig_fs = read_function_starts_offset(&data, ctx.header_size)
+            .expect("read_function_starts_offset should succeed");
 
         let block = BasicBlock {
             va: ctx.text.va,
@@ -2644,10 +2961,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = linkedit.3 - ctx.linkedit_fileoff;
 
-        let new_fs = read_function_starts_offset(&result.data, ctx.header_size).unwrap();
+        let new_fs = read_function_starts_offset(&result.data, ctx.header_size)
+            .expect("read_function_starts_offset should succeed");
         assert_eq!(
             new_fs,
             orig_fs + shift as u32,
@@ -2659,7 +2980,8 @@ mod tests {
     #[test]
     fn test_patch_macho_x86_64_lc_dysymtab_shifted() {
         let (data, ctx) = build_macho_with_linkedit(0x0100_0007);
-        let orig_indirect = read_dysymtab_indirectsymoff(&data, ctx.header_size).unwrap();
+        let orig_indirect = read_dysymtab_indirectsymoff(&data, ctx.header_size)
+            .expect("read_dysymtab_indirectsymoff should succeed");
 
         let block = BasicBlock {
             va: ctx.text.va,
@@ -2685,10 +3007,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = linkedit.3 - ctx.linkedit_fileoff;
 
-        let new_indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size).unwrap();
+        let new_indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size)
+            .expect("read_dysymtab_indirectsymoff should succeed");
         assert_eq!(
             new_indirect,
             orig_indirect + shift as u32,
@@ -2727,14 +3053,17 @@ mod tests {
         let file_len = result.data.len() as u32;
 
         // Every shifted offset must be < file length.
-        let symtab = read_symtab(&result.data, ctx.header_size).unwrap();
+        let symtab =
+            read_symtab(&result.data, ctx.header_size).expect("read_symtab should succeed");
         assert!(symtab.0 < file_len, "symoff out of file bounds");
         assert!(symtab.1 < file_len, "stroff out of file bounds");
 
-        let fs = read_function_starts_offset(&result.data, ctx.header_size).unwrap();
+        let fs = read_function_starts_offset(&result.data, ctx.header_size)
+            .expect("read_function_starts_offset should succeed");
         assert!(fs < file_len, "function_starts dataoff out of file bounds");
 
-        let indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size).unwrap();
+        let indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size)
+            .expect("read_dysymtab_indirectsymoff should succeed");
         assert!(indirect < file_len, "indirectsymoff out of file bounds");
     }
 
@@ -2805,8 +3134,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         assert!(
             tr_cov.3 < linkedit.3,
@@ -2836,7 +3171,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         assert_eq!(
             linkedit.3 + linkedit.4,
@@ -2865,8 +3203,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // ARM64 uses 16KB pages — all segment offsets must be 16KB-aligned.
         assert_eq!(tr_cov.1 % 0x4000, 0, "TR_COV vmaddr must be 16KB-aligned");
@@ -2910,7 +3254,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let new_off = linkedit.3 as usize;
 
         let relocated = &result.data[new_off..new_off + orig_linkedit.len()];
@@ -2924,9 +3271,11 @@ mod tests {
     #[test]
     fn test_patch_macho_arm64_lc_offsets_shifted() {
         let (data, ctx) = build_macho_with_linkedit(0x0100_000C);
-        let orig_symtab = read_symtab(&data, ctx.header_size).unwrap();
-        let orig_fs = read_function_starts_offset(&data, ctx.header_size).unwrap();
-        let orig_indirect = read_dysymtab_indirectsymoff(&data, ctx.header_size).unwrap();
+        let orig_symtab = read_symtab(&data, ctx.header_size).expect("read_symtab should succeed");
+        let orig_fs = read_function_starts_offset(&data, ctx.header_size)
+            .expect("read_function_starts_offset should succeed");
+        let orig_indirect = read_dysymtab_indirectsymoff(&data, ctx.header_size)
+            .expect("read_dysymtab_indirectsymoff should succeed");
 
         let result = patch_macho(
             &ctx,
@@ -2944,12 +3293,18 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = (linkedit.3 - ctx.linkedit_fileoff) as u32;
 
-        let new_symtab = read_symtab(&result.data, ctx.header_size).unwrap();
-        let new_fs = read_function_starts_offset(&result.data, ctx.header_size).unwrap();
-        let new_indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size).unwrap();
+        let new_symtab =
+            read_symtab(&result.data, ctx.header_size).expect("read_symtab should succeed");
+        let new_fs = read_function_starts_offset(&result.data, ctx.header_size)
+            .expect("read_function_starts_offset should succeed");
+        let new_indirect = read_dysymtab_indirectsymoff(&result.data, ctx.header_size)
+            .expect("read_dysymtab_indirectsymoff should succeed");
 
         assert_eq!(new_symtab.0, orig_symtab.0 + shift, "ARM64: symoff shift");
         assert_eq!(new_symtab.1, orig_symtab.1 + shift, "ARM64: stroff shift");
@@ -3303,7 +3658,8 @@ mod tests {
     #[test]
     fn test_update_linkedit_lc_offsets_data_in_code() {
         let (mut data, ctx) = build_macho_all_lcs(0x0100_0007, false);
-        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
+        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
         let shift = 0x6000u64;
 
         update_linkedit_lc_offsets(
@@ -3319,7 +3675,8 @@ mod tests {
             0,
         );
 
-        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
+        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(
             new.0,
             orig.0 + shift as u32,
@@ -3333,7 +3690,8 @@ mod tests {
     #[test]
     fn test_update_linkedit_lc_offsets_exports_trie() {
         let (mut data, ctx) = build_macho_all_lcs(0x0100_0007, false);
-        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
+        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
         let shift = 0x5000u64;
 
         update_linkedit_lc_offsets(
@@ -3349,7 +3707,8 @@ mod tests {
             0,
         );
 
-        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
+        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(
             new.0,
             orig.0 + shift as u32,
@@ -3363,7 +3722,8 @@ mod tests {
     #[test]
     fn test_update_linkedit_lc_offsets_segment_split_info() {
         let (mut data, ctx) = build_macho_all_lcs(0x0100_0007, false);
-        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
         let shift = 0x7000u64;
 
         update_linkedit_lc_offsets(
@@ -3379,7 +3739,8 @@ mod tests {
             0,
         );
 
-        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let new = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(
             new.0,
             orig.0 + shift as u32,
@@ -3410,7 +3771,8 @@ mod tests {
             new_blob_size,
         );
 
-        let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS).unwrap();
+        let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(
             fixups.0, new_blob_off,
             "LC_DYLD_CHAINED_FIXUPS should point to new blob offset"
@@ -3426,7 +3788,8 @@ mod tests {
     #[test]
     fn test_update_linkedit_lc_offsets_chained_fixups_shift_fallback() {
         let (mut data, ctx) = build_macho_all_lcs(0x0100_0007, true);
-        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS).unwrap();
+        let orig = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
+            .expect("read_linkedit_data_lc should succeed");
         let shift = 0x3000u64;
 
         // new_fixups_fileoff=0 triggers the shift-only fallback path.
@@ -3443,7 +3806,8 @@ mod tests {
             0,
         );
 
-        let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS).unwrap();
+        let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(
             fixups.0,
             orig.0 + shift as u32,
@@ -3460,12 +3824,15 @@ mod tests {
     #[test]
     fn test_patch_macho_all_lc_types_shifted_x86_64() {
         let (data, ctx) = build_macho_all_lcs(0x0100_0007, false);
-        let orig_symtab = read_symtab(&data, ctx.header_size).unwrap();
-        let orig_fs = read_linkedit_data_lc(&data, ctx.header_size, LC_FUNCTION_STARTS).unwrap();
-        let orig_dic = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
-        let orig_et = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
-        let orig_ssi =
-            read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let orig_symtab = read_symtab(&data, ctx.header_size).expect("read_symtab should succeed");
+        let orig_fs = read_linkedit_data_lc(&data, ctx.header_size, LC_FUNCTION_STARTS)
+            .expect("read_linkedit_data_lc should succeed");
+        let orig_dic = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
+        let orig_et = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
+        let orig_ssi = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
 
         let block = BasicBlock {
             va: ctx.text.va,
@@ -3491,29 +3858,33 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = (linkedit.3 - ctx.linkedit_fileoff) as u32;
         let file_len = result.data.len() as u32;
 
         // All offsets shifted by the same amount.
-        let new_symtab = read_symtab(&result.data, ctx.header_size).unwrap();
+        let new_symtab =
+            read_symtab(&result.data, ctx.header_size).expect("read_symtab should succeed");
         assert_eq!(new_symtab.0, orig_symtab.0 + shift, "symoff");
         assert_eq!(new_symtab.1, orig_symtab.1 + shift, "stroff");
 
-        let new_fs =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_FUNCTION_STARTS).unwrap();
+        let new_fs = read_linkedit_data_lc(&result.data, ctx.header_size, LC_FUNCTION_STARTS)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_fs.0, orig_fs.0 + shift, "function_starts");
 
-        let new_dic =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
+        let new_dic = read_linkedit_data_lc(&result.data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_dic.0, orig_dic.0 + shift, "data_in_code");
 
-        let new_et =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
+        let new_et = read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_et.0, orig_et.0 + shift, "exports_trie");
 
-        let new_ssi =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let new_ssi = read_linkedit_data_lc(&result.data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_ssi.0, orig_ssi.0 + shift, "segment_split_info");
 
         // All offsets within bounds.
@@ -3535,10 +3906,12 @@ mod tests {
     #[test]
     fn test_patch_macho_all_lc_types_shifted_arm64() {
         let (data, ctx) = build_macho_all_lcs(0x0100_000C, false);
-        let orig_dic = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
-        let orig_et = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
-        let orig_ssi =
-            read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let orig_dic = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
+        let orig_et = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
+        let orig_ssi = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
 
         let result = patch_macho(
             &ctx,
@@ -3556,19 +3929,22 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
         let shift = (linkedit.3 - ctx.linkedit_fileoff) as u32;
 
-        let new_dic =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_DATA_IN_CODE).unwrap();
+        let new_dic = read_linkedit_data_lc(&result.data, ctx.header_size, LC_DATA_IN_CODE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_dic.0, orig_dic.0 + shift, "ARM64: data_in_code");
 
-        let new_et =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_EXPORTS_TRIE).unwrap();
+        let new_et = read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_et.0, orig_et.0 + shift, "ARM64: exports_trie");
 
-        let new_ssi =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_SEGMENT_SPLIT_INFO).unwrap();
+        let new_ssi = read_linkedit_data_lc(&result.data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
+            .expect("read_linkedit_data_lc should succeed");
         assert_eq!(new_ssi.0, orig_ssi.0 + shift, "ARM64: segment_split_info");
     }
 
@@ -3594,9 +3970,12 @@ mod tests {
         .expect("patch_macho with chained fixups should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
-        let fixups =
-            read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS).unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
+        let fixups = read_linkedit_data_lc(&result.data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
+            .expect("read_linkedit_data_lc should succeed");
 
         // New fixups blob must be within LINKEDIT range.
         let linkedit_end = linkedit.3 + linkedit.4;
@@ -3650,8 +4029,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // x86_64 uses 4KB pages.
         assert_eq!(
@@ -3716,7 +4101,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // LINKEDIT must have the highest vmaddr of all segments.
         for seg in &segs {
@@ -3772,7 +4160,10 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         for seg in &segs {
             if seg.0 != "__LINKEDIT" {
@@ -3830,8 +4221,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         // TR_COV vmaddr + vmsize == LINKEDIT vmaddr (contiguous, no gap).
         assert_eq!(
@@ -3861,8 +4258,14 @@ mod tests {
         .expect("patch_macho should succeed");
 
         let segs = read_segments(&result.data, ctx.header_size);
-        let tr_cov = segs.iter().find(|s| s.0 == "__TR_COV").unwrap();
-        let linkedit = segs.iter().find(|s| s.0 == "__LINKEDIT").unwrap();
+        let tr_cov = segs
+            .iter()
+            .find(|s| s.0 == "__TR_COV")
+            .expect("__TR_COV segment must exist");
+        let linkedit = segs
+            .iter()
+            .find(|s| s.0 == "__LINKEDIT")
+            .expect("__LINKEDIT segment must exist");
 
         assert_eq!(
             tr_cov.1 + tr_cov.2,

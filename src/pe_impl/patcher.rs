@@ -129,6 +129,204 @@ impl Patcher for PePatcher {
     }
 }
 
+/// Filter and sort basic blocks, removing overlapping ones.
+fn filter_and_sort_blocks(blocks: &[BasicBlock]) -> Vec<&BasicBlock> {
+    let mut sorted: Vec<&BasicBlock> = blocks.iter().collect();
+    sorted.sort_by_key(|b| b.va);
+    let mut filtered: Vec<&BasicBlock> = Vec::with_capacity(sorted.len());
+    for block in &sorted {
+        if let Some(prev) = filtered.last()
+            && block.va < prev.va + prev.displaced_len as u64
+        {
+            continue;
+        }
+        filtered.push(block);
+    }
+    if filtered.len() < sorted.len() {
+        tracing::info!(
+            "removed {} overlapping blocks ({} -> {})",
+            sorted.len() - filtered.len(),
+            sorted.len(),
+            filtered.len(),
+        );
+    }
+    filtered
+}
+
+/// Build the section data buffer containing init code, trampolines, persistent data,
+/// hook data, shellcode blobs, and hook trampolines.
+#[allow(clippy::too_many_arguments)]
+fn build_section_data(
+    section_raw_size: u64,
+    new_section_va: u64,
+    init_va: u64,
+    init_code: &crate::trampoline::InitCode,
+    trampolines: &[(&BasicBlock, crate::trampoline::Trampoline)],
+    persistent_data_va: Option<u64>,
+    persistent_wrapper: Option<crate::trampoline::PersistentWrapper>,
+    persistent_wrapper_va: Option<u64>,
+    toggle_data_va: u64,
+    resolved_hooks: &[ResolvedHook],
+    shellcode_blobs: &[(u64, Vec<u8>)],
+    hook_trampolines: &[(usize, crate::trampoline::Trampoline)],
+    return_trampolines: &[crate::trampoline::Trampoline],
+) -> Vec<u8> {
+    let mut section_data = vec![0u8; section_raw_size as usize];
+    if !init_code.code.is_empty() {
+        let init_offset = (init_va - new_section_va) as usize;
+        section_data[init_offset..init_offset + init_code.code.len()]
+            .copy_from_slice(&init_code.code);
+    }
+    for (_, tramp) in trampolines {
+        let offset = (tramp.va - new_section_va) as usize;
+        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
+    }
+    if let Some(p_data_va) = persistent_data_va {
+        let p_offset = (p_data_va - new_section_va) as usize;
+        section_data[p_offset] = 1;
+    }
+    if let Some(wrapper) = persistent_wrapper {
+        let w_va = persistent_wrapper_va.expect("persistent_wrapper_va must be set");
+        let w_offset = (w_va - new_section_va) as usize;
+        section_data[w_offset..w_offset + wrapper.code.len()].copy_from_slice(&wrapper.code);
+    }
+    for hook in resolved_hooks {
+        let offset = (toggle_data_va - new_section_va) as usize + hook.toggle_index;
+        if offset < section_data.len() {
+            section_data[offset] = if hook.initial_enabled { 1 } else { 0 };
+        }
+    }
+    for (sc_va, sc_bytes) in shellcode_blobs {
+        let offset = (*sc_va - new_section_va) as usize;
+        section_data[offset..offset + sc_bytes.len()].copy_from_slice(sc_bytes);
+    }
+    for (_, tramp) in hook_trampolines {
+        let offset = (tramp.va - new_section_va) as usize;
+        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
+    }
+    for tramp in return_trampolines {
+        let offset = (tramp.va - new_section_va) as usize;
+        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
+    }
+    section_data
+}
+
+/// Patch basic blocks with JMP rel32 to their trampolines.
+fn patch_coverage_blocks(
+    data: &mut [u8],
+    trampolines: &[(&BasicBlock, crate::trampoline::Trampoline)],
+    tramp_gen: &dyn TrampolineGenerator,
+) -> Result<usize> {
+    let mut blocks_instrumented = 0;
+    for (block, tramp) in trampolines {
+        let branch = tramp_gen
+            .encode_branch(block.va, tramp.va)
+            .with_context(|| format!("failed to encode branch at 0x{:x}", block.va))?;
+        let fo = block.file_offset as usize;
+        if fo + branch.len() > data.len() {
+            tracing::warn!("block at 0x{:x}: file offset out of range", block.va);
+            continue;
+        }
+        data[fo..fo + branch.len()].copy_from_slice(&branch);
+        for i in branch.len()..block.displaced_len {
+            data[fo + i] = 0x90;
+        }
+        blocks_instrumented += 1;
+    }
+    Ok(blocks_instrumented)
+}
+
+/// Patch hook targets with JMP rel32 to hook trampolines.
+fn patch_hook_targets(
+    data: &mut [u8],
+    resolved_hooks: &[ResolvedHook],
+    hook_trampolines: &[(usize, crate::trampoline::Trampoline)],
+    tramp_gen: &dyn TrampolineGenerator,
+) -> Result<usize> {
+    let mut hooks_applied = 0;
+    let mut hook_tramp_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for (i, tramp) in hook_trampolines {
+        let hook = &resolved_hooks[*i];
+        hook_tramp_map.insert(hook.target_va, tramp.va);
+    }
+    for hook in resolved_hooks {
+        if let Some(&tramp_va) = hook_tramp_map.get(&hook.target_va) {
+            let branch = tramp_gen
+                .encode_branch(hook.target_va, tramp_va)
+                .with_context(|| {
+                    format!("failed to encode hook branch at 0x{:x}", hook.target_va)
+                })?;
+            let fo = hook.file_offset as usize;
+            if fo + branch.len() > data.len() {
+                tracing::warn!("hook at 0x{:x}: file offset out of range", hook.target_va);
+                continue;
+            }
+            data[fo..fo + branch.len()].copy_from_slice(&branch);
+            for i in branch.len()..hook.displaced_len {
+                data[fo + i] = 0x90;
+            }
+            hooks_applied += 1;
+            hook_tramp_map.remove(&hook.target_va);
+        }
+    }
+    Ok(hooks_applied)
+}
+
+/// Patch the persistent address with JMP rel32 to persistent wrapper.
+fn patch_persistent_addr(
+    data: &mut [u8],
+    ctx: &PeContext,
+    persistent_addr: Option<u64>,
+    persistent_wrapper_va: Option<u64>,
+    persistent_displaced_len: usize,
+    tramp_gen: &dyn TrampolineGenerator,
+) -> Result<()> {
+    if let (Some(p_addr), Some(wrapper_va)) = (persistent_addr, persistent_wrapper_va) {
+        let branch = tramp_gen
+            .encode_branch(p_addr, wrapper_va)
+            .with_context(|| format!("failed to encode persistent branch at 0x{:x}", p_addr))?;
+        let fo = crate::pe::va_to_file_offset_pe(p_addr, ctx)
+            .ok_or_else(|| anyhow::anyhow!("persistent_addr 0x{:x} has no file mapping", p_addr))?;
+        if fo + branch.len() > data.len() {
+            bail!("persistent_addr 0x{:x}: file offset out of range", p_addr);
+        }
+        data[fo..fo + branch.len()].copy_from_slice(&branch);
+        for i in branch.len()..persistent_displaced_len {
+            data[fo + i] = 0x90;
+        }
+    }
+    Ok(())
+}
+
+/// Update PE headers: NumberOfSections, SizeOfImage, CheckSum, and optionally EntryPoint.
+fn update_pe_headers(
+    data: &mut [u8],
+    ctx: &PeContext,
+    new_section_rva: u64,
+    section_virtual_size: u64,
+    section_alignment: u64,
+    need_init_code: bool,
+    init_code: &crate::trampoline::InitCode,
+) {
+    let new_num_sections = ctx.number_of_sections + 1;
+    let nsec_off = ctx.number_of_sections_field_offset as usize;
+    data[nsec_off..nsec_off + 2].copy_from_slice(&new_num_sections.to_le_bytes());
+
+    let new_size_of_image =
+        (new_section_rva + align_up(section_virtual_size, section_alignment)) as u32;
+    let soi_off = ctx.size_of_image_field_offset as usize;
+    data[soi_off..soi_off + 4].copy_from_slice(&new_size_of_image.to_le_bytes());
+
+    let cksum_off = ctx.checksum_field_offset as usize;
+    data[cksum_off..cksum_off + 4].copy_from_slice(&0u32.to_le_bytes());
+
+    if need_init_code {
+        let new_entry_rva = (init_code.entry_va - ctx.image_base) as u32;
+        let ep_off = ctx.entry_point_field_offset as usize;
+        data[ep_off..ep_off + 4].copy_from_slice(&new_entry_rva.to_le_bytes());
+    }
+}
+
 /// Orchestrate PE patching:
 /// 1. Compute new section layout
 /// 2. Generate PE init code + trampolines
@@ -154,31 +352,7 @@ fn patch_pe(
     }
 
     // Sort blocks by VA and remove overlapping ones.
-    // Two blocks overlap if the second starts within the first's displaced region.
-    // This prevents JMP rel32 patches from corrupting adjacent code.
-    let blocks = {
-        let mut sorted: Vec<&BasicBlock> = blocks.iter().collect();
-        sorted.sort_by_key(|b| b.va);
-        let mut filtered: Vec<&BasicBlock> = Vec::with_capacity(sorted.len());
-        for block in &sorted {
-            if let Some(prev) = filtered.last() {
-                if block.va < prev.va + prev.displaced_len as u64 {
-                    // This block starts within the previous block's displaced region — skip.
-                    continue;
-                }
-            }
-            filtered.push(block);
-        }
-        if filtered.len() < sorted.len() {
-            tracing::info!(
-                "removed {} overlapping blocks ({} -> {})",
-                sorted.len() - filtered.len(),
-                sorted.len(),
-                filtered.len(),
-            );
-        }
-        filtered
-    };
+    let blocks = filter_and_sort_blocks(blocks);
 
     let section_alignment = ctx.section_alignment as u64;
     let file_alignment = ctx.file_alignment as u64;
@@ -398,8 +572,9 @@ fn patch_pe(
     let mut persistent_wrapper_va: Option<u64> = None;
     let mut persistent_displaced_len: usize = 0;
     if use_persistent {
-        let p_addr = persistent_addr.unwrap();
-        let p_data_va = persistent_data_va.unwrap();
+        let p_addr = persistent_addr.expect("persistent_addr required when use_persistent is true");
+        let p_data_va =
+            persistent_data_va.expect("persistent_data_va required when use_persistent is true");
         current_va = align_up(current_va, 16);
         let wrapper_va = current_va;
         persistent_wrapper_va = Some(wrapper_va);
@@ -507,7 +682,12 @@ fn patch_pe(
                 let entry_va = current_va;
                 let estimated_entry_size = 256u64;
                 let ret_tramp_va = align_up(entry_va + estimated_entry_size, 8);
-                let slot_va = return_slot_va + hook.return_slot_index.unwrap() as u64 * ptr_size;
+                let slot_va = return_slot_va
+                    + hook
+                        .return_slot_index
+                        .expect("Return mode hook must have return_slot_index")
+                        as u64
+                        * ptr_size;
 
                 match crate::hook_trampoline::generate_return_hook_trampolines(
                     entry_va,
@@ -616,135 +796,38 @@ fn patch_pe(
     }
 
     // Build section data.
-    let mut section_data = vec![0u8; section_raw_size as usize];
-
-    // Write data area (16 bytes of zeros — shm_ptr and prev_loc).
-    // Already zeroed.
-
-    // Write init code.
-    if !init_code.code.is_empty() {
-        let init_offset = (init_va - new_section_va) as usize;
-        section_data[init_offset..init_offset + init_code.code.len()]
-            .copy_from_slice(&init_code.code);
-    }
-
-    // Write coverage trampolines.
-    for (_, tramp) in &trampolines {
-        let offset = (tramp.va - new_section_va) as usize;
-        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
-    }
-
-    // Write persistent data area (first_pass=1, rest zeroed).
-    if let Some(p_data_va) = persistent_data_va {
-        let p_offset = (p_data_va - new_section_va) as usize;
-        // first_pass = 1 at offset 0
-        section_data[p_offset] = 1;
-        // Everything else (counter, save_regs, ptrs) already zeroed.
-    }
-
-    // Write persistent wrapper code.
-    if let Some(wrapper) = persistent_wrapper {
-        let w_va = persistent_wrapper_va.unwrap();
-        let w_offset = (w_va - new_section_va) as usize;
-        section_data[w_offset..w_offset + wrapper.code.len()].copy_from_slice(&wrapper.code);
-    }
-
-    // Write toggle initial values.
-    for hook in resolved_hooks {
-        let offset = (toggle_data_va - new_section_va) as usize + hook.toggle_index;
-        if offset < section_data.len() {
-            section_data[offset] = if hook.initial_enabled { 1 } else { 0 };
-        }
-    }
-
-    // Write shellcode blobs.
-    for (sc_va, sc_bytes) in &shellcode_blobs {
-        let offset = (*sc_va - new_section_va) as usize;
-        section_data[offset..offset + sc_bytes.len()].copy_from_slice(sc_bytes);
-    }
-
-    // Write hook trampolines.
-    for (_, tramp) in &hook_trampolines {
-        let offset = (tramp.va - new_section_va) as usize;
-        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
-    }
-
-    // Write return trampolines.
-    for tramp in &return_trampolines {
-        let offset = (tramp.va - new_section_va) as usize;
-        section_data[offset..offset + tramp.code.len()].copy_from_slice(&tramp.code);
-    }
+    let section_data = build_section_data(
+        section_raw_size,
+        new_section_va,
+        init_va,
+        &init_code,
+        &trampolines,
+        persistent_data_va,
+        persistent_wrapper,
+        persistent_wrapper_va,
+        toggle_data_va,
+        resolved_hooks,
+        &shellcode_blobs,
+        &hook_trampolines,
+        &return_trampolines,
+    );
 
     // Patch basic blocks with JMP rel32 to trampolines.
-    let mut blocks_instrumented = 0;
-    for (block, tramp) in &trampolines {
-        let branch = tramp_gen
-            .encode_branch(block.va, tramp.va)
-            .with_context(|| format!("failed to encode branch at 0x{:x}", block.va))?;
-
-        let fo = block.file_offset as usize;
-        if fo + branch.len() > data.len() {
-            tracing::warn!("block at 0x{:x}: file offset out of range", block.va);
-            continue;
-        }
-        data[fo..fo + branch.len()].copy_from_slice(&branch);
-        // NOP-pad remaining displaced bytes.
-        for i in branch.len()..block.displaced_len {
-            data[fo + i] = 0x90;
-        }
-        blocks_instrumented += 1;
-    }
+    let blocks_instrumented = patch_coverage_blocks(&mut data, &trampolines, tramp_gen)?;
 
     // Patch hook targets with JMP rel32 to hook trampolines.
-    let mut hooks_applied = 0;
-    // Build a map of target_va -> trampoline VA for chained hooks.
-    let mut hook_tramp_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    for (i, tramp) in &hook_trampolines {
-        let hook = &resolved_hooks[*i];
-        hook_tramp_map.insert(hook.target_va, tramp.va);
-    }
-
-    for hook in resolved_hooks {
-        if let Some(&tramp_va) = hook_tramp_map.get(&hook.target_va) {
-            let branch = tramp_gen
-                .encode_branch(hook.target_va, tramp_va)
-                .with_context(|| {
-                    format!("failed to encode hook branch at 0x{:x}", hook.target_va)
-                })?;
-
-            let fo = hook.file_offset as usize;
-            if fo + branch.len() > data.len() {
-                tracing::warn!("hook at 0x{:x}: file offset out of range", hook.target_va);
-                continue;
-            }
-            data[fo..fo + branch.len()].copy_from_slice(&branch);
-            for i in branch.len()..hook.displaced_len {
-                data[fo + i] = 0x90;
-            }
-            hooks_applied += 1;
-            // Remove from map so we don't patch the same site twice (chained hooks).
-            hook_tramp_map.remove(&hook.target_va);
-        }
-    }
+    let hooks_applied =
+        patch_hook_targets(&mut data, resolved_hooks, &hook_trampolines, tramp_gen)?;
 
     // Patch persistent_addr with JMP rel32 to persistent wrapper.
-    if let (Some(p_addr), Some(wrapper_va)) = (persistent_addr, persistent_wrapper_va) {
-        let branch = tramp_gen
-            .encode_branch(p_addr, wrapper_va)
-            .with_context(|| format!("failed to encode persistent branch at 0x{:x}", p_addr))?;
-
-        let fo = crate::pe::va_to_file_offset_pe(p_addr, ctx)
-            .ok_or_else(|| anyhow::anyhow!("persistent_addr 0x{:x} has no file mapping", p_addr))?;
-
-        if fo + branch.len() > data.len() {
-            bail!("persistent_addr 0x{:x}: file offset out of range", p_addr);
-        }
-        data[fo..fo + branch.len()].copy_from_slice(&branch);
-        // NOP-pad remaining displaced bytes.
-        for i in branch.len()..persistent_displaced_len {
-            data[fo + i] = 0x90;
-        }
-    }
+    patch_persistent_addr(
+        &mut data,
+        ctx,
+        persistent_addr,
+        persistent_wrapper_va,
+        persistent_displaced_len,
+        tramp_gen,
+    )?;
 
     // Compute file offset for new section data.
     // Must be after all existing raw data, aligned to FileAlignment.
@@ -780,27 +863,15 @@ fn patch_pe(
     data[header_offset..header_offset + SECTION_HEADER_SIZE].copy_from_slice(&hdr);
 
     // Update PE headers.
-    // NumberOfSections += 1
-    let new_num_sections = ctx.number_of_sections + 1;
-    let nsec_off = ctx.number_of_sections_field_offset as usize;
-    data[nsec_off..nsec_off + 2].copy_from_slice(&new_num_sections.to_le_bytes());
-
-    // SizeOfImage = new_section_rva + aligned virtual size
-    let new_size_of_image =
-        (new_section_rva + align_up(section_virtual_size, section_alignment)) as u32;
-    let soi_off = ctx.size_of_image_field_offset as usize;
-    data[soi_off..soi_off + 4].copy_from_slice(&new_size_of_image.to_le_bytes());
-
-    // Zero CheckSum (let the user recalculate if needed).
-    let cksum_off = ctx.checksum_field_offset as usize;
-    data[cksum_off..cksum_off + 4].copy_from_slice(&0u32.to_le_bytes());
-
-    // Redirect entry point to init code (when coverage or library hooks need it).
-    if need_init_code {
-        let new_entry_rva = (init_code.entry_va - ctx.image_base) as u32;
-        let ep_off = ctx.entry_point_field_offset as usize;
-        data[ep_off..ep_off + 4].copy_from_slice(&new_entry_rva.to_le_bytes());
-    }
+    update_pe_headers(
+        &mut data,
+        ctx,
+        new_section_rva,
+        section_virtual_size,
+        section_alignment,
+        need_init_code,
+        &init_code,
+    );
 
     let segment_size = section_raw_size;
 
@@ -815,6 +886,1307 @@ fn patch_pe(
         hook_data_va,
         toggle_data_va,
     })
+}
+
+/// Emit x64 code to parse the decimal SHM ID from the wide-string environment
+/// variable value and construct the SHM name "afl_shm_<id>" on the stack.
+fn emit_pe64_shm_name_build(code: &mut Vec<u8>) {
+    // ===== FOUND! Parse decimal SHM ID from wide string at rsi + 26 =====
+    // lea rsi, [rsi + 26]  ; skip past "__AFL_SHM_ID=" (13 wchars = 26 bytes)
+    code.extend_from_slice(&[0x48, 0x8D, 0x76, 0x1A]);
+    // xor r14, r14  ; shmid accumulator = 0
+    code.extend_from_slice(&[0x4D, 0x31, 0xF6]);
+
+    // .parse_loop:
+    let parse_loop = code.len();
+    // movzx eax, word [rsi]  ; load wide char
+    code.extend_from_slice(&[0x0F, 0xB7, 0x06]);
+    // sub ax, '0'  (0x30)
+    code.extend_from_slice(&[0x66, 0x2D, 0x30, 0x00]);
+    // cmp ax, 9
+    code.extend_from_slice(&[0x66, 0x3D, 0x09, 0x00]);
+    // ja .parse_done
+    let ja_parse_done_pos = code.len();
+    code.extend_from_slice(&[0x77, 0x00]); // ja rel8 placeholder
+    // imul r14, r14, 10
+    code.extend_from_slice(&[0x4D, 0x6B, 0xF6, 0x0A]);
+    // movzx eax, ax
+    code.extend_from_slice(&[0x0F, 0xB7, 0xC0]);
+    // add r14, rax
+    code.extend_from_slice(&[0x49, 0x01, 0xC6]);
+    // add rsi, 2  ; next wchar
+    code.extend_from_slice(&[0x48, 0x83, 0xC6, 0x02]);
+    // jmp .parse_loop
+    let jmp_parse_rel = (parse_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_parse_rel as u8]);
+
+    // .parse_done:
+    let parse_done = code.len();
+    code[ja_parse_done_pos + 1] = (parse_done - (ja_parse_done_pos + 2)) as u8;
+
+    // ============================================================
+    // Step 3: Resolve kernel32.dll functions via PEB_LDR_DATA
+    // Then call OpenFileMappingA and MapViewOfFile.
+    //
+    // Walk PEB.Ldr.InLoadOrderModuleList to find kernel32.dll.
+    // Parse its export table to find OpenFileMappingA and MapViewOfFile.
+    // ============================================================
+
+    // First, build the SHM name "afl_shm_<id>" on the stack.
+    // The ID is in r14. We need to convert it to a decimal ASCII string.
+    // lea rdi, [rsp + 32]  ; buffer for name (after shadow space)
+    code.extend_from_slice(&[0x48, 0x8D, 0x7C, 0x24, 0x20]);
+
+    // Write "afl_shm_" prefix (8 bytes)
+    // mov rax, "afl_shm_" as u64
+    let prefix = u64::from_le_bytes(*b"afl_shm_");
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    code.extend_from_slice(&prefix.to_le_bytes());
+    // mov [rdi], rax
+    code.extend_from_slice(&[0x48, 0x89, 0x07]);
+    // lea rdi, [rdi + 8]
+    code.extend_from_slice(&[0x48, 0x8D, 0x7F, 0x08]);
+
+    // Convert r14 (SHM ID) to decimal ASCII at [rdi].
+    // We'll use a simple div-10 loop, writing digits in reverse then reversing.
+    // mov rax, r14
+    code.extend_from_slice(&[0x4C, 0x89, 0xF0]);
+    // mov rbx, rdi  ; save start of digits
+    code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .conv_loop
+    let jnz_conv_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jnz rel8 placeholder
+    // Zero case: write '0'
+    code.extend_from_slice(&[0xC6, 0x07, 0x30]); // mov byte [rdi], '0'
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi
+    // jmp .conv_done
+    let jmp_conv_done_pos = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
+
+    // .conv_loop:
+    let conv_loop = code.len();
+    code[jnz_conv_pos + 1] = (conv_loop - (jnz_conv_pos + 2)) as u8;
+    // xor edx, edx
+    code.extend_from_slice(&[0x31, 0xD2]);
+    // mov rcx, 10
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0x0A, 0x00, 0x00, 0x00]);
+    // div rcx  ; rax = quotient, rdx = remainder
+    code.extend_from_slice(&[0x48, 0xF7, 0xF1]);
+    // add dl, '0'
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
+    // mov [rdi], dl
+    code.extend_from_slice(&[0x88, 0x17]);
+    // inc rdi
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .conv_loop
+    let jnz_conv2_rel = (conv_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0x75, jnz_conv2_rel as u8]);
+
+    // Now reverse the digits at [rbx..rdi).
+    // mov byte [rdi], 0  ; null-terminate
+    code.extend_from_slice(&[0xC6, 0x07, 0x00]);
+    // dec rdi  ; rdi points to last digit
+    code.extend_from_slice(&[0x48, 0xFF, 0xCF]);
+
+    // .reverse_loop:
+    let reverse_loop = code.len();
+    // cmp rbx, rdi
+    code.extend_from_slice(&[0x48, 0x39, 0xFB]);
+    // jge .conv_done
+    let jge_conv_done_pos = code.len();
+    code.extend_from_slice(&[0x7D, 0x00]); // jge rel8 placeholder
+    // mov al, [rbx]
+    code.extend_from_slice(&[0x8A, 0x03]);
+    // mov cl, [rdi]
+    code.extend_from_slice(&[0x8A, 0x0F]);
+    // mov [rbx], cl
+    code.extend_from_slice(&[0x88, 0x0B]);
+    // mov [rdi], al
+    code.extend_from_slice(&[0x88, 0x07]);
+    // inc rbx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    // dec rdi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCF]);
+    // jmp .reverse_loop
+    let jmp_rev_rel = (reverse_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_rev_rel as u8]);
+
+    // .conv_done:
+    let conv_done = code.len();
+    code[jmp_conv_done_pos + 1] = (conv_done - (jmp_conv_done_pos + 2)) as u8;
+    code[jge_conv_done_pos + 1] = (conv_done - (jge_conv_done_pos + 2)) as u8;
+}
+
+/// Walk x64 PEB_LDR_DATA InLoadOrderModuleList to find kernel32.dll.
+/// On success, r15 = kernel32 base address.
+/// Returns the fixup position for the "kernel32 not found" jump to epilogue.
+fn emit_pe64_kernel32_walk(code: &mut Vec<u8>) -> usize {
+    // ============================================================
+    // Step 4: Walk PEB_LDR_DATA to find kernel32.dll
+    // PEB at gs:[0x60]
+    // PEB.Ldr at PEB+0x18
+    // PEB_LDR_DATA.InLoadOrderModuleList at Ldr+0x10
+    // Each entry: LDR_DATA_TABLE_ENTRY
+    //   +0x00: InLoadOrderLinks (LIST_ENTRY: Flink, Blink)
+    //   +0x30: DllBase
+    //   +0x58: BaseDllName (UNICODE_STRING: Length, MaxLength, Buffer)
+    // ============================================================
+
+    // mov rax, gs:[0x60]  ; PEB
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
+    // mov rax, [rax + 0x18]  ; PEB.Ldr
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
+    // lea rbx, [rax + 0x10]  ; &InLoadOrderModuleList (list head)
+    code.extend_from_slice(&[0x48, 0x8D, 0x58, 0x10]);
+    // mov rdi, [rbx]  ; first entry (Flink)
+    code.extend_from_slice(&[0x48, 0x8B, 0x3B]);
+
+    // .ldr_loop:
+    let ldr_loop = code.len();
+    // cmp rdi, rbx  ; back to head?
+    code.extend_from_slice(&[0x48, 0x39, 0xDF]);
+    // je .epilogue  ; kernel32 not found
+    let je_epilogue_k32_pos = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je rel32 placeholder
+
+    // Check BaseDllName: LDR_DATA_TABLE_ENTRY.BaseDllName at offset 0x58.
+    // UNICODE_STRING.Length at +0x00 (u16), Buffer at +0x08 (ptr).
+    // movzx ecx, word [rdi + 0x58]  ; BaseDllName.Length (in bytes)
+    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x58]);
+    // cmp ecx, 24  ; "KERNEL32.DLL" = 12 wchars = 24 bytes (case-insensitive check below)
+    // We also accept "kernel32.dll" (lowercase). Length must be 24.
+    code.extend_from_slice(&[0x83, 0xF9, 0x18]);
+    // jne .ldr_next
+    let jne_ldr_next1_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // mov rsi, [rdi + 0x60]  ; BaseDllName.Buffer
+    code.extend_from_slice(&[0x48, 0x8B, 0x77, 0x60]);
+
+    // Case-insensitive compare of first 6 wchars ("kernel" or "KERNEL"):
+    // We'll just check that the first wchar ORed with 0x20 == 'k' (0x6B)
+    // and the 7th wchar is '3' (0x33).
+    // movzx eax, word [rsi]  ; first wchar
+    code.extend_from_slice(&[0x0F, 0xB7, 0x06]);
+    // or al, 0x20  ; to lowercase
+    code.extend_from_slice(&[0x0C, 0x20]);
+    // cmp al, 'k'
+    code.extend_from_slice(&[0x3C, 0x6B]);
+    // jne .ldr_next
+    let jne_ldr_next2_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Check '3' at wchar index 6 (byte offset 12)
+    // movzx eax, word [rsi + 12]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0C]);
+    // cmp al, '3'
+    code.extend_from_slice(&[0x3C, 0x33]);
+    // jne .ldr_next
+    let jne_ldr_next3_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Check '2' at wchar index 7 (byte offset 14)
+    // movzx eax, word [rsi + 14]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0E]);
+    // cmp al, '2'
+    code.extend_from_slice(&[0x3C, 0x32]);
+    // jne .ldr_next
+    let jne_ldr_next4_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Found kernel32.dll! DllBase is at [rdi + 0x30].
+    // mov r15, [rdi + 0x30]  ; r15 = kernel32 base
+    code.extend_from_slice(&[0x4C, 0x8B, 0x7F, 0x30]);
+    // jmp .resolve_exports
+    let jmp_resolve_pos = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
+
+    // .ldr_next:
+    let ldr_next = code.len();
+    code[jne_ldr_next1_pos + 1] = (ldr_next - (jne_ldr_next1_pos + 2)) as u8;
+    code[jne_ldr_next2_pos + 1] = (ldr_next - (jne_ldr_next2_pos + 2)) as u8;
+    code[jne_ldr_next3_pos + 1] = (ldr_next - (jne_ldr_next3_pos + 2)) as u8;
+    code[jne_ldr_next4_pos + 1] = (ldr_next - (jne_ldr_next4_pos + 2)) as u8;
+    // mov rdi, [rdi]  ; Flink (next entry)
+    code.extend_from_slice(&[0x48, 0x8B, 0x3F]);
+    // jmp .ldr_loop
+    let jmp_ldr_rel = (ldr_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_ldr_rel as u8]);
+
+    // .resolve_exports:
+    let resolve_exports = code.len();
+    code[jmp_resolve_pos + 1] = (resolve_exports - (jmp_resolve_pos + 2)) as u8;
+
+    je_epilogue_k32_pos
+}
+
+/// Resolve ReadFile, WriteFile, ExitProcess for PE x64 persistent mode.
+/// Re-walks kernel32 exports using the base saved at [rbp - 0x68].
+fn emit_pe64_persistent_resolve(code: &mut Vec<u8>, init_va: u64, p_data_va: u64) {
+    let hash_read_file: u32 = djb2_hash(b"ReadFile");
+    let hash_write_file: u32 = djb2_hash(b"WriteFile");
+    let hash_exit_process: u32 = djb2_hash(b"ExitProcess");
+
+    // Load kernel32 base from [rbp - 0x68].
+    // mov r15, [rbp - 0x68]   ; 4C 8B 7D 98
+    code.extend_from_slice(&[0x4C, 0x8B, 0x7D, 0x98]);
+
+    // Parse export directory (same sequence as Step 5).
+    // mov eax, [r15 + 0x3C]  ; e_lfanew
+    code.extend_from_slice(&[0x41, 0x8B, 0x47, 0x3C]);
+    // lea rbx, [r15 + rax]  ; PE header
+    code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x07]);
+    // mov eax, [rbx + 0x88]  ; Export directory RVA
+    code.extend_from_slice(&[0x8B, 0x83, 0x88, 0x00, 0x00, 0x00]);
+    // test eax, eax
+    code.extend_from_slice(&[0x85, 0xC0]);
+    // jz .skip_persistent_resolve
+    let jz_skip_persist_pos = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+
+    // lea rsi, [r15 + rax]  ; export directory
+    code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]);
+
+    // mov ecx, [rsi + 0x18]  ; NumberOfNames
+    code.extend_from_slice(&[0x8B, 0x4E, 0x18]);
+    // mov eax, [rsi + 0x20]  ; AddressOfNames RVA
+    code.extend_from_slice(&[0x8B, 0x46, 0x20]);
+    // lea r13, [r15 + rax]  ; AddressOfNames
+    // REX.WRB (0x4D): W=64-bit, R=extend reg to r13, B=extend rm base to r15
+    code.extend_from_slice(&[0x4D, 0x8D, 0x2C, 0x07]);
+    // mov eax, [rsi + 0x24]  ; AddressOfNameOrdinals RVA
+    code.extend_from_slice(&[0x8B, 0x46, 0x24]);
+    // lea r14, [r15 + rax]  ; AddressOfNameOrdinals
+    code.extend_from_slice(&[0x4D, 0x8D, 0x34, 0x07]);
+    // mov eax, [rsi + 0x1C]  ; AddressOfFunctions RVA
+    code.extend_from_slice(&[0x8B, 0x46, 0x1C]);
+    // push rax  ; save AddressOfFunctions RVA
+    code.push(0x50);
+    // push r15  ; save kernel32 base
+    code.extend_from_slice(&[0x41, 0x57]);
+
+    // Use stack locals to track resolved pointers:
+    // [rbp - 0x70] = ReadFile, [rbp - 0x78] = WriteFile, [rbp - 0x80] = ExitProcess
+    // Init to 0.
+    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x90, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x70], 0
+    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x88, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x78], 0
+    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x80, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x80], 0
+
+    // xor edx, edx  ; index = 0
+    code.extend_from_slice(&[0x31, 0xD2]);
+
+    // .persist_export_loop:
+    let persist_export_loop = code.len();
+    // cmp edx, ecx
+    code.extend_from_slice(&[0x39, 0xCA]);
+    // jge .persist_exports_done
+    let jge_persist_done_pos = code.len();
+    code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]);
+
+    // mov eax, [r13 + rdx*4]  ; name RVA
+    code.extend_from_slice(&[0x41, 0x8B, 0x44, 0x95, 0x00]);
+    // lea rdi, [r15 + rax]  ; name string
+    code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]);
+
+    // DJB2 hash of name.
+    // push rdx
+    code.push(0x52);
+    // push rcx
+    code.push(0x51);
+    // mov eax, 5381
+    code.extend_from_slice(&[0xB8]);
+    code.extend_from_slice(&5381u32.to_le_bytes());
+
+    // .persist_hash_loop:
+    let persist_hash_loop = code.len();
+    // movzx ebx, byte [rdi]
+    code.extend_from_slice(&[0x0F, 0xB6, 0x1F]);
+    // test bl, bl
+    code.extend_from_slice(&[0x84, 0xDB]);
+    // jz .persist_hash_done
+    let jz_persist_hash_done = code.len();
+    code.extend_from_slice(&[0x74, 0x00]);
+    // imul eax, eax, 33
+    code.extend_from_slice(&[0x6B, 0xC0, 0x21]);
+    // add eax, ebx
+    code.extend_from_slice(&[0x01, 0xD8]);
+    // inc rdi
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+    // jmp .persist_hash_loop
+    let jmp_hash_rel = (persist_hash_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_hash_rel as u8]);
+
+    // .persist_hash_done:
+    let persist_hash_done = code.len();
+    code[jz_persist_hash_done + 1] = (persist_hash_done - (jz_persist_hash_done + 2)) as u8;
+
+    // pop rcx
+    code.push(0x59);
+    // pop rdx
+    code.push(0x5A);
+
+    // Compare hash with ReadFile.
+    code.extend_from_slice(&[0x3D]); // cmp eax, hash_read_file
+    code.extend_from_slice(&hash_read_file.to_le_bytes());
+    let jne_check_wf_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne .check_write_file
+
+    // Resolve ReadFile → [rbp-0x70]
+    code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
+    code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]); // mov ebx, [rsp+8] ; AddrOfFunctions RVA
+    code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]); // lea rbx, [r15+rbx]
+    code.extend_from_slice(&[0x8B, 0x04, 0x83]); // mov eax, [rbx+rax*4]
+    code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]); // lea rax, [r15+rax]
+    code.extend_from_slice(&[0x48, 0x89, 0x45, 0x90]); // mov [rbp-0x70], rax
+    let jmp_persist_next1 = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .persist_export_next
+
+    // .check_write_file:
+    let check_wf = code.len();
+    code[jne_check_wf_pos + 1] = (check_wf - (jne_check_wf_pos + 2)) as u8;
+
+    code.extend_from_slice(&[0x3D]); // cmp eax, hash_write_file
+    code.extend_from_slice(&hash_write_file.to_le_bytes());
+    let jne_check_ep_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne .check_exit_process
+
+    // Resolve WriteFile → [rbp-0x78]
+    code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]);
+    code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]);
+    code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]);
+    code.extend_from_slice(&[0x8B, 0x04, 0x83]);
+    code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]);
+    code.extend_from_slice(&[0x48, 0x89, 0x45, 0x88]); // mov [rbp-0x78], rax
+    let jmp_persist_next2 = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .persist_export_next
+
+    // .check_exit_process:
+    let check_ep = code.len();
+    code[jne_check_ep_pos + 1] = (check_ep - (jne_check_ep_pos + 2)) as u8;
+
+    code.extend_from_slice(&[0x3D]); // cmp eax, hash_exit_process
+    code.extend_from_slice(&hash_exit_process.to_le_bytes());
+    let jne_persist_next_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne .persist_export_next
+
+    // Resolve ExitProcess → [rbp-0x80]
+    code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]);
+    code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]);
+    code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]);
+    code.extend_from_slice(&[0x8B, 0x04, 0x83]);
+    code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]);
+    code.extend_from_slice(&[0x48, 0x89, 0x45, 0x80]); // mov [rbp-0x80], rax
+
+    // .persist_export_next:
+    let persist_export_next = code.len();
+    code[jmp_persist_next1 + 1] = (persist_export_next - (jmp_persist_next1 + 2)) as u8;
+    code[jmp_persist_next2 + 1] = (persist_export_next - (jmp_persist_next2 + 2)) as u8;
+    code[jne_persist_next_pos + 1] = (persist_export_next - (jne_persist_next_pos + 2)) as u8;
+
+    // Early exit: check if all 3 found.
+    // cmp qword [rbp-0x70], 0
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x90, 0x00]);
+    let jz_persist_cont1 = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // jz .persist_continue
+    // cmp qword [rbp-0x78], 0
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x88, 0x00]);
+    let jz_persist_cont2 = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // jz .persist_continue
+    // cmp qword [rbp-0x80], 0
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x80, 0x00]);
+    // jnz .persist_exports_done (all 3 found!)
+    let jnz_persist_all_found = code.len();
+    code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+
+    // .persist_continue:
+    let persist_continue = code.len();
+    code[jz_persist_cont1 + 1] = (persist_continue - (jz_persist_cont1 + 2)) as u8;
+    code[jz_persist_cont2 + 1] = (persist_continue - (jz_persist_cont2 + 2)) as u8;
+
+    // inc edx
+    code.extend_from_slice(&[0xFF, 0xC2]);
+    // jmp .persist_export_loop
+    let jmp_loop_rel = (persist_export_loop as i32) - (code.len() as i32 + 5);
+    code.push(0xE9);
+    code.extend_from_slice(&jmp_loop_rel.to_le_bytes());
+
+    // .persist_exports_done:
+    let persist_exports_done = code.len();
+    let rel1 = (persist_exports_done as i32) - (jge_persist_done_pos as i32 + 6);
+    code[jge_persist_done_pos + 2..jge_persist_done_pos + 6].copy_from_slice(&rel1.to_le_bytes());
+    let rel2 = (persist_exports_done as i32) - (jnz_persist_all_found as i32 + 6);
+    code[jnz_persist_all_found + 2..jnz_persist_all_found + 6].copy_from_slice(&rel2.to_le_bytes());
+
+    // Pop r15, rax (kernel32 base, AddressOfFunctions).
+    code.extend_from_slice(&[0x41, 0x5F]); // pop r15
+    code.push(0x58); // pop rax
+
+    // Store resolved pointers to persistent data area using RIP-relative mov.
+    // ReadFile → persistent_data_va + 152
+    // mov rax, [rbp-0x70]
+    code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
+    // mov [rip+disp32], rax   ; 7 bytes
+    let ip_after = init_va + code.len() as u64 + 7;
+    let disp = (p_data_va as i64 + 152 - ip_after as i64) as i32;
+    code.extend_from_slice(&[0x48, 0x89, 0x05]);
+    code.extend_from_slice(&disp.to_le_bytes());
+
+    // WriteFile → persistent_data_va + 160
+    code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x88]); // mov rax, [rbp-0x78]
+    let ip_after = init_va + code.len() as u64 + 7;
+    let disp = (p_data_va as i64 + 160 - ip_after as i64) as i32;
+    code.extend_from_slice(&[0x48, 0x89, 0x05]);
+    code.extend_from_slice(&disp.to_le_bytes());
+
+    // ExitProcess → persistent_data_va + 168
+    code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
+    let ip_after = init_va + code.len() as u64 + 7;
+    let disp = (p_data_va as i64 + 168 - ip_after as i64) as i32;
+    code.extend_from_slice(&[0x48, 0x89, 0x05]);
+    code.extend_from_slice(&disp.to_le_bytes());
+
+    // .skip_persistent_resolve:
+    let skip_persist = code.len();
+    let skip_rel = (skip_persist as i32) - (jz_skip_persist_pos as i32 + 6);
+    code[jz_skip_persist_pos + 2..jz_skip_persist_pos + 6].copy_from_slice(&skip_rel.to_le_bytes());
+}
+
+/// Emit the x64 hook-only resolution block: fresh kernel32 walk for
+/// LoadLibraryA + GetProcAddress when SHM setup was skipped.
+/// Returns (hook_resolve_label, fixup_positions_to_real_epilogue).
+fn emit_pe64_hook_only_resolve(
+    code: &mut Vec<u8>,
+    init_va: u64,
+    hook_lib: &PeHookLibraryInfo,
+) -> (usize, Vec<usize>) {
+    let mut hr_fixup_to_real_epilogue: Vec<usize> = Vec::new();
+
+    let label = code.len();
+
+    // --- Walk PEB_LDR_DATA to find kernel32 (same algo as Step 4) ---
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // mov rax, gs:[0x60]
+    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]); // mov rax, [rax+0x18]
+    code.extend_from_slice(&[0x48, 0x8D, 0x58, 0x10]); // lea rbx, [rax+0x10]
+    code.extend_from_slice(&[0x48, 0x8B, 0x3B]); // mov rdi, [rbx]
+
+    let hr_ldr_loop = code.len();
+    code.extend_from_slice(&[0x48, 0x39, 0xDF]); // cmp rdi, rbx
+    let hr_je_no_k32 = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je .real_epilogue
+    hr_fixup_to_real_epilogue.push(hr_je_no_k32);
+
+    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x58]); // movzx ecx, word [rdi+0x58]
+    code.extend_from_slice(&[0x83, 0xF9, 0x18]); // cmp ecx, 24
+    let hr_jne1 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    code.extend_from_slice(&[0x48, 0x8B, 0x77, 0x60]); // mov rsi, [rdi+0x60]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x06]); // movzx eax, word [rsi]
+    code.extend_from_slice(&[0x0C, 0x20]); // or al, 0x20
+    code.extend_from_slice(&[0x3C, 0x6B]); // cmp al, 'k'
+    let hr_jne2 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0C]); // movzx eax, word [rsi+12]
+    code.extend_from_slice(&[0x3C, 0x33]); // cmp al, '3'
+    let hr_jne3 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0E]); // movzx eax, word [rsi+14]
+    code.extend_from_slice(&[0x3C, 0x32]); // cmp al, '2'
+    let hr_jne4 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+
+    // Found! mov r15, [rdi+0x30]
+    code.extend_from_slice(&[0x4C, 0x8B, 0x7F, 0x30]);
+    let hr_jmp_found = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_found
+
+    // .hr_ldr_next:
+    let hr_ldr_next = code.len();
+    code[hr_jne1 + 1] = (hr_ldr_next - (hr_jne1 + 2)) as u8;
+    code[hr_jne2 + 1] = (hr_ldr_next - (hr_jne2 + 2)) as u8;
+    code[hr_jne3 + 1] = (hr_ldr_next - (hr_jne3 + 2)) as u8;
+    code[hr_jne4 + 1] = (hr_ldr_next - (hr_jne4 + 2)) as u8;
+    code.extend_from_slice(&[0x48, 0x8B, 0x3F]); // mov rdi, [rdi]
+    let rel = (hr_ldr_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, rel as u8]);
+
+    // .hr_found: parse kernel32 exports for LoadLibraryA + GetProcAddress
+    let hr_found = code.len();
+    code[hr_jmp_found + 1] = (hr_found - (hr_jmp_found + 2)) as u8;
+
+    code.extend_from_slice(&[0x41, 0x8B, 0x47, 0x3C]); // mov eax, [r15+0x3C]
+    code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x07]); // lea rbx, [r15+rax]
+    code.extend_from_slice(&[0x8B, 0x83, 0x88, 0x00, 0x00, 0x00]); // mov eax, [rbx+0x88]
+    code.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    let hr_jz_noexp = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz .real_epilogue
+    hr_fixup_to_real_epilogue.push(hr_jz_noexp);
+
+    code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]); // lea rsi, [r15+rax]
+    code.extend_from_slice(&[0x8B, 0x4E, 0x18]); // mov ecx, [rsi+0x18] ; NumberOfNames
+    code.extend_from_slice(&[0x8B, 0x46, 0x20]); // mov eax, [rsi+0x20] ; AddressOfNames RVA
+    code.extend_from_slice(&[0x4D, 0x8D, 0x2C, 0x07]); // lea r13, [r15+rax]
+    code.extend_from_slice(&[0x8B, 0x46, 0x24]); // mov eax, [rsi+0x24] ; Ordinals RVA
+    code.extend_from_slice(&[0x4D, 0x8D, 0x34, 0x07]); // lea r14, [r15+rax]
+    code.extend_from_slice(&[0x8B, 0x46, 0x1C]); // mov eax, [rsi+0x1C] ; AddressOfFunctions RVA
+    // lea rsi, [r15+rax] — reuse rsi for AddressOfFunctions base
+    code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]);
+
+    // Clear LoadLibraryA / GetProcAddress slots
+    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xA8, 0x00, 0x00, 0x00, 0x00]); // [rbp-0x58]=0
+    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xA0, 0x00, 0x00, 0x00, 0x00]); // [rbp-0x60]=0
+
+    let hash_lla = djb2_hash(b"LoadLibraryA");
+    let hash_gpa = djb2_hash(b"GetProcAddress");
+
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+
+    let hr_exp_loop = code.len();
+    code.extend_from_slice(&[0x39, 0xCA]); // cmp edx, ecx
+    let hr_jge_exp_done = code.len();
+    code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]); // jge .hr_exp_done
+
+    code.extend_from_slice(&[0x41, 0x8B, 0x44, 0x95, 0x00]); // mov eax, [r13+rdx*4]
+    code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]); // lea rdi, [r15+rax]
+
+    // DJB2 hash
+    code.push(0x52); // push rdx
+    code.push(0x51); // push rcx
+    code.push(0x56); // push rsi (save AddressOfFunctions base)
+    code.extend_from_slice(&[0xB8, 0x05, 0x15, 0x00, 0x00]); // mov eax, 5381
+    let hr_hl = code.len();
+    code.extend_from_slice(&[0x0F, 0xB6, 0x1F]); // movzx ebx, byte [rdi]
+    code.extend_from_slice(&[0x84, 0xDB]); // test bl, bl
+    let hr_jz_hd = code.len();
+    code.extend_from_slice(&[0x74, 0x00]);
+    code.extend_from_slice(&[0x6B, 0xC0, 0x21]); // imul eax, eax, 33
+    code.extend_from_slice(&[0x01, 0xD8]); // add eax, ebx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi
+    let r = (hr_hl as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, r as u8]);
+    let hr_hd = code.len();
+    code[hr_jz_hd + 1] = (hr_hd - (hr_jz_hd + 2)) as u8;
+    code.push(0x5E); // pop rsi
+    code.push(0x59); // pop rcx
+    code.push(0x5A); // pop rdx
+
+    // Check LoadLibraryA
+    code.extend_from_slice(&[0x3D]);
+    code.extend_from_slice(&hash_lla.to_le_bytes());
+    let hr_jne_lla = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne .hr_check_gpa
+
+    // Resolve: ordinal → function VA
+    code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
+    code.extend_from_slice(&[0x8B, 0x04, 0x86]); // mov eax, [rsi+rax*4]
+    // Replace the preceding mov with lea rdi, [r15+rax] to compute
+    // function VA = kernel32 base + export RVA without clobbering r15.
+    code.truncate(code.len() - 3);
+    // lea rdi, [r15+rax]
+    code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]);
+    // mov [rbp-0x58], rdi
+    code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xA8]);
+    let hr_jmp_next1 = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_exp_next
+
+    // .hr_check_gpa:
+    let hr_check_gpa = code.len();
+    code[hr_jne_lla + 1] = (hr_check_gpa - (hr_jne_lla + 2)) as u8;
+
+    code.extend_from_slice(&[0x3D]);
+    code.extend_from_slice(&hash_gpa.to_le_bytes());
+    let hr_jne_gpa = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne .hr_exp_next
+
+    code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
+    code.extend_from_slice(&[0x8B, 0x04, 0x86]); // mov eax, [rsi+rax*4]
+    code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]); // lea rdi, [r15+rax]
+    code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xA0]); // mov [rbp-0x60], rdi
+
+    // .hr_exp_next:
+    let hr_exp_next = code.len();
+    code[hr_jmp_next1 + 1] = (hr_exp_next - (hr_jmp_next1 + 2)) as u8;
+    code[hr_jne_gpa + 1] = (hr_exp_next - (hr_jne_gpa + 2)) as u8;
+
+    // Check if both found
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA8, 0x00]); // cmp qword [rbp-0x58], 0
+    let hr_jz_cont = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // jz .hr_exp_inc
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA0, 0x00]); // cmp qword [rbp-0x60], 0
+    let hr_jnz_both = code.len();
+    code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]); // jnz .hr_exp_done (both found!)
+
+    // .hr_exp_inc:
+    let hr_exp_inc = code.len();
+    code[hr_jz_cont + 1] = (hr_exp_inc - (hr_jz_cont + 2)) as u8;
+    code.extend_from_slice(&[0xFF, 0xC2]); // inc edx
+    let r2 = (hr_exp_loop as i32) - (code.len() as i32 + 5);
+    code.push(0xE9);
+    code.extend_from_slice(&r2.to_le_bytes());
+
+    // .hr_exp_done:
+    let hr_exp_done = code.len();
+    let r3 = (hr_exp_done as i32) - (hr_jge_exp_done as i32 + 6);
+    code[hr_jge_exp_done + 2..hr_jge_exp_done + 6].copy_from_slice(&r3.to_le_bytes());
+    let r4 = (hr_exp_done as i32) - (hr_jnz_both as i32 + 6);
+    code[hr_jnz_both + 2..hr_jnz_both + 6].copy_from_slice(&r4.to_le_bytes());
+
+    // --- Now call LoadLibraryA + GetProcAddress for hook handlers ---
+    // (Same logic as the main path at lines ~1831-1905)
+
+    // Check both were found
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA8, 0x00]); // cmp [rbp-0x58], 0
+    let hr_jz_nolib = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz .real_epilogue
+    hr_fixup_to_real_epilogue.push(hr_jz_nolib);
+
+    code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA0, 0x00]); // cmp [rbp-0x60], 0
+    let hr_jz_nogpa = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_nogpa);
+
+    // lea rcx, [rip + library_path] — need to embed the library path string
+    // We'll embed it after this code and fix up the LEA.
+    let hr_lea_lib = code.len();
+    code.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]); // lea rcx, [rip+disp32]
+
+    // sub rsp, 32
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    // call [rbp-0x58] ; LoadLibraryA
+    code.extend_from_slice(&[0xFF, 0x55, 0xA8]);
+    // add rsp, 32
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    let hr_jz_loadfail = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_loadfail);
+
+    // mov rbx, rax ; HMODULE
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]);
+
+    // For each handler: GetProcAddress(rbx, symbol_name) → store at slot VA
+    let mut hr_sym_leas: Vec<(usize, usize)> = Vec::new(); // (lea_pos, handler_index)
+    for (i, (_name, slot_va)) in hook_lib.handlers.iter().enumerate() {
+        let hr_lea_sym = code.len();
+        code.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]); // lea rdx, [rip+disp32]
+        hr_sym_leas.push((hr_lea_sym, i));
+
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
+        code.extend_from_slice(&[0xFF, 0x55, 0xA0]); // call [rbp-0x60]
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        let hr_jz_skip = code.len();
+        code.extend_from_slice(&[0x74, 0x00]); // jz .hr_skip_store
+
+        // lea r13, [rip + disp32] — data slot VA (RIP-relative for ASLR)
+        let lea_slot_pos = code.len();
+        code.extend_from_slice(&[0x4C, 0x8D, 0x2D, 0x00, 0x00, 0x00, 0x00]);
+        let lea_slot_rip = init_va + code.len() as u64;
+        let slot_disp = (*slot_va as i64 - lea_slot_rip as i64) as i32;
+        code[lea_slot_pos + 3..lea_slot_pos + 7].copy_from_slice(&slot_disp.to_le_bytes());
+        // mov [r13], rax
+        code.extend_from_slice(&[0x49, 0x89, 0x45, 0x00]);
+
+        // .hr_skip_store:
+        let hr_skip_store = code.len();
+        code[hr_jz_skip + 1] = (hr_skip_store - (hr_jz_skip + 2)) as u8;
+    }
+
+    // JMP over the embedded strings that follow.
+    let hr_jmp_over_strings = code.len();
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]); // jmp rel32 placeholder
+
+    // Embed strings: library path, then handler symbol names.
+    // Fix up the LEA displacements.
+
+    // Library path string
+    let hr_lib_str = code.len();
+    let lib_rip = init_va + (hr_lea_lib + 7) as u64;
+    let lib_delta = (init_va + hr_lib_str as u64) as i64 - lib_rip as i64;
+    code[hr_lea_lib + 3..hr_lea_lib + 7].copy_from_slice(&(lib_delta as i32).to_le_bytes());
+    code.extend_from_slice(hook_lib.library_path.as_bytes());
+    code.push(0x00); // null terminator
+
+    // Handler symbol name strings
+    for (lea_pos, handler_idx) in &hr_sym_leas {
+        let str_offset = code.len();
+        let sym_rip = init_va + (lea_pos + 7) as u64;
+        let sym_delta = (init_va + str_offset as u64) as i64 - sym_rip as i64;
+        code[lea_pos + 3..lea_pos + 7].copy_from_slice(&(sym_delta as i32).to_le_bytes());
+        let (name, _) = &hook_lib.handlers[*handler_idx];
+        code.extend_from_slice(name.as_bytes());
+        code.push(0x00);
+    }
+
+    // Fix up JMP over strings
+    let hr_after_strings = code.len();
+    let jmp_rel = (hr_after_strings as i32) - (hr_jmp_over_strings as i32 + 5);
+    code[hr_jmp_over_strings + 1..hr_jmp_over_strings + 5].copy_from_slice(&jmp_rel.to_le_bytes());
+
+    // Fall through to real_epilogue
+
+    (label, hr_fixup_to_real_epilogue)
+}
+
+/// Emit PE32 code to parse the decimal SHM ID and construct the SHM name.
+fn emit_pe32_shm_name_build(code: &mut Vec<u8>) {
+    const LOCAL_SIZE: u32 = 128;
+    // ===== FOUND! Parse decimal SHM ID from wide string at edi + 26 =====
+    // lea edi, [edi + 26]  ; skip past "__AFL_SHM_ID=" (13 wchars = 26 bytes)
+    code.extend_from_slice(&[0x8D, 0x7F, 0x1A]);
+
+    // Use ebx as shmid accumulator (we don't need needle pointer anymore).
+    // xor ebx, ebx  ; shmid = 0
+    code.extend_from_slice(&[0x31, 0xDB]);
+
+    // .parse_loop:
+    let parse_loop = code.len();
+    // movzx eax, word [edi]  ; load wide char
+    code.extend_from_slice(&[0x0F, 0xB7, 0x07]);
+    // sub ax, '0'  (0x30)
+    code.extend_from_slice(&[0x66, 0x2D, 0x30, 0x00]);
+    // cmp ax, 9
+    code.extend_from_slice(&[0x66, 0x3D, 0x09, 0x00]);
+    // ja .parse_done
+    let ja_parse_done_pos = code.len();
+    code.extend_from_slice(&[0x77, 0x00]); // ja rel8 placeholder
+    // imul ebx, ebx, 10
+    code.extend_from_slice(&[0x6B, 0xDB, 0x0A]);
+    // movzx eax, ax
+    code.extend_from_slice(&[0x0F, 0xB7, 0xC0]);
+    // add ebx, eax
+    code.extend_from_slice(&[0x01, 0xC3]);
+    // add edi, 2  ; next wchar
+    code.extend_from_slice(&[0x83, 0xC7, 0x02]);
+    // jmp .parse_loop
+    let jmp_parse_rel = (parse_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_parse_rel as u8]);
+
+    // .parse_done:
+    let parse_done = code.len();
+    code[ja_parse_done_pos + 1] = (parse_done - (ja_parse_done_pos + 2)) as u8;
+
+    // ebx = SHM ID. Save it.
+    // mov [ebp - 0x04], ebx  ; save SHM ID at local
+    code.extend_from_slice(&[0x89, 0x5D, 0xFC]);
+
+    // ============================================================
+    // Step 3: Build SHM name "afl_shm_<id>" on stack
+    // ============================================================
+
+    // lea edi, [ebp - LOCAL_SIZE]  ; name buffer
+    let name_ebp_offset: i32 = -(LOCAL_SIZE as i32);
+    code.extend_from_slice(&[0x8D, 0xBD]);
+    code.extend_from_slice(&name_ebp_offset.to_le_bytes());
+
+    // Write "afl_shm_" prefix (8 bytes, written as two dwords)
+    let prefix_bytes = b"afl_shm_";
+    let prefix_lo = u32::from_le_bytes([
+        prefix_bytes[0],
+        prefix_bytes[1],
+        prefix_bytes[2],
+        prefix_bytes[3],
+    ]);
+    let prefix_hi = u32::from_le_bytes([
+        prefix_bytes[4],
+        prefix_bytes[5],
+        prefix_bytes[6],
+        prefix_bytes[7],
+    ]);
+    // mov dword [edi], prefix_lo
+    code.extend_from_slice(&[0xC7, 0x07]);
+    code.extend_from_slice(&prefix_lo.to_le_bytes());
+    // mov dword [edi + 4], prefix_hi
+    code.extend_from_slice(&[0xC7, 0x47, 0x04]);
+    code.extend_from_slice(&prefix_hi.to_le_bytes());
+    // add edi, 8
+    code.extend_from_slice(&[0x83, 0xC7, 0x08]);
+
+    // Convert ebx (SHM ID) to decimal ASCII at [edi].
+    // mov eax, ebx
+    code.extend_from_slice(&[0x89, 0xD8]);
+    // mov ebx, edi  ; save start of digits
+    code.extend_from_slice(&[0x89, 0xFB]);
+    // test eax, eax
+    code.extend_from_slice(&[0x85, 0xC0]);
+    // jnz .conv_loop
+    let jnz_conv_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jnz rel8 placeholder
+    // Zero case: write '0'
+    code.extend_from_slice(&[0xC6, 0x07, 0x30]); // mov byte [edi], '0'
+    code.extend_from_slice(&[0x47]); // inc edi
+    // jmp .conv_done
+    let jmp_conv_done_pos = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
+
+    // .conv_loop:
+    let conv_loop = code.len();
+    code[jnz_conv_pos + 1] = (conv_loop - (jnz_conv_pos + 2)) as u8;
+    // xor edx, edx
+    code.extend_from_slice(&[0x31, 0xD2]);
+    // mov ecx, 10
+    code.extend_from_slice(&[0xB9, 0x0A, 0x00, 0x00, 0x00]);
+    // div ecx  ; eax = quotient, edx = remainder
+    code.extend_from_slice(&[0xF7, 0xF1]);
+    // add dl, '0'
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
+    // mov [edi], dl
+    code.extend_from_slice(&[0x88, 0x17]);
+    // inc edi
+    code.push(0x47);
+    // test eax, eax
+    code.extend_from_slice(&[0x85, 0xC0]);
+    // jnz .conv_loop
+    let jnz_conv2_rel = (conv_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0x75, jnz_conv2_rel as u8]);
+
+    // Null-terminate and reverse.
+    // mov byte [edi], 0
+    code.extend_from_slice(&[0xC6, 0x07, 0x00]);
+    // dec edi  ; points to last digit
+    code.push(0x4F); // dec edi
+
+    // .reverse_loop:
+    let reverse_loop = code.len();
+    // cmp ebx, edi
+    code.extend_from_slice(&[0x39, 0xFB]);
+    // jge .conv_done
+    let jge_conv_done_pos = code.len();
+    code.extend_from_slice(&[0x7D, 0x00]); // jge rel8 placeholder
+    // mov al, [ebx]
+    code.extend_from_slice(&[0x8A, 0x03]);
+    // mov cl, [edi]
+    code.extend_from_slice(&[0x8A, 0x0F]);
+    // mov [ebx], cl
+    code.extend_from_slice(&[0x88, 0x0B]);
+    // mov [edi], al
+    code.extend_from_slice(&[0x88, 0x07]);
+    // inc ebx
+    code.push(0x43);
+    // dec edi
+    code.push(0x4F);
+    // jmp .reverse_loop
+    let jmp_rev_rel = (reverse_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_rev_rel as u8]);
+
+    // .conv_done:
+    let conv_done = code.len();
+    code[jmp_conv_done_pos + 1] = (conv_done - (jmp_conv_done_pos + 2)) as u8;
+    code[jge_conv_done_pos + 1] = (conv_done - (jge_conv_done_pos + 2)) as u8;
+}
+
+/// Walk PE32 PEB_LDR_DATA InLoadOrderModuleList to find kernel32.dll.
+/// Returns the fixup position for the "kernel32 not found" jump to epilogue.
+fn emit_pe32_kernel32_walk(code: &mut Vec<u8>) -> usize {
+    // ============================================================
+    // Step 4: Walk PEB_LDR_DATA to find kernel32.dll
+    // PEB at fs:[0x30]
+    // PEB.Ldr at PEB+0x0C
+    // PEB_LDR_DATA.InLoadOrderModuleList at Ldr+0x0C
+    // Each entry: LDR_DATA_TABLE_ENTRY (32-bit):
+    //   +0x00: InLoadOrderLinks (LIST_ENTRY: Flink, Blink) (8 bytes)
+    //   +0x18: DllBase (4 bytes)
+    //   +0x2C: BaseDllName (UNICODE_STRING: Length u16, MaxLength u16, Buffer ptr)
+    //          Buffer at +0x30 (offset +0x04 from UNICODE_STRING start at +0x2C)
+    // ============================================================
+
+    // mov eax, fs:[0x30]  ; PEB
+    code.extend_from_slice(&[0x64, 0xA1, 0x30, 0x00, 0x00, 0x00]);
+    // mov eax, [eax + 0x0C]  ; PEB.Ldr
+    code.extend_from_slice(&[0x8B, 0x40, 0x0C]);
+    // lea ebx, [eax + 0x0C]  ; &InLoadOrderModuleList (list head)
+    code.extend_from_slice(&[0x8D, 0x58, 0x0C]);
+    // mov edi, [ebx]  ; first entry (Flink)
+    code.extend_from_slice(&[0x8B, 0x3B]);
+
+    // .ldr_loop:
+    let ldr_loop = code.len();
+    // cmp edi, ebx  ; back to head?
+    code.extend_from_slice(&[0x39, 0xDF]);
+    // je .epilogue  ; kernel32 not found
+    let je_epilogue_k32_pos = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je rel32 placeholder
+
+    // Check BaseDllName: LDR_DATA_TABLE_ENTRY.BaseDllName at offset 0x2C (32-bit).
+    // UNICODE_STRING.Length at +0x00 (u16), Buffer at +0x04 (ptr, 32-bit).
+    // movzx ecx, word [edi + 0x2C]  ; BaseDllName.Length (in bytes)
+    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x2C]);
+    // cmp ecx, 24  ; "KERNEL32.DLL" = 12 wchars = 24 bytes
+    code.extend_from_slice(&[0x83, 0xF9, 0x18]);
+    // jne .ldr_next
+    let jne_ldr_next1_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // mov ecx, [edi + 0x30]  ; BaseDllName.Buffer (at UNICODE_STRING + 0x04)
+    code.extend_from_slice(&[0x8B, 0x4F, 0x30]);
+
+    // Case-insensitive check: first wchar ORed with 0x20 == 'k' (0x6B)
+    // movzx eax, word [ecx]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x01]);
+    // or al, 0x20
+    code.extend_from_slice(&[0x0C, 0x20]);
+    // cmp al, 'k'
+    code.extend_from_slice(&[0x3C, 0x6B]);
+    // jne .ldr_next
+    let jne_ldr_next2_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Check '3' at wchar index 6 (byte offset 12)
+    // movzx eax, word [ecx + 12]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0C]);
+    // cmp al, '3'
+    code.extend_from_slice(&[0x3C, 0x33]);
+    // jne .ldr_next
+    let jne_ldr_next3_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Check '2' at wchar index 7 (byte offset 14)
+    // movzx eax, word [ecx + 14]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0E]);
+    // cmp al, '2'
+    code.extend_from_slice(&[0x3C, 0x32]);
+    // jne .ldr_next
+    let jne_ldr_next4_pos = code.len();
+    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
+
+    // Found kernel32.dll! DllBase is at [edi + 0x18] (32-bit).
+    // mov esi, [edi + 0x18]  ; esi = kernel32 base (repurpose esi; data_va saved earlier)
+    // Save esi (data_va) to stack before repurposing esi for kernel32 base.
+    // data_va can also be reloaded from the immediate constant if needed.
+    // push esi  ; save data_va
+    code.push(0x56);
+    // mov esi, [edi + 0x18]  ; esi = kernel32 base
+    code.extend_from_slice(&[0x8B, 0x77, 0x18]);
+    // jmp .resolve_exports
+    let jmp_resolve_pos = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
+
+    // .ldr_next:
+    let ldr_next = code.len();
+    code[jne_ldr_next1_pos + 1] = (ldr_next - (jne_ldr_next1_pos + 2)) as u8;
+    code[jne_ldr_next2_pos + 1] = (ldr_next - (jne_ldr_next2_pos + 2)) as u8;
+    code[jne_ldr_next3_pos + 1] = (ldr_next - (jne_ldr_next3_pos + 2)) as u8;
+    code[jne_ldr_next4_pos + 1] = (ldr_next - (jne_ldr_next4_pos + 2)) as u8;
+    // mov edi, [edi]  ; Flink (next entry)
+    code.extend_from_slice(&[0x8B, 0x3F]);
+    // jmp .ldr_loop
+    let jmp_ldr_rel = (ldr_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, jmp_ldr_rel as u8]);
+
+    // .resolve_exports:
+    let resolve_exports = code.len();
+    code[jmp_resolve_pos + 1] = (resolve_exports - (jmp_resolve_pos + 2)) as u8;
+
+    je_epilogue_k32_pos
+}
+
+/// Emit the PE32 hook-only resolution block.
+/// Returns (hook_resolve_label, fixup_positions_to_real_epilogue).
+fn emit_pe32_hook_only_resolve(
+    code: &mut Vec<u8>,
+    init_va: u64,
+    hook_lib: &PeHookLibraryInfo,
+) -> (usize, Vec<usize>) {
+    let mut hr_fixup_to_real_epilogue: Vec<usize> = Vec::new();
+
+    let label = code.len();
+
+    // Walk PEB_LDR_DATA for kernel32 (same as Step 4, 32-bit)
+    // mov eax, fs:[0x30]
+    code.extend_from_slice(&[0x64, 0xA1, 0x30, 0x00, 0x00, 0x00]);
+    // mov eax, [eax + 0x0C]  ; PEB.Ldr
+    code.extend_from_slice(&[0x8B, 0x40, 0x0C]);
+    // lea ebx, [eax + 0x0C]
+    code.extend_from_slice(&[0x8D, 0x58, 0x0C]);
+    // mov edi, [ebx]
+    code.extend_from_slice(&[0x8B, 0x3B]);
+
+    let hr_ldr_loop = code.len();
+    // cmp edi, ebx
+    code.extend_from_slice(&[0x39, 0xDF]);
+    let hr_je_no_k32 = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je .real_epilogue
+    hr_fixup_to_real_epilogue.push(hr_je_no_k32);
+
+    // movzx ecx, word [edi + 0x2C]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x2C]);
+    // cmp ecx, 24
+    code.extend_from_slice(&[0x83, 0xF9, 0x18]);
+    let hr_jne1 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    // mov ecx, [edi + 0x30]  ; BaseDllName.Buffer
+    code.extend_from_slice(&[0x8B, 0x4F, 0x30]);
+    // movzx eax, word [ecx]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x01]);
+    // or al, 0x20
+    code.extend_from_slice(&[0x0C, 0x20]);
+    // cmp al, 'k'
+    code.extend_from_slice(&[0x3C, 0x6B]);
+    let hr_jne2 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    // movzx eax, word [ecx + 12]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0C]);
+    // cmp al, '3'
+    code.extend_from_slice(&[0x3C, 0x33]);
+    let hr_jne3 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+    // movzx eax, word [ecx + 14]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0E]);
+    // cmp al, '2'
+    code.extend_from_slice(&[0x3C, 0x32]);
+    let hr_jne4 = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+
+    // Found! mov esi, [edi + 0x18]  ; kernel32 base in esi
+    code.extend_from_slice(&[0x8B, 0x77, 0x18]);
+    let hr_jmp_found = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_found
+
+    // .hr_ldr_next:
+    let hr_ldr_next = code.len();
+    code[hr_jne1 + 1] = (hr_ldr_next - (hr_jne1 + 2)) as u8;
+    code[hr_jne2 + 1] = (hr_ldr_next - (hr_jne2 + 2)) as u8;
+    code[hr_jne3 + 1] = (hr_ldr_next - (hr_jne3 + 2)) as u8;
+    code[hr_jne4 + 1] = (hr_ldr_next - (hr_jne4 + 2)) as u8;
+    // mov edi, [edi]
+    code.extend_from_slice(&[0x8B, 0x3F]);
+    let rel = (hr_ldr_loop as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, rel as u8]);
+
+    // .hr_found:
+    let hr_found = code.len();
+    code[hr_jmp_found + 1] = (hr_found - (hr_jmp_found + 2)) as u8;
+
+    // Parse exports (PE32)
+    // mov eax, [esi + 0x3C]
+    code.extend_from_slice(&[0x8B, 0x46, 0x3C]);
+    // lea ebx, [esi + eax]
+    code.extend_from_slice(&[0x8D, 0x1C, 0x06]);
+    // mov eax, [ebx + 0x78]  ; Export dir RVA
+    code.extend_from_slice(&[0x8B, 0x43, 0x78]);
+    // test eax, eax
+    code.extend_from_slice(&[0x85, 0xC0]);
+    let hr_jz_noexp = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_noexp);
+
+    // lea ebx, [esi + eax]  ; export directory
+    code.extend_from_slice(&[0x8D, 0x1C, 0x06]);
+    // mov ecx, [ebx + 0x18]  ; NumberOfNames
+    code.extend_from_slice(&[0x8B, 0x4B, 0x18]);
+    // AddressOfNames
+    code.extend_from_slice(&[0x8B, 0x43, 0x20]); // mov eax, [ebx + 0x20]
+    code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
+    code.extend_from_slice(&[0x89, 0x45, 0xF8]); // mov [ebp - 0x08], eax
+    // AddressOfNameOrdinals
+    code.extend_from_slice(&[0x8B, 0x43, 0x24]); // mov eax, [ebx + 0x24]
+    code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
+    code.extend_from_slice(&[0x89, 0x45, 0xF4]); // mov [ebp - 0x0C], eax
+    // AddressOfFunctions
+    code.extend_from_slice(&[0x8B, 0x43, 0x1C]); // mov eax, [ebx + 0x1C]
+    code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
+    code.extend_from_slice(&[0x89, 0x45, 0xF0]); // mov [ebp - 0x10], eax
+
+    // Clear slots
+    code.extend_from_slice(&[0xC7, 0x45, 0xE4, 0x00, 0x00, 0x00, 0x00]); // [ebp-0x1C]=0
+    code.extend_from_slice(&[0xC7, 0x45, 0xE0, 0x00, 0x00, 0x00, 0x00]); // [ebp-0x20]=0
+
+    let hash_lla = djb2_hash(b"LoadLibraryA");
+    let hash_gpa = djb2_hash(b"GetProcAddress");
+
+    // xor edx, edx
+    code.extend_from_slice(&[0x31, 0xD2]);
+
+    let hr_exp_loop = code.len();
+    // cmp edx, ecx
+    code.extend_from_slice(&[0x39, 0xCA]);
+    let hr_jge_exp_done = code.len();
+    code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]);
+
+    // mov eax, [ebp - 0x08]  ; AddressOfNames
+    code.extend_from_slice(&[0x8B, 0x45, 0xF8]);
+    // mov eax, [eax + edx*4]
+    code.extend_from_slice(&[0x8B, 0x04, 0x90]);
+    // lea edi, [esi + eax]
+    code.extend_from_slice(&[0x8D, 0x3C, 0x06]);
+
+    // DJB2 hash
+    code.push(0x52); // push edx
+    code.push(0x51); // push ecx
+    code.push(0xB8); // mov eax, 5381
+    code.extend_from_slice(&5381u32.to_le_bytes());
+    let hr_hl = code.len();
+    code.extend_from_slice(&[0x0F, 0xB6, 0x1F]); // movzx ebx, byte [edi]
+    code.extend_from_slice(&[0x84, 0xDB]); // test bl, bl
+    let hr_jz_hd = code.len();
+    code.extend_from_slice(&[0x74, 0x00]);
+    code.extend_from_slice(&[0x6B, 0xC0, 0x21]); // imul eax, eax, 33
+    code.extend_from_slice(&[0x01, 0xD8]); // add eax, ebx
+    code.push(0x47); // inc edi
+    let r = (hr_hl as isize - (code.len() as isize + 2)) as i8;
+    code.extend_from_slice(&[0xEB, r as u8]);
+    let hr_hd = code.len();
+    code[hr_jz_hd + 1] = (hr_hd - (hr_jz_hd + 2)) as u8;
+    code.push(0x59); // pop ecx
+    code.push(0x5A); // pop edx
+
+    // Check LoadLibraryA
+    code.push(0x3D);
+    code.extend_from_slice(&hash_lla.to_le_bytes());
+    let hr_jne_lla = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+
+    // Resolve
+    code.extend_from_slice(&[0x8B, 0x5D, 0xF4]); // mov ebx, [ebp - 0x0C]
+    code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x53]); // movzx eax, word [ebx + edx*2]
+    code.extend_from_slice(&[0x8B, 0x5D, 0xF0]); // mov ebx, [ebp - 0x10]
+    code.extend_from_slice(&[0x8B, 0x04, 0x83]); // mov eax, [ebx + eax*4]
+    code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
+    code.extend_from_slice(&[0x89, 0x45, 0xE4]); // mov [ebp - 0x1C], eax
+    let hr_jmp_next1 = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]);
+
+    // Check GetProcAddress
+    let hr_check_gpa = code.len();
+    code[hr_jne_lla + 1] = (hr_check_gpa - (hr_jne_lla + 2)) as u8;
+
+    code.push(0x3D);
+    code.extend_from_slice(&hash_gpa.to_le_bytes());
+    let hr_jne_gpa = code.len();
+    code.extend_from_slice(&[0x75, 0x00]);
+
+    code.extend_from_slice(&[0x8B, 0x5D, 0xF4]);
+    code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x53]);
+    code.extend_from_slice(&[0x8B, 0x5D, 0xF0]);
+    code.extend_from_slice(&[0x8B, 0x04, 0x83]);
+    code.extend_from_slice(&[0x8D, 0x04, 0x06]);
+    code.extend_from_slice(&[0x89, 0x45, 0xE0]); // mov [ebp - 0x20], eax
+
+    // .hr_exp_next:
+    let hr_exp_next = code.len();
+    code[hr_jmp_next1 + 1] = (hr_exp_next - (hr_jmp_next1 + 2)) as u8;
+    code[hr_jne_gpa + 1] = (hr_exp_next - (hr_jne_gpa + 2)) as u8;
+
+    // Check if both found
+    code.extend_from_slice(&[0x83, 0x7D, 0xE4, 0x00]); // cmp dword [ebp-0x1C], 0
+    let hr_jz_cont = code.len();
+    code.extend_from_slice(&[0x74, 0x00]);
+    code.extend_from_slice(&[0x83, 0x7D, 0xE0, 0x00]); // cmp dword [ebp-0x20], 0
+    let hr_jnz_both = code.len();
+    code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+
+    let hr_exp_inc = code.len();
+    code[hr_jz_cont + 1] = (hr_exp_inc - (hr_jz_cont + 2)) as u8;
+    // inc edx
+    code.extend_from_slice(&[0xFF, 0xC2]);
+    let r2 = (hr_exp_loop as i32) - (code.len() as i32 + 5);
+    code.push(0xE9);
+    code.extend_from_slice(&r2.to_le_bytes());
+
+    // .hr_exp_done:
+    let hr_exp_done = code.len();
+    let r3 = (hr_exp_done as i32) - (hr_jge_exp_done as i32 + 6);
+    code[hr_jge_exp_done + 2..hr_jge_exp_done + 6].copy_from_slice(&r3.to_le_bytes());
+    let r4 = (hr_exp_done as i32) - (hr_jnz_both as i32 + 6);
+    code[hr_jnz_both + 2..hr_jnz_both + 6].copy_from_slice(&r4.to_le_bytes());
+
+    // Check both were found
+    code.extend_from_slice(&[0x83, 0x7D, 0xE4, 0x00]); // cmp [ebp-0x1C], 0
+    let hr_jz_nolib = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_nolib);
+
+    code.extend_from_slice(&[0x83, 0x7D, 0xE0, 0x00]); // cmp [ebp-0x20], 0
+    let hr_jz_nogpa = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_nogpa);
+
+    // Call LoadLibraryA
+    // mov eax, imm32  ; library path string VA (placeholder)
+    let hr_mov_lib = code.len();
+    code.push(0xB8);
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // push eax
+    code.push(0x50);
+    // call [ebp - 0x1C]
+    code.extend_from_slice(&[0xFF, 0x55, 0xE4]);
+    // add esp, 4
+    code.extend_from_slice(&[0x83, 0xC4, 0x04]);
+
+    // test eax, eax
+    code.extend_from_slice(&[0x85, 0xC0]);
+    let hr_jz_loadfail = code.len();
+    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    hr_fixup_to_real_epilogue.push(hr_jz_loadfail);
+
+    // mov ebx, eax  ; HMODULE
+    code.extend_from_slice(&[0x89, 0xC3]);
+
+    // For each handler: GetProcAddress(hModule, lpProcName) -> store at slot VA
+    let mut hr_sym_movs: Vec<(usize, usize)> = Vec::new(); // (mov_pos, handler_index)
+    for (i, (_name, slot_va)) in hook_lib.handlers.iter().enumerate() {
+        let hr_mov_sym = code.len();
+        code.push(0xB8); // mov eax, imm32
+        code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        hr_sym_movs.push((hr_mov_sym, i));
+
+        // push eax  ; lpProcName
+        code.push(0x50);
+        // push ebx  ; hModule
+        code.push(0x53);
+        // call [ebp - 0x20]  ; GetProcAddress
+        code.extend_from_slice(&[0xFF, 0x55, 0xE0]);
+        // add esp, 8
+        code.extend_from_slice(&[0x83, 0xC4, 0x08]);
+
+        // test eax, eax
+        code.extend_from_slice(&[0x85, 0xC0]);
+        let hr_jz_skip = code.len();
+        code.extend_from_slice(&[0x74, 0x00]);
+
+        // mov [slot_va], eax  (absolute)
+        code.push(0xA3);
+        code.extend_from_slice(&(*slot_va as u32).to_le_bytes());
+
+        let hr_skip_store = code.len();
+        code[hr_jz_skip + 1] = (hr_skip_store - (hr_jz_skip + 2)) as u8;
+    }
+
+    // JMP over strings
+    let hr_jmp_over_strings = code.len();
+    code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+
+    // Embed library path string
+    let hr_lib_str_offset = code.len();
+    let hr_lib_str_va = init_va + hr_lib_str_offset as u64;
+    code[hr_mov_lib + 1..hr_mov_lib + 5].copy_from_slice(&(hr_lib_str_va as u32).to_le_bytes());
+    code.extend_from_slice(hook_lib.library_path.as_bytes());
+    code.push(0x00);
+
+    // Embed handler symbol name strings
+    for (mov_pos, handler_idx) in &hr_sym_movs {
+        let str_offset = code.len();
+        let str_va = init_va + str_offset as u64;
+        code[mov_pos + 1..mov_pos + 5].copy_from_slice(&(str_va as u32).to_le_bytes());
+        let (name, _) = &hook_lib.handlers[*handler_idx];
+        code.extend_from_slice(name.as_bytes());
+        code.push(0x00);
+    }
+
+    // Fix up JMP over strings
+    let hr_after_strings = code.len();
+    let jmp_rel = (hr_after_strings as i32) - (hr_jmp_over_strings as i32 + 5);
+    code[hr_jmp_over_strings + 1..hr_jmp_over_strings + 5].copy_from_slice(&jmp_rel.to_le_bytes());
+
+    (label, hr_fixup_to_real_epilogue)
 }
 
 /// Generate PE-specific init code for SHM attachment.
@@ -989,230 +2361,11 @@ fn generate_pe_init_code(
     let jne_next4_pos = code.len();
     code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]); // jne rel32 placeholder
 
-    // ===== FOUND! Parse decimal SHM ID from wide string at rsi + 26 =====
-    // lea rsi, [rsi + 26]  ; skip past "__AFL_SHM_ID=" (13 wchars = 26 bytes)
-    code.extend_from_slice(&[0x48, 0x8D, 0x76, 0x1A]);
-    // xor r14, r14  ; shmid accumulator = 0
-    code.extend_from_slice(&[0x4D, 0x31, 0xF6]);
+    // Parse decimal SHM ID and build SHM name on stack.
+    emit_pe64_shm_name_build(&mut code);
 
-    // .parse_loop:
-    let parse_loop = code.len();
-    // movzx eax, word [rsi]  ; load wide char
-    code.extend_from_slice(&[0x0F, 0xB7, 0x06]);
-    // sub ax, '0'  (0x30)
-    code.extend_from_slice(&[0x66, 0x2D, 0x30, 0x00]);
-    // cmp ax, 9
-    code.extend_from_slice(&[0x66, 0x3D, 0x09, 0x00]);
-    // ja .parse_done
-    let ja_parse_done_pos = code.len();
-    code.extend_from_slice(&[0x77, 0x00]); // ja rel8 placeholder
-    // imul r14, r14, 10
-    code.extend_from_slice(&[0x4D, 0x6B, 0xF6, 0x0A]);
-    // movzx eax, ax
-    code.extend_from_slice(&[0x0F, 0xB7, 0xC0]);
-    // add r14, rax
-    code.extend_from_slice(&[0x49, 0x01, 0xC6]);
-    // add rsi, 2  ; next wchar
-    code.extend_from_slice(&[0x48, 0x83, 0xC6, 0x02]);
-    // jmp .parse_loop
-    let jmp_parse_rel = (parse_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_parse_rel as u8]);
-
-    // .parse_done:
-    let parse_done = code.len();
-    code[ja_parse_done_pos + 1] = (parse_done - (ja_parse_done_pos + 2)) as u8;
-
-    // ============================================================
-    // Step 3: Resolve kernel32.dll functions via PEB_LDR_DATA
-    // Then call OpenFileMappingA and MapViewOfFile.
-    //
-    // Walk PEB.Ldr.InLoadOrderModuleList to find kernel32.dll.
-    // Parse its export table to find OpenFileMappingA and MapViewOfFile.
-    // ============================================================
-
-    // First, build the SHM name "afl_shm_<id>" on the stack.
-    // The ID is in r14. We need to convert it to a decimal ASCII string.
-    // lea rdi, [rsp + 32]  ; buffer for name (after shadow space)
-    code.extend_from_slice(&[0x48, 0x8D, 0x7C, 0x24, 0x20]);
-
-    // Write "afl_shm_" prefix (8 bytes)
-    // mov rax, "afl_shm_" as u64
-    let prefix = u64::from_le_bytes(*b"afl_shm_");
-    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    code.extend_from_slice(&prefix.to_le_bytes());
-    // mov [rdi], rax
-    code.extend_from_slice(&[0x48, 0x89, 0x07]);
-    // lea rdi, [rdi + 8]
-    code.extend_from_slice(&[0x48, 0x8D, 0x7F, 0x08]);
-
-    // Convert r14 (SHM ID) to decimal ASCII at [rdi].
-    // We'll use a simple div-10 loop, writing digits in reverse then reversing.
-    // mov rax, r14
-    code.extend_from_slice(&[0x4C, 0x89, 0xF0]);
-    // mov rbx, rdi  ; save start of digits
-    code.extend_from_slice(&[0x48, 0x89, 0xFB]);
-    // test rax, rax
-    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-    // jnz .conv_loop
-    let jnz_conv_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jnz rel8 placeholder
-    // Zero case: write '0'
-    code.extend_from_slice(&[0xC6, 0x07, 0x30]); // mov byte [rdi], '0'
-    code.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi
-    // jmp .conv_done
-    let jmp_conv_done_pos = code.len();
-    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
-
-    // .conv_loop:
-    let conv_loop = code.len();
-    code[jnz_conv_pos + 1] = (conv_loop - (jnz_conv_pos + 2)) as u8;
-    // xor edx, edx
-    code.extend_from_slice(&[0x31, 0xD2]);
-    // mov rcx, 10
-    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0x0A, 0x00, 0x00, 0x00]);
-    // div rcx  ; rax = quotient, rdx = remainder
-    code.extend_from_slice(&[0x48, 0xF7, 0xF1]);
-    // add dl, '0'
-    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
-    // mov [rdi], dl
-    code.extend_from_slice(&[0x88, 0x17]);
-    // inc rdi
-    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
-    // test rax, rax
-    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-    // jnz .conv_loop
-    let jnz_conv2_rel = (conv_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0x75, jnz_conv2_rel as u8]);
-
-    // Now reverse the digits at [rbx..rdi).
-    // mov byte [rdi], 0  ; null-terminate
-    code.extend_from_slice(&[0xC6, 0x07, 0x00]);
-    // dec rdi  ; rdi points to last digit
-    code.extend_from_slice(&[0x48, 0xFF, 0xCF]);
-
-    // .reverse_loop:
-    let reverse_loop = code.len();
-    // cmp rbx, rdi
-    code.extend_from_slice(&[0x48, 0x39, 0xFB]);
-    // jge .conv_done
-    let jge_conv_done_pos = code.len();
-    code.extend_from_slice(&[0x7D, 0x00]); // jge rel8 placeholder
-    // mov al, [rbx]
-    code.extend_from_slice(&[0x8A, 0x03]);
-    // mov cl, [rdi]
-    code.extend_from_slice(&[0x8A, 0x0F]);
-    // mov [rbx], cl
-    code.extend_from_slice(&[0x88, 0x0B]);
-    // mov [rdi], al
-    code.extend_from_slice(&[0x88, 0x07]);
-    // inc rbx
-    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
-    // dec rdi
-    code.extend_from_slice(&[0x48, 0xFF, 0xCF]);
-    // jmp .reverse_loop
-    let jmp_rev_rel = (reverse_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_rev_rel as u8]);
-
-    // .conv_done:
-    let conv_done = code.len();
-    code[jmp_conv_done_pos + 1] = (conv_done - (jmp_conv_done_pos + 2)) as u8;
-    code[jge_conv_done_pos + 1] = (conv_done - (jge_conv_done_pos + 2)) as u8;
-
-    // ============================================================
-    // Step 4: Walk PEB_LDR_DATA to find kernel32.dll
-    // PEB at gs:[0x60]
-    // PEB.Ldr at PEB+0x18
-    // PEB_LDR_DATA.InLoadOrderModuleList at Ldr+0x10
-    // Each entry: LDR_DATA_TABLE_ENTRY
-    //   +0x00: InLoadOrderLinks (LIST_ENTRY: Flink, Blink)
-    //   +0x30: DllBase
-    //   +0x58: BaseDllName (UNICODE_STRING: Length, MaxLength, Buffer)
-    // ============================================================
-
-    // mov rax, gs:[0x60]  ; PEB
-    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
-    // mov rax, [rax + 0x18]  ; PEB.Ldr
-    code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
-    // lea rbx, [rax + 0x10]  ; &InLoadOrderModuleList (list head)
-    code.extend_from_slice(&[0x48, 0x8D, 0x58, 0x10]);
-    // mov rdi, [rbx]  ; first entry (Flink)
-    code.extend_from_slice(&[0x48, 0x8B, 0x3B]);
-
-    // .ldr_loop:
-    let ldr_loop = code.len();
-    // cmp rdi, rbx  ; back to head?
-    code.extend_from_slice(&[0x48, 0x39, 0xDF]);
-    // je .epilogue  ; kernel32 not found
-    let je_epilogue_k32_pos = code.len();
-    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je rel32 placeholder
-
-    // Check BaseDllName: LDR_DATA_TABLE_ENTRY.BaseDllName at offset 0x58.
-    // UNICODE_STRING.Length at +0x00 (u16), Buffer at +0x08 (ptr).
-    // movzx ecx, word [rdi + 0x58]  ; BaseDllName.Length (in bytes)
-    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x58]);
-    // cmp ecx, 24  ; "KERNEL32.DLL" = 12 wchars = 24 bytes (case-insensitive check below)
-    // We also accept "kernel32.dll" (lowercase). Length must be 24.
-    code.extend_from_slice(&[0x83, 0xF9, 0x18]);
-    // jne .ldr_next
-    let jne_ldr_next1_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // mov rsi, [rdi + 0x60]  ; BaseDllName.Buffer
-    code.extend_from_slice(&[0x48, 0x8B, 0x77, 0x60]);
-
-    // Case-insensitive compare of first 6 wchars ("kernel" or "KERNEL"):
-    // We'll just check that the first wchar ORed with 0x20 == 'k' (0x6B)
-    // and the 7th wchar is '3' (0x33).
-    // movzx eax, word [rsi]  ; first wchar
-    code.extend_from_slice(&[0x0F, 0xB7, 0x06]);
-    // or al, 0x20  ; to lowercase
-    code.extend_from_slice(&[0x0C, 0x20]);
-    // cmp al, 'k'
-    code.extend_from_slice(&[0x3C, 0x6B]);
-    // jne .ldr_next
-    let jne_ldr_next2_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Check '3' at wchar index 6 (byte offset 12)
-    // movzx eax, word [rsi + 12]
-    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0C]);
-    // cmp al, '3'
-    code.extend_from_slice(&[0x3C, 0x33]);
-    // jne .ldr_next
-    let jne_ldr_next3_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Check '2' at wchar index 7 (byte offset 14)
-    // movzx eax, word [rsi + 14]
-    code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0E]);
-    // cmp al, '2'
-    code.extend_from_slice(&[0x3C, 0x32]);
-    // jne .ldr_next
-    let jne_ldr_next4_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Found kernel32.dll! DllBase is at [rdi + 0x30].
-    // mov r15, [rdi + 0x30]  ; r15 = kernel32 base
-    code.extend_from_slice(&[0x4C, 0x8B, 0x7F, 0x30]);
-    // jmp .resolve_exports
-    let jmp_resolve_pos = code.len();
-    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
-
-    // .ldr_next:
-    let ldr_next = code.len();
-    code[jne_ldr_next1_pos + 1] = (ldr_next - (jne_ldr_next1_pos + 2)) as u8;
-    code[jne_ldr_next2_pos + 1] = (ldr_next - (jne_ldr_next2_pos + 2)) as u8;
-    code[jne_ldr_next3_pos + 1] = (ldr_next - (jne_ldr_next3_pos + 2)) as u8;
-    code[jne_ldr_next4_pos + 1] = (ldr_next - (jne_ldr_next4_pos + 2)) as u8;
-    // mov rdi, [rdi]  ; Flink (next entry)
-    code.extend_from_slice(&[0x48, 0x8B, 0x3F]);
-    // jmp .ldr_loop
-    let jmp_ldr_rel = (ldr_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_ldr_rel as u8]);
-
-    // .resolve_exports:
-    let resolve_exports = code.len();
-    code[jmp_resolve_pos + 1] = (resolve_exports - (jmp_resolve_pos + 2)) as u8;
+    // Walk PEB_LDR_DATA to find kernel32.dll.
+    let je_epilogue_k32_pos = emit_pe64_kernel32_walk(&mut code);
 
     // ============================================================
     // Step 5: Parse kernel32.dll export directory to find
@@ -1676,235 +2829,7 @@ fn generate_pe_init_code(
     // ============================================================
 
     if let Some(p_data_va) = persistent_data_va {
-        let hash_read_file: u32 = djb2_hash(b"ReadFile");
-        let hash_write_file: u32 = djb2_hash(b"WriteFile");
-        let hash_exit_process: u32 = djb2_hash(b"ExitProcess");
-
-        // Load kernel32 base from [rbp - 0x68].
-        // mov r15, [rbp - 0x68]   ; 4C 8B 7D 98
-        code.extend_from_slice(&[0x4C, 0x8B, 0x7D, 0x98]);
-
-        // Parse export directory (same sequence as Step 5).
-        // mov eax, [r15 + 0x3C]  ; e_lfanew
-        code.extend_from_slice(&[0x41, 0x8B, 0x47, 0x3C]);
-        // lea rbx, [r15 + rax]  ; PE header
-        code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x07]);
-        // mov eax, [rbx + 0x88]  ; Export directory RVA
-        code.extend_from_slice(&[0x8B, 0x83, 0x88, 0x00, 0x00, 0x00]);
-        // test eax, eax
-        code.extend_from_slice(&[0x85, 0xC0]);
-        // jz .skip_persistent_resolve
-        let jz_skip_persist_pos = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-
-        // lea rsi, [r15 + rax]  ; export directory
-        code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]);
-
-        // mov ecx, [rsi + 0x18]  ; NumberOfNames
-        code.extend_from_slice(&[0x8B, 0x4E, 0x18]);
-        // mov eax, [rsi + 0x20]  ; AddressOfNames RVA
-        code.extend_from_slice(&[0x8B, 0x46, 0x20]);
-        // lea r13, [r15 + rax]  ; AddressOfNames
-        // REX.WRB (0x4D): W=64-bit, R=extend reg to r13, B=extend rm base to r15
-        code.extend_from_slice(&[0x4D, 0x8D, 0x2C, 0x07]);
-        // mov eax, [rsi + 0x24]  ; AddressOfNameOrdinals RVA
-        code.extend_from_slice(&[0x8B, 0x46, 0x24]);
-        // lea r14, [r15 + rax]  ; AddressOfNameOrdinals
-        code.extend_from_slice(&[0x4D, 0x8D, 0x34, 0x07]);
-        // mov eax, [rsi + 0x1C]  ; AddressOfFunctions RVA
-        code.extend_from_slice(&[0x8B, 0x46, 0x1C]);
-        // push rax  ; save AddressOfFunctions RVA
-        code.push(0x50);
-        // push r15  ; save kernel32 base
-        code.extend_from_slice(&[0x41, 0x57]);
-
-        // Use stack locals to track resolved pointers:
-        // [rbp - 0x70] = ReadFile, [rbp - 0x78] = WriteFile, [rbp - 0x80] = ExitProcess
-        // Init to 0.
-        code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x90, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x70], 0
-        code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x88, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x78], 0
-        code.extend_from_slice(&[0x48, 0xC7, 0x45, 0x80, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x80], 0
-
-        // xor edx, edx  ; index = 0
-        code.extend_from_slice(&[0x31, 0xD2]);
-
-        // .persist_export_loop:
-        let persist_export_loop = code.len();
-        // cmp edx, ecx
-        code.extend_from_slice(&[0x39, 0xCA]);
-        // jge .persist_exports_done
-        let jge_persist_done_pos = code.len();
-        code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]);
-
-        // mov eax, [r13 + rdx*4]  ; name RVA
-        code.extend_from_slice(&[0x41, 0x8B, 0x44, 0x95, 0x00]);
-        // lea rdi, [r15 + rax]  ; name string
-        code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]);
-
-        // DJB2 hash of name.
-        // push rdx
-        code.push(0x52);
-        // push rcx
-        code.push(0x51);
-        // mov eax, 5381
-        code.extend_from_slice(&[0xB8]);
-        code.extend_from_slice(&5381u32.to_le_bytes());
-
-        // .persist_hash_loop:
-        let persist_hash_loop = code.len();
-        // movzx ebx, byte [rdi]
-        code.extend_from_slice(&[0x0F, 0xB6, 0x1F]);
-        // test bl, bl
-        code.extend_from_slice(&[0x84, 0xDB]);
-        // jz .persist_hash_done
-        let jz_persist_hash_done = code.len();
-        code.extend_from_slice(&[0x74, 0x00]);
-        // imul eax, eax, 33
-        code.extend_from_slice(&[0x6B, 0xC0, 0x21]);
-        // add eax, ebx
-        code.extend_from_slice(&[0x01, 0xD8]);
-        // inc rdi
-        code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
-        // jmp .persist_hash_loop
-        let jmp_hash_rel = (persist_hash_loop as isize - (code.len() as isize + 2)) as i8;
-        code.extend_from_slice(&[0xEB, jmp_hash_rel as u8]);
-
-        // .persist_hash_done:
-        let persist_hash_done = code.len();
-        code[jz_persist_hash_done + 1] = (persist_hash_done - (jz_persist_hash_done + 2)) as u8;
-
-        // pop rcx
-        code.push(0x59);
-        // pop rdx
-        code.push(0x5A);
-
-        // Compare hash with ReadFile.
-        code.extend_from_slice(&[0x3D]); // cmp eax, hash_read_file
-        code.extend_from_slice(&hash_read_file.to_le_bytes());
-        let jne_check_wf_pos = code.len();
-        code.extend_from_slice(&[0x75, 0x00]); // jne .check_write_file
-
-        // Resolve ReadFile → [rbp-0x70]
-        code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
-        code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]); // mov ebx, [rsp+8] ; AddrOfFunctions RVA
-        code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]); // lea rbx, [r15+rbx]
-        code.extend_from_slice(&[0x8B, 0x04, 0x83]); // mov eax, [rbx+rax*4]
-        code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]); // lea rax, [r15+rax]
-        code.extend_from_slice(&[0x48, 0x89, 0x45, 0x90]); // mov [rbp-0x70], rax
-        let jmp_persist_next1 = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]); // jmp .persist_export_next
-
-        // .check_write_file:
-        let check_wf = code.len();
-        code[jne_check_wf_pos + 1] = (check_wf - (jne_check_wf_pos + 2)) as u8;
-
-        code.extend_from_slice(&[0x3D]); // cmp eax, hash_write_file
-        code.extend_from_slice(&hash_write_file.to_le_bytes());
-        let jne_check_ep_pos = code.len();
-        code.extend_from_slice(&[0x75, 0x00]); // jne .check_exit_process
-
-        // Resolve WriteFile → [rbp-0x78]
-        code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]);
-        code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]);
-        code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]);
-        code.extend_from_slice(&[0x8B, 0x04, 0x83]);
-        code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]);
-        code.extend_from_slice(&[0x48, 0x89, 0x45, 0x88]); // mov [rbp-0x78], rax
-        let jmp_persist_next2 = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]); // jmp .persist_export_next
-
-        // .check_exit_process:
-        let check_ep = code.len();
-        code[jne_check_ep_pos + 1] = (check_ep - (jne_check_ep_pos + 2)) as u8;
-
-        code.extend_from_slice(&[0x3D]); // cmp eax, hash_exit_process
-        code.extend_from_slice(&hash_exit_process.to_le_bytes());
-        let jne_persist_next_pos = code.len();
-        code.extend_from_slice(&[0x75, 0x00]); // jne .persist_export_next
-
-        // Resolve ExitProcess → [rbp-0x80]
-        code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]);
-        code.extend_from_slice(&[0x8B, 0x5C, 0x24, 0x08]);
-        code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x1F]);
-        code.extend_from_slice(&[0x8B, 0x04, 0x83]);
-        code.extend_from_slice(&[0x49, 0x8D, 0x04, 0x07]);
-        code.extend_from_slice(&[0x48, 0x89, 0x45, 0x80]); // mov [rbp-0x80], rax
-
-        // .persist_export_next:
-        let persist_export_next = code.len();
-        code[jmp_persist_next1 + 1] = (persist_export_next - (jmp_persist_next1 + 2)) as u8;
-        code[jmp_persist_next2 + 1] = (persist_export_next - (jmp_persist_next2 + 2)) as u8;
-        code[jne_persist_next_pos + 1] = (persist_export_next - (jne_persist_next_pos + 2)) as u8;
-
-        // Early exit: check if all 3 found.
-        // cmp qword [rbp-0x70], 0
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x90, 0x00]);
-        let jz_persist_cont1 = code.len();
-        code.extend_from_slice(&[0x74, 0x00]); // jz .persist_continue
-        // cmp qword [rbp-0x78], 0
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x88, 0x00]);
-        let jz_persist_cont2 = code.len();
-        code.extend_from_slice(&[0x74, 0x00]); // jz .persist_continue
-        // cmp qword [rbp-0x80], 0
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0x80, 0x00]);
-        // jnz .persist_exports_done (all 3 found!)
-        let jnz_persist_all_found = code.len();
-        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-
-        // .persist_continue:
-        let persist_continue = code.len();
-        code[jz_persist_cont1 + 1] = (persist_continue - (jz_persist_cont1 + 2)) as u8;
-        code[jz_persist_cont2 + 1] = (persist_continue - (jz_persist_cont2 + 2)) as u8;
-
-        // inc edx
-        code.extend_from_slice(&[0xFF, 0xC2]);
-        // jmp .persist_export_loop
-        let jmp_loop_rel = (persist_export_loop as i32) - (code.len() as i32 + 5);
-        code.push(0xE9);
-        code.extend_from_slice(&jmp_loop_rel.to_le_bytes());
-
-        // .persist_exports_done:
-        let persist_exports_done = code.len();
-        let rel1 = (persist_exports_done as i32) - (jge_persist_done_pos as i32 + 6);
-        code[jge_persist_done_pos + 2..jge_persist_done_pos + 6]
-            .copy_from_slice(&rel1.to_le_bytes());
-        let rel2 = (persist_exports_done as i32) - (jnz_persist_all_found as i32 + 6);
-        code[jnz_persist_all_found + 2..jnz_persist_all_found + 6]
-            .copy_from_slice(&rel2.to_le_bytes());
-
-        // Pop r15, rax (kernel32 base, AddressOfFunctions).
-        code.extend_from_slice(&[0x41, 0x5F]); // pop r15
-        code.push(0x58); // pop rax
-
-        // Store resolved pointers to persistent data area using RIP-relative mov.
-        // ReadFile → persistent_data_va + 152
-        // mov rax, [rbp-0x70]
-        code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
-        // mov [rip+disp32], rax   ; 7 bytes
-        let ip_after = init_va + code.len() as u64 + 7;
-        let disp = (p_data_va as i64 + 152 - ip_after as i64) as i32;
-        code.extend_from_slice(&[0x48, 0x89, 0x05]);
-        code.extend_from_slice(&disp.to_le_bytes());
-
-        // WriteFile → persistent_data_va + 160
-        code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x88]); // mov rax, [rbp-0x78]
-        let ip_after = init_va + code.len() as u64 + 7;
-        let disp = (p_data_va as i64 + 160 - ip_after as i64) as i32;
-        code.extend_from_slice(&[0x48, 0x89, 0x05]);
-        code.extend_from_slice(&disp.to_le_bytes());
-
-        // ExitProcess → persistent_data_va + 168
-        code.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
-        let ip_after = init_va + code.len() as u64 + 7;
-        let disp = (p_data_va as i64 + 168 - ip_after as i64) as i32;
-        code.extend_from_slice(&[0x48, 0x89, 0x05]);
-        code.extend_from_slice(&disp.to_le_bytes());
-
-        // .skip_persistent_resolve:
-        let skip_persist = code.len();
-        let skip_rel = (skip_persist as i32) - (jz_skip_persist_pos as i32 + 6);
-        code[jz_skip_persist_pos + 2..jz_skip_persist_pos + 6]
-            .copy_from_slice(&skip_rel.to_le_bytes());
+        emit_pe64_persistent_resolve(&mut code, init_va, p_data_va);
     }
 
     // ============================================================
@@ -2046,289 +2971,17 @@ fn generate_pe_init_code(
     // The jz/je jumps target the epilogue label set earlier. The actual
     // restore + jump code is emitted here as a separate section.
 
-    // ============================================================
-    // Hook-only resolve: When hooks are present but SHM setup was
-    // skipped (no __AFL_SHM_ID), we still need to resolve hook
-    // handlers. This block does a fresh kernel32 walk, resolves
-    // LoadLibraryA + GetProcAddress, then does the handler resolution
-    // that the main path (lines ~1819-1905) also performs.
-    // ============================================================
-
+    // Hook-only resolve block.
     let hook_resolve_label: Option<usize>;
     let mut hr_fixup_to_real_epilogue: Vec<usize> = Vec::new();
 
     if let Some(hook_lib) = hook_library {
-        let label = code.len();
+        let (label, hr_fixups) = emit_pe64_hook_only_resolve(&mut code, init_va, hook_lib);
         hook_resolve_label = Some(label);
-
-        // --- Walk PEB_LDR_DATA to find kernel32 (same algo as Step 4) ---
-        code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // mov rax, gs:[0x60]
-        code.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]); // mov rax, [rax+0x18]
-        code.extend_from_slice(&[0x48, 0x8D, 0x58, 0x10]); // lea rbx, [rax+0x10]
-        code.extend_from_slice(&[0x48, 0x8B, 0x3B]); // mov rdi, [rbx]
-
-        let hr_ldr_loop = code.len();
-        code.extend_from_slice(&[0x48, 0x39, 0xDF]); // cmp rdi, rbx
-        let hr_je_no_k32 = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je .real_epilogue
-        hr_fixup_to_real_epilogue.push(hr_je_no_k32);
-
-        code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x58]); // movzx ecx, word [rdi+0x58]
-        code.extend_from_slice(&[0x83, 0xF9, 0x18]); // cmp ecx, 24
-        let hr_jne1 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        code.extend_from_slice(&[0x48, 0x8B, 0x77, 0x60]); // mov rsi, [rdi+0x60]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x06]); // movzx eax, word [rsi]
-        code.extend_from_slice(&[0x0C, 0x20]); // or al, 0x20
-        code.extend_from_slice(&[0x3C, 0x6B]); // cmp al, 'k'
-        let hr_jne2 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0C]); // movzx eax, word [rsi+12]
-        code.extend_from_slice(&[0x3C, 0x33]); // cmp al, '3'
-        let hr_jne3 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        code.extend_from_slice(&[0x0F, 0xB7, 0x46, 0x0E]); // movzx eax, word [rsi+14]
-        code.extend_from_slice(&[0x3C, 0x32]); // cmp al, '2'
-        let hr_jne4 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-
-        // Found! mov r15, [rdi+0x30]
-        code.extend_from_slice(&[0x4C, 0x8B, 0x7F, 0x30]);
-        let hr_jmp_found = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_found
-
-        // .hr_ldr_next:
-        let hr_ldr_next = code.len();
-        code[hr_jne1 + 1] = (hr_ldr_next - (hr_jne1 + 2)) as u8;
-        code[hr_jne2 + 1] = (hr_ldr_next - (hr_jne2 + 2)) as u8;
-        code[hr_jne3 + 1] = (hr_ldr_next - (hr_jne3 + 2)) as u8;
-        code[hr_jne4 + 1] = (hr_ldr_next - (hr_jne4 + 2)) as u8;
-        code.extend_from_slice(&[0x48, 0x8B, 0x3F]); // mov rdi, [rdi]
-        let rel = (hr_ldr_loop as isize - (code.len() as isize + 2)) as i8;
-        code.extend_from_slice(&[0xEB, rel as u8]);
-
-        // .hr_found: parse kernel32 exports for LoadLibraryA + GetProcAddress
-        let hr_found = code.len();
-        code[hr_jmp_found + 1] = (hr_found - (hr_jmp_found + 2)) as u8;
-
-        code.extend_from_slice(&[0x41, 0x8B, 0x47, 0x3C]); // mov eax, [r15+0x3C]
-        code.extend_from_slice(&[0x49, 0x8D, 0x1C, 0x07]); // lea rbx, [r15+rax]
-        code.extend_from_slice(&[0x8B, 0x83, 0x88, 0x00, 0x00, 0x00]); // mov eax, [rbx+0x88]
-        code.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
-        let hr_jz_noexp = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz .real_epilogue
-        hr_fixup_to_real_epilogue.push(hr_jz_noexp);
-
-        code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]); // lea rsi, [r15+rax]
-        code.extend_from_slice(&[0x8B, 0x4E, 0x18]); // mov ecx, [rsi+0x18] ; NumberOfNames
-        code.extend_from_slice(&[0x8B, 0x46, 0x20]); // mov eax, [rsi+0x20] ; AddressOfNames RVA
-        code.extend_from_slice(&[0x4D, 0x8D, 0x2C, 0x07]); // lea r13, [r15+rax]
-        code.extend_from_slice(&[0x8B, 0x46, 0x24]); // mov eax, [rsi+0x24] ; Ordinals RVA
-        code.extend_from_slice(&[0x4D, 0x8D, 0x34, 0x07]); // lea r14, [r15+rax]
-        code.extend_from_slice(&[0x8B, 0x46, 0x1C]); // mov eax, [rsi+0x1C] ; AddressOfFunctions RVA
-        // lea rsi, [r15+rax] — reuse rsi for AddressOfFunctions base
-        code.extend_from_slice(&[0x49, 0x8D, 0x34, 0x07]);
-
-        // Clear LoadLibraryA / GetProcAddress slots
-        code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xA8, 0x00, 0x00, 0x00, 0x00]); // [rbp-0x58]=0
-        code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xA0, 0x00, 0x00, 0x00, 0x00]); // [rbp-0x60]=0
-
-        let hash_lla = djb2_hash(b"LoadLibraryA");
-        let hash_gpa = djb2_hash(b"GetProcAddress");
-
-        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
-
-        let hr_exp_loop = code.len();
-        code.extend_from_slice(&[0x39, 0xCA]); // cmp edx, ecx
-        let hr_jge_exp_done = code.len();
-        code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]); // jge .hr_exp_done
-
-        code.extend_from_slice(&[0x41, 0x8B, 0x44, 0x95, 0x00]); // mov eax, [r13+rdx*4]
-        code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]); // lea rdi, [r15+rax]
-
-        // DJB2 hash
-        code.push(0x52); // push rdx
-        code.push(0x51); // push rcx
-        code.push(0x56); // push rsi (save AddressOfFunctions base)
-        code.extend_from_slice(&[0xB8, 0x05, 0x15, 0x00, 0x00]); // mov eax, 5381
-        let hr_hl = code.len();
-        code.extend_from_slice(&[0x0F, 0xB6, 0x1F]); // movzx ebx, byte [rdi]
-        code.extend_from_slice(&[0x84, 0xDB]); // test bl, bl
-        let hr_jz_hd = code.len();
-        code.extend_from_slice(&[0x74, 0x00]);
-        code.extend_from_slice(&[0x6B, 0xC0, 0x21]); // imul eax, eax, 33
-        code.extend_from_slice(&[0x01, 0xD8]); // add eax, ebx
-        code.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi
-        let r = (hr_hl as isize - (code.len() as isize + 2)) as i8;
-        code.extend_from_slice(&[0xEB, r as u8]);
-        let hr_hd = code.len();
-        code[hr_jz_hd + 1] = (hr_hd - (hr_jz_hd + 2)) as u8;
-        code.push(0x5E); // pop rsi
-        code.push(0x59); // pop rcx
-        code.push(0x5A); // pop rdx
-
-        // Check LoadLibraryA
-        code.extend_from_slice(&[0x3D]);
-        code.extend_from_slice(&hash_lla.to_le_bytes());
-        let hr_jne_lla = code.len();
-        code.extend_from_slice(&[0x75, 0x00]); // jne .hr_check_gpa
-
-        // Resolve: ordinal → function VA
-        code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
-        code.extend_from_slice(&[0x8B, 0x04, 0x86]); // mov eax, [rsi+rax*4]
-        // Replace the preceding mov with lea rdi, [r15+rax] to compute
-        // function VA = kernel32 base + export RVA without clobbering r15.
-        code.truncate(code.len() - 3);
-        // lea rdi, [r15+rax]
-        code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]);
-        // mov [rbp-0x58], rdi
-        code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xA8]);
-        let hr_jmp_next1 = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_exp_next
-
-        // .hr_check_gpa:
-        let hr_check_gpa = code.len();
-        code[hr_jne_lla + 1] = (hr_check_gpa - (hr_jne_lla + 2)) as u8;
-
-        code.extend_from_slice(&[0x3D]);
-        code.extend_from_slice(&hash_gpa.to_le_bytes());
-        let hr_jne_gpa = code.len();
-        code.extend_from_slice(&[0x75, 0x00]); // jne .hr_exp_next
-
-        code.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x04, 0x56]); // movzx eax, word [r14+rdx*2]
-        code.extend_from_slice(&[0x8B, 0x04, 0x86]); // mov eax, [rsi+rax*4]
-        code.extend_from_slice(&[0x49, 0x8D, 0x3C, 0x07]); // lea rdi, [r15+rax]
-        code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xA0]); // mov [rbp-0x60], rdi
-
-        // .hr_exp_next:
-        let hr_exp_next = code.len();
-        code[hr_jmp_next1 + 1] = (hr_exp_next - (hr_jmp_next1 + 2)) as u8;
-        code[hr_jne_gpa + 1] = (hr_exp_next - (hr_jne_gpa + 2)) as u8;
-
-        // Check if both found
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA8, 0x00]); // cmp qword [rbp-0x58], 0
-        let hr_jz_cont = code.len();
-        code.extend_from_slice(&[0x74, 0x00]); // jz .hr_exp_inc
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA0, 0x00]); // cmp qword [rbp-0x60], 0
-        let hr_jnz_both = code.len();
-        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]); // jnz .hr_exp_done (both found!)
-
-        // .hr_exp_inc:
-        let hr_exp_inc = code.len();
-        code[hr_jz_cont + 1] = (hr_exp_inc - (hr_jz_cont + 2)) as u8;
-        code.extend_from_slice(&[0xFF, 0xC2]); // inc edx
-        let r2 = (hr_exp_loop as i32) - (code.len() as i32 + 5);
-        code.push(0xE9);
-        code.extend_from_slice(&r2.to_le_bytes());
-
-        // .hr_exp_done:
-        let hr_exp_done = code.len();
-        let r3 = (hr_exp_done as i32) - (hr_jge_exp_done as i32 + 6);
-        code[hr_jge_exp_done + 2..hr_jge_exp_done + 6].copy_from_slice(&r3.to_le_bytes());
-        let r4 = (hr_exp_done as i32) - (hr_jnz_both as i32 + 6);
-        code[hr_jnz_both + 2..hr_jnz_both + 6].copy_from_slice(&r4.to_le_bytes());
-
-        // --- Now call LoadLibraryA + GetProcAddress for hook handlers ---
-        // (Same logic as the main path at lines ~1831-1905)
-
-        // Check both were found
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA8, 0x00]); // cmp [rbp-0x58], 0
-        let hr_jz_nolib = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // jz .real_epilogue
-        hr_fixup_to_real_epilogue.push(hr_jz_nolib);
-
-        code.extend_from_slice(&[0x48, 0x83, 0x7D, 0xA0, 0x00]); // cmp [rbp-0x60], 0
-        let hr_jz_nogpa = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_nogpa);
-
-        // lea rcx, [rip + library_path] — need to embed the library path string
-        // We'll embed it after this code and fix up the LEA.
-        let hr_lea_lib = code.len();
-        code.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]); // lea rcx, [rip+disp32]
-
-        // sub rsp, 32
-        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-        // call [rbp-0x58] ; LoadLibraryA
-        code.extend_from_slice(&[0xFF, 0x55, 0xA8]);
-        // add rsp, 32
-        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
-
-        // test rax, rax
-        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
-        let hr_jz_loadfail = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_loadfail);
-
-        // mov rbx, rax ; HMODULE
-        code.extend_from_slice(&[0x48, 0x89, 0xC3]);
-
-        // For each handler: GetProcAddress(rbx, symbol_name) → store at slot VA
-        let mut hr_sym_leas: Vec<(usize, usize)> = Vec::new(); // (lea_pos, handler_index)
-        for (i, (_name, slot_va)) in hook_lib.handlers.iter().enumerate() {
-            let hr_lea_sym = code.len();
-            code.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]); // lea rdx, [rip+disp32]
-            hr_sym_leas.push((hr_lea_sym, i));
-
-            code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
-            code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
-            code.extend_from_slice(&[0xFF, 0x55, 0xA0]); // call [rbp-0x60]
-            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
-
-            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-            let hr_jz_skip = code.len();
-            code.extend_from_slice(&[0x74, 0x00]); // jz .hr_skip_store
-
-            // lea r13, [rip + disp32] — data slot VA (RIP-relative for ASLR)
-            let lea_slot_pos = code.len();
-            code.extend_from_slice(&[0x4C, 0x8D, 0x2D, 0x00, 0x00, 0x00, 0x00]);
-            let lea_slot_rip = init_va + code.len() as u64;
-            let slot_disp = (*slot_va as i64 - lea_slot_rip as i64) as i32;
-            code[lea_slot_pos + 3..lea_slot_pos + 7].copy_from_slice(&slot_disp.to_le_bytes());
-            // mov [r13], rax
-            code.extend_from_slice(&[0x49, 0x89, 0x45, 0x00]);
-
-            // .hr_skip_store:
-            let hr_skip_store = code.len();
-            code[hr_jz_skip + 1] = (hr_skip_store - (hr_jz_skip + 2)) as u8;
-        }
-
-        // JMP over the embedded strings that follow.
-        let hr_jmp_over_strings = code.len();
-        code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]); // jmp rel32 placeholder
-
-        // Embed strings: library path, then handler symbol names.
-        // Fix up the LEA displacements.
-
-        // Library path string
-        let hr_lib_str = code.len();
-        let lib_rip = init_va + (hr_lea_lib + 7) as u64;
-        let lib_delta = (init_va + hr_lib_str as u64) as i64 - lib_rip as i64;
-        code[hr_lea_lib + 3..hr_lea_lib + 7].copy_from_slice(&(lib_delta as i32).to_le_bytes());
-        code.extend_from_slice(hook_lib.library_path.as_bytes());
-        code.push(0x00); // null terminator
-
-        // Handler symbol name strings
-        for (lea_pos, handler_idx) in &hr_sym_leas {
-            let str_offset = code.len();
-            let sym_rip = init_va + (lea_pos + 7) as u64;
-            let sym_delta = (init_va + str_offset as u64) as i64 - sym_rip as i64;
-            code[lea_pos + 3..lea_pos + 7].copy_from_slice(&(sym_delta as i32).to_le_bytes());
-            let (name, _) = &hook_lib.handlers[*handler_idx];
-            code.extend_from_slice(name.as_bytes());
-            code.push(0x00);
-        }
-
-        // Fix up JMP over strings
-        let hr_after_strings = code.len();
-        let jmp_rel = (hr_after_strings as i32) - (hr_jmp_over_strings as i32 + 5);
-        code[hr_jmp_over_strings + 1..hr_jmp_over_strings + 5]
-            .copy_from_slice(&jmp_rel.to_le_bytes());
-
-        // Fall through to real_epilogue
+        hr_fixup_to_real_epilogue = hr_fixups;
     } else {
         hook_resolve_label = None;
-    };
+    }
 
     // .real_epilogue: restore registers and jump to original entry point
     let real_epilogue = code.len();
@@ -2604,247 +3257,11 @@ fn generate_pe32_init_code(
     let jne_next7_pos = code.len();
     code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]); // jne rel32 placeholder
 
-    // ===== FOUND! Parse decimal SHM ID from wide string at edi + 26 =====
-    // lea edi, [edi + 26]  ; skip past "__AFL_SHM_ID=" (13 wchars = 26 bytes)
-    code.extend_from_slice(&[0x8D, 0x7F, 0x1A]);
+    // Parse decimal SHM ID and build SHM name on stack.
+    emit_pe32_shm_name_build(&mut code);
 
-    // Use ebx as shmid accumulator (we don't need needle pointer anymore).
-    // xor ebx, ebx  ; shmid = 0
-    code.extend_from_slice(&[0x31, 0xDB]);
-
-    // .parse_loop:
-    let parse_loop = code.len();
-    // movzx eax, word [edi]  ; load wide char
-    code.extend_from_slice(&[0x0F, 0xB7, 0x07]);
-    // sub ax, '0'  (0x30)
-    code.extend_from_slice(&[0x66, 0x2D, 0x30, 0x00]);
-    // cmp ax, 9
-    code.extend_from_slice(&[0x66, 0x3D, 0x09, 0x00]);
-    // ja .parse_done
-    let ja_parse_done_pos = code.len();
-    code.extend_from_slice(&[0x77, 0x00]); // ja rel8 placeholder
-    // imul ebx, ebx, 10
-    code.extend_from_slice(&[0x6B, 0xDB, 0x0A]);
-    // movzx eax, ax
-    code.extend_from_slice(&[0x0F, 0xB7, 0xC0]);
-    // add ebx, eax
-    code.extend_from_slice(&[0x01, 0xC3]);
-    // add edi, 2  ; next wchar
-    code.extend_from_slice(&[0x83, 0xC7, 0x02]);
-    // jmp .parse_loop
-    let jmp_parse_rel = (parse_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_parse_rel as u8]);
-
-    // .parse_done:
-    let parse_done = code.len();
-    code[ja_parse_done_pos + 1] = (parse_done - (ja_parse_done_pos + 2)) as u8;
-
-    // ebx = SHM ID. Save it.
-    // mov [ebp - 0x04], ebx  ; save SHM ID at local
-    code.extend_from_slice(&[0x89, 0x5D, 0xFC]);
-
-    // ============================================================
-    // Step 3: Build SHM name "afl_shm_<id>" on stack
-    // ============================================================
-
-    // lea edi, [ebp - LOCAL_SIZE]  ; name buffer
-    let name_ebp_offset: i32 = -(LOCAL_SIZE as i32);
-    code.extend_from_slice(&[0x8D, 0xBD]);
-    code.extend_from_slice(&name_ebp_offset.to_le_bytes());
-
-    // Write "afl_shm_" prefix (8 bytes, written as two dwords)
-    let prefix_bytes = b"afl_shm_";
-    let prefix_lo = u32::from_le_bytes([
-        prefix_bytes[0],
-        prefix_bytes[1],
-        prefix_bytes[2],
-        prefix_bytes[3],
-    ]);
-    let prefix_hi = u32::from_le_bytes([
-        prefix_bytes[4],
-        prefix_bytes[5],
-        prefix_bytes[6],
-        prefix_bytes[7],
-    ]);
-    // mov dword [edi], prefix_lo
-    code.extend_from_slice(&[0xC7, 0x07]);
-    code.extend_from_slice(&prefix_lo.to_le_bytes());
-    // mov dword [edi + 4], prefix_hi
-    code.extend_from_slice(&[0xC7, 0x47, 0x04]);
-    code.extend_from_slice(&prefix_hi.to_le_bytes());
-    // add edi, 8
-    code.extend_from_slice(&[0x83, 0xC7, 0x08]);
-
-    // Convert ebx (SHM ID) to decimal ASCII at [edi].
-    // mov eax, ebx
-    code.extend_from_slice(&[0x89, 0xD8]);
-    // mov ebx, edi  ; save start of digits
-    code.extend_from_slice(&[0x89, 0xFB]);
-    // test eax, eax
-    code.extend_from_slice(&[0x85, 0xC0]);
-    // jnz .conv_loop
-    let jnz_conv_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jnz rel8 placeholder
-    // Zero case: write '0'
-    code.extend_from_slice(&[0xC6, 0x07, 0x30]); // mov byte [edi], '0'
-    code.extend_from_slice(&[0x47]); // inc edi
-    // jmp .conv_done
-    let jmp_conv_done_pos = code.len();
-    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
-
-    // .conv_loop:
-    let conv_loop = code.len();
-    code[jnz_conv_pos + 1] = (conv_loop - (jnz_conv_pos + 2)) as u8;
-    // xor edx, edx
-    code.extend_from_slice(&[0x31, 0xD2]);
-    // mov ecx, 10
-    code.extend_from_slice(&[0xB9, 0x0A, 0x00, 0x00, 0x00]);
-    // div ecx  ; eax = quotient, edx = remainder
-    code.extend_from_slice(&[0xF7, 0xF1]);
-    // add dl, '0'
-    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
-    // mov [edi], dl
-    code.extend_from_slice(&[0x88, 0x17]);
-    // inc edi
-    code.push(0x47);
-    // test eax, eax
-    code.extend_from_slice(&[0x85, 0xC0]);
-    // jnz .conv_loop
-    let jnz_conv2_rel = (conv_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0x75, jnz_conv2_rel as u8]);
-
-    // Null-terminate and reverse.
-    // mov byte [edi], 0
-    code.extend_from_slice(&[0xC6, 0x07, 0x00]);
-    // dec edi  ; points to last digit
-    code.push(0x4F); // dec edi
-
-    // .reverse_loop:
-    let reverse_loop = code.len();
-    // cmp ebx, edi
-    code.extend_from_slice(&[0x39, 0xFB]);
-    // jge .conv_done
-    let jge_conv_done_pos = code.len();
-    code.extend_from_slice(&[0x7D, 0x00]); // jge rel8 placeholder
-    // mov al, [ebx]
-    code.extend_from_slice(&[0x8A, 0x03]);
-    // mov cl, [edi]
-    code.extend_from_slice(&[0x8A, 0x0F]);
-    // mov [ebx], cl
-    code.extend_from_slice(&[0x88, 0x0B]);
-    // mov [edi], al
-    code.extend_from_slice(&[0x88, 0x07]);
-    // inc ebx
-    code.push(0x43);
-    // dec edi
-    code.push(0x4F);
-    // jmp .reverse_loop
-    let jmp_rev_rel = (reverse_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_rev_rel as u8]);
-
-    // .conv_done:
-    let conv_done = code.len();
-    code[jmp_conv_done_pos + 1] = (conv_done - (jmp_conv_done_pos + 2)) as u8;
-    code[jge_conv_done_pos + 1] = (conv_done - (jge_conv_done_pos + 2)) as u8;
-
-    // ============================================================
-    // Step 4: Walk PEB_LDR_DATA to find kernel32.dll
-    // PEB at fs:[0x30]
-    // PEB.Ldr at PEB+0x0C
-    // PEB_LDR_DATA.InLoadOrderModuleList at Ldr+0x0C
-    // Each entry: LDR_DATA_TABLE_ENTRY (32-bit):
-    //   +0x00: InLoadOrderLinks (LIST_ENTRY: Flink, Blink) (8 bytes)
-    //   +0x18: DllBase (4 bytes)
-    //   +0x2C: BaseDllName (UNICODE_STRING: Length u16, MaxLength u16, Buffer ptr)
-    //          Buffer at +0x30 (offset +0x04 from UNICODE_STRING start at +0x2C)
-    // ============================================================
-
-    // mov eax, fs:[0x30]  ; PEB
-    code.extend_from_slice(&[0x64, 0xA1, 0x30, 0x00, 0x00, 0x00]);
-    // mov eax, [eax + 0x0C]  ; PEB.Ldr
-    code.extend_from_slice(&[0x8B, 0x40, 0x0C]);
-    // lea ebx, [eax + 0x0C]  ; &InLoadOrderModuleList (list head)
-    code.extend_from_slice(&[0x8D, 0x58, 0x0C]);
-    // mov edi, [ebx]  ; first entry (Flink)
-    code.extend_from_slice(&[0x8B, 0x3B]);
-
-    // .ldr_loop:
-    let ldr_loop = code.len();
-    // cmp edi, ebx  ; back to head?
-    code.extend_from_slice(&[0x39, 0xDF]);
-    // je .epilogue  ; kernel32 not found
-    let je_epilogue_k32_pos = code.len();
-    code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je rel32 placeholder
-
-    // Check BaseDllName: LDR_DATA_TABLE_ENTRY.BaseDllName at offset 0x2C (32-bit).
-    // UNICODE_STRING.Length at +0x00 (u16), Buffer at +0x04 (ptr, 32-bit).
-    // movzx ecx, word [edi + 0x2C]  ; BaseDllName.Length (in bytes)
-    code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x2C]);
-    // cmp ecx, 24  ; "KERNEL32.DLL" = 12 wchars = 24 bytes
-    code.extend_from_slice(&[0x83, 0xF9, 0x18]);
-    // jne .ldr_next
-    let jne_ldr_next1_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // mov ecx, [edi + 0x30]  ; BaseDllName.Buffer (at UNICODE_STRING + 0x04)
-    code.extend_from_slice(&[0x8B, 0x4F, 0x30]);
-
-    // Case-insensitive check: first wchar ORed with 0x20 == 'k' (0x6B)
-    // movzx eax, word [ecx]
-    code.extend_from_slice(&[0x0F, 0xB7, 0x01]);
-    // or al, 0x20
-    code.extend_from_slice(&[0x0C, 0x20]);
-    // cmp al, 'k'
-    code.extend_from_slice(&[0x3C, 0x6B]);
-    // jne .ldr_next
-    let jne_ldr_next2_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Check '3' at wchar index 6 (byte offset 12)
-    // movzx eax, word [ecx + 12]
-    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0C]);
-    // cmp al, '3'
-    code.extend_from_slice(&[0x3C, 0x33]);
-    // jne .ldr_next
-    let jne_ldr_next3_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Check '2' at wchar index 7 (byte offset 14)
-    // movzx eax, word [ecx + 14]
-    code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0E]);
-    // cmp al, '2'
-    code.extend_from_slice(&[0x3C, 0x32]);
-    // jne .ldr_next
-    let jne_ldr_next4_pos = code.len();
-    code.extend_from_slice(&[0x75, 0x00]); // jne rel8 placeholder
-
-    // Found kernel32.dll! DllBase is at [edi + 0x18] (32-bit).
-    // mov esi, [edi + 0x18]  ; esi = kernel32 base (repurpose esi; data_va saved earlier)
-    // Save esi (data_va) to stack before repurposing esi for kernel32 base.
-    // data_va can also be reloaded from the immediate constant if needed.
-    // push esi  ; save data_va
-    code.push(0x56);
-    // mov esi, [edi + 0x18]  ; esi = kernel32 base
-    code.extend_from_slice(&[0x8B, 0x77, 0x18]);
-    // jmp .resolve_exports
-    let jmp_resolve_pos = code.len();
-    code.extend_from_slice(&[0xEB, 0x00]); // jmp rel8 placeholder
-
-    // .ldr_next:
-    let ldr_next = code.len();
-    code[jne_ldr_next1_pos + 1] = (ldr_next - (jne_ldr_next1_pos + 2)) as u8;
-    code[jne_ldr_next2_pos + 1] = (ldr_next - (jne_ldr_next2_pos + 2)) as u8;
-    code[jne_ldr_next3_pos + 1] = (ldr_next - (jne_ldr_next3_pos + 2)) as u8;
-    code[jne_ldr_next4_pos + 1] = (ldr_next - (jne_ldr_next4_pos + 2)) as u8;
-    // mov edi, [edi]  ; Flink (next entry)
-    code.extend_from_slice(&[0x8B, 0x3F]);
-    // jmp .ldr_loop
-    let jmp_ldr_rel = (ldr_loop as isize - (code.len() as isize + 2)) as i8;
-    code.extend_from_slice(&[0xEB, jmp_ldr_rel as u8]);
-
-    // .resolve_exports:
-    let resolve_exports = code.len();
-    code[jmp_resolve_pos + 1] = (resolve_exports - (jmp_resolve_pos + 2)) as u8;
+    // Walk PEB_LDR_DATA to find kernel32.dll.
+    let je_epilogue_k32_pos = emit_pe32_kernel32_walk(&mut code);
 
     // ============================================================
     // Step 5: Parse kernel32.dll export directory
@@ -3172,6 +3589,8 @@ fn generate_pe32_init_code(
     // ============================================================
 
     // lea eax, [ebp + name_ebp_offset]  ; name string buffer
+    const LOCAL_SIZE_32: u32 = 128;
+    let name_ebp_offset: i32 = -(LOCAL_SIZE_32 as i32);
     code.extend_from_slice(&[0x8D, 0x85]);
     code.extend_from_slice(&name_ebp_offset.to_le_bytes());
 
@@ -3353,306 +3772,14 @@ fn generate_pe32_init_code(
     code.push(0xE9);
     code.extend_from_slice(&jmp_env_scan_rel.to_le_bytes());
 
-    // ============================================================
-    // Hook-only resolve: when hooks present but SHM was skipped,
-    // we still need to resolve hook handlers via a fresh kernel32 walk.
-    // ============================================================
-
+    // Hook-only resolve block.
     let hook_resolve_label: Option<usize>;
     let mut hr_fixup_to_real_epilogue: Vec<usize> = Vec::new();
 
     if let Some(hook_lib) = hook_library {
-        let label = code.len();
+        let (label, hr_fixups) = emit_pe32_hook_only_resolve(&mut code, init_va, hook_lib);
         hook_resolve_label = Some(label);
-
-        // Walk PEB_LDR_DATA for kernel32 (same as Step 4, 32-bit)
-        // mov eax, fs:[0x30]
-        code.extend_from_slice(&[0x64, 0xA1, 0x30, 0x00, 0x00, 0x00]);
-        // mov eax, [eax + 0x0C]  ; PEB.Ldr
-        code.extend_from_slice(&[0x8B, 0x40, 0x0C]);
-        // lea ebx, [eax + 0x0C]
-        code.extend_from_slice(&[0x8D, 0x58, 0x0C]);
-        // mov edi, [ebx]
-        code.extend_from_slice(&[0x8B, 0x3B]);
-
-        let hr_ldr_loop = code.len();
-        // cmp edi, ebx
-        code.extend_from_slice(&[0x39, 0xDF]);
-        let hr_je_no_k32 = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je .real_epilogue
-        hr_fixup_to_real_epilogue.push(hr_je_no_k32);
-
-        // movzx ecx, word [edi + 0x2C]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x4F, 0x2C]);
-        // cmp ecx, 24
-        code.extend_from_slice(&[0x83, 0xF9, 0x18]);
-        let hr_jne1 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        // mov ecx, [edi + 0x30]  ; BaseDllName.Buffer
-        code.extend_from_slice(&[0x8B, 0x4F, 0x30]);
-        // movzx eax, word [ecx]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x01]);
-        // or al, 0x20
-        code.extend_from_slice(&[0x0C, 0x20]);
-        // cmp al, 'k'
-        code.extend_from_slice(&[0x3C, 0x6B]);
-        let hr_jne2 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        // movzx eax, word [ecx + 12]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0C]);
-        // cmp al, '3'
-        code.extend_from_slice(&[0x3C, 0x33]);
-        let hr_jne3 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-        // movzx eax, word [ecx + 14]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x41, 0x0E]);
-        // cmp al, '2'
-        code.extend_from_slice(&[0x3C, 0x32]);
-        let hr_jne4 = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-
-        // Found! mov esi, [edi + 0x18]  ; kernel32 base in esi
-        code.extend_from_slice(&[0x8B, 0x77, 0x18]);
-        let hr_jmp_found = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]); // jmp .hr_found
-
-        // .hr_ldr_next:
-        let hr_ldr_next = code.len();
-        code[hr_jne1 + 1] = (hr_ldr_next - (hr_jne1 + 2)) as u8;
-        code[hr_jne2 + 1] = (hr_ldr_next - (hr_jne2 + 2)) as u8;
-        code[hr_jne3 + 1] = (hr_ldr_next - (hr_jne3 + 2)) as u8;
-        code[hr_jne4 + 1] = (hr_ldr_next - (hr_jne4 + 2)) as u8;
-        // mov edi, [edi]
-        code.extend_from_slice(&[0x8B, 0x3F]);
-        let rel = (hr_ldr_loop as isize - (code.len() as isize + 2)) as i8;
-        code.extend_from_slice(&[0xEB, rel as u8]);
-
-        // .hr_found:
-        let hr_found = code.len();
-        code[hr_jmp_found + 1] = (hr_found - (hr_jmp_found + 2)) as u8;
-
-        // Parse exports (PE32)
-        // mov eax, [esi + 0x3C]
-        code.extend_from_slice(&[0x8B, 0x46, 0x3C]);
-        // lea ebx, [esi + eax]
-        code.extend_from_slice(&[0x8D, 0x1C, 0x06]);
-        // mov eax, [ebx + 0x78]  ; Export dir RVA
-        code.extend_from_slice(&[0x8B, 0x43, 0x78]);
-        // test eax, eax
-        code.extend_from_slice(&[0x85, 0xC0]);
-        let hr_jz_noexp = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_noexp);
-
-        // lea ebx, [esi + eax]  ; export directory
-        code.extend_from_slice(&[0x8D, 0x1C, 0x06]);
-        // mov ecx, [ebx + 0x18]  ; NumberOfNames
-        code.extend_from_slice(&[0x8B, 0x4B, 0x18]);
-        // AddressOfNames
-        code.extend_from_slice(&[0x8B, 0x43, 0x20]); // mov eax, [ebx + 0x20]
-        code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
-        code.extend_from_slice(&[0x89, 0x45, 0xF8]); // mov [ebp - 0x08], eax
-        // AddressOfNameOrdinals
-        code.extend_from_slice(&[0x8B, 0x43, 0x24]); // mov eax, [ebx + 0x24]
-        code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
-        code.extend_from_slice(&[0x89, 0x45, 0xF4]); // mov [ebp - 0x0C], eax
-        // AddressOfFunctions
-        code.extend_from_slice(&[0x8B, 0x43, 0x1C]); // mov eax, [ebx + 0x1C]
-        code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
-        code.extend_from_slice(&[0x89, 0x45, 0xF0]); // mov [ebp - 0x10], eax
-
-        // Clear slots
-        code.extend_from_slice(&[0xC7, 0x45, 0xE4, 0x00, 0x00, 0x00, 0x00]); // [ebp-0x1C]=0
-        code.extend_from_slice(&[0xC7, 0x45, 0xE0, 0x00, 0x00, 0x00, 0x00]); // [ebp-0x20]=0
-
-        let hash_lla = djb2_hash(b"LoadLibraryA");
-        let hash_gpa = djb2_hash(b"GetProcAddress");
-
-        // xor edx, edx
-        code.extend_from_slice(&[0x31, 0xD2]);
-
-        let hr_exp_loop = code.len();
-        // cmp edx, ecx
-        code.extend_from_slice(&[0x39, 0xCA]);
-        let hr_jge_exp_done = code.len();
-        code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]);
-
-        // mov eax, [ebp - 0x08]  ; AddressOfNames
-        code.extend_from_slice(&[0x8B, 0x45, 0xF8]);
-        // mov eax, [eax + edx*4]
-        code.extend_from_slice(&[0x8B, 0x04, 0x90]);
-        // lea edi, [esi + eax]
-        code.extend_from_slice(&[0x8D, 0x3C, 0x06]);
-
-        // DJB2 hash
-        code.push(0x52); // push edx
-        code.push(0x51); // push ecx
-        code.push(0xB8); // mov eax, 5381
-        code.extend_from_slice(&5381u32.to_le_bytes());
-        let hr_hl = code.len();
-        code.extend_from_slice(&[0x0F, 0xB6, 0x1F]); // movzx ebx, byte [edi]
-        code.extend_from_slice(&[0x84, 0xDB]); // test bl, bl
-        let hr_jz_hd = code.len();
-        code.extend_from_slice(&[0x74, 0x00]);
-        code.extend_from_slice(&[0x6B, 0xC0, 0x21]); // imul eax, eax, 33
-        code.extend_from_slice(&[0x01, 0xD8]); // add eax, ebx
-        code.push(0x47); // inc edi
-        let r = (hr_hl as isize - (code.len() as isize + 2)) as i8;
-        code.extend_from_slice(&[0xEB, r as u8]);
-        let hr_hd = code.len();
-        code[hr_jz_hd + 1] = (hr_hd - (hr_jz_hd + 2)) as u8;
-        code.push(0x59); // pop ecx
-        code.push(0x5A); // pop edx
-
-        // Check LoadLibraryA
-        code.push(0x3D);
-        code.extend_from_slice(&hash_lla.to_le_bytes());
-        let hr_jne_lla = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-
-        // Resolve
-        code.extend_from_slice(&[0x8B, 0x5D, 0xF4]); // mov ebx, [ebp - 0x0C]
-        code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x53]); // movzx eax, word [ebx + edx*2]
-        code.extend_from_slice(&[0x8B, 0x5D, 0xF0]); // mov ebx, [ebp - 0x10]
-        code.extend_from_slice(&[0x8B, 0x04, 0x83]); // mov eax, [ebx + eax*4]
-        code.extend_from_slice(&[0x8D, 0x04, 0x06]); // lea eax, [esi + eax]
-        code.extend_from_slice(&[0x89, 0x45, 0xE4]); // mov [ebp - 0x1C], eax
-        let hr_jmp_next1 = code.len();
-        code.extend_from_slice(&[0xEB, 0x00]);
-
-        // Check GetProcAddress
-        let hr_check_gpa = code.len();
-        code[hr_jne_lla + 1] = (hr_check_gpa - (hr_jne_lla + 2)) as u8;
-
-        code.push(0x3D);
-        code.extend_from_slice(&hash_gpa.to_le_bytes());
-        let hr_jne_gpa = code.len();
-        code.extend_from_slice(&[0x75, 0x00]);
-
-        code.extend_from_slice(&[0x8B, 0x5D, 0xF4]);
-        code.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x53]);
-        code.extend_from_slice(&[0x8B, 0x5D, 0xF0]);
-        code.extend_from_slice(&[0x8B, 0x04, 0x83]);
-        code.extend_from_slice(&[0x8D, 0x04, 0x06]);
-        code.extend_from_slice(&[0x89, 0x45, 0xE0]); // mov [ebp - 0x20], eax
-
-        // .hr_exp_next:
-        let hr_exp_next = code.len();
-        code[hr_jmp_next1 + 1] = (hr_exp_next - (hr_jmp_next1 + 2)) as u8;
-        code[hr_jne_gpa + 1] = (hr_exp_next - (hr_jne_gpa + 2)) as u8;
-
-        // Check if both found
-        code.extend_from_slice(&[0x83, 0x7D, 0xE4, 0x00]); // cmp dword [ebp-0x1C], 0
-        let hr_jz_cont = code.len();
-        code.extend_from_slice(&[0x74, 0x00]);
-        code.extend_from_slice(&[0x83, 0x7D, 0xE0, 0x00]); // cmp dword [ebp-0x20], 0
-        let hr_jnz_both = code.len();
-        code.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-
-        let hr_exp_inc = code.len();
-        code[hr_jz_cont + 1] = (hr_exp_inc - (hr_jz_cont + 2)) as u8;
-        // inc edx
-        code.extend_from_slice(&[0xFF, 0xC2]);
-        let r2 = (hr_exp_loop as i32) - (code.len() as i32 + 5);
-        code.push(0xE9);
-        code.extend_from_slice(&r2.to_le_bytes());
-
-        // .hr_exp_done:
-        let hr_exp_done = code.len();
-        let r3 = (hr_exp_done as i32) - (hr_jge_exp_done as i32 + 6);
-        code[hr_jge_exp_done + 2..hr_jge_exp_done + 6].copy_from_slice(&r3.to_le_bytes());
-        let r4 = (hr_exp_done as i32) - (hr_jnz_both as i32 + 6);
-        code[hr_jnz_both + 2..hr_jnz_both + 6].copy_from_slice(&r4.to_le_bytes());
-
-        // Check both were found
-        code.extend_from_slice(&[0x83, 0x7D, 0xE4, 0x00]); // cmp [ebp-0x1C], 0
-        let hr_jz_nolib = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_nolib);
-
-        code.extend_from_slice(&[0x83, 0x7D, 0xE0, 0x00]); // cmp [ebp-0x20], 0
-        let hr_jz_nogpa = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_nogpa);
-
-        // Call LoadLibraryA
-        // mov eax, imm32  ; library path string VA (placeholder)
-        let hr_mov_lib = code.len();
-        code.push(0xB8);
-        code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-        // push eax
-        code.push(0x50);
-        // call [ebp - 0x1C]
-        code.extend_from_slice(&[0xFF, 0x55, 0xE4]);
-        // add esp, 4
-        code.extend_from_slice(&[0x83, 0xC4, 0x04]);
-
-        // test eax, eax
-        code.extend_from_slice(&[0x85, 0xC0]);
-        let hr_jz_loadfail = code.len();
-        code.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-        hr_fixup_to_real_epilogue.push(hr_jz_loadfail);
-
-        // mov ebx, eax  ; HMODULE
-        code.extend_from_slice(&[0x89, 0xC3]);
-
-        // For each handler: GetProcAddress(hModule, lpProcName) -> store at slot VA
-        let mut hr_sym_movs: Vec<(usize, usize)> = Vec::new(); // (mov_pos, handler_index)
-        for (i, (_name, slot_va)) in hook_lib.handlers.iter().enumerate() {
-            let hr_mov_sym = code.len();
-            code.push(0xB8); // mov eax, imm32
-            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-            hr_sym_movs.push((hr_mov_sym, i));
-
-            // push eax  ; lpProcName
-            code.push(0x50);
-            // push ebx  ; hModule
-            code.push(0x53);
-            // call [ebp - 0x20]  ; GetProcAddress
-            code.extend_from_slice(&[0xFF, 0x55, 0xE0]);
-            // add esp, 8
-            code.extend_from_slice(&[0x83, 0xC4, 0x08]);
-
-            // test eax, eax
-            code.extend_from_slice(&[0x85, 0xC0]);
-            let hr_jz_skip = code.len();
-            code.extend_from_slice(&[0x74, 0x00]);
-
-            // mov [slot_va], eax  (absolute)
-            code.push(0xA3);
-            code.extend_from_slice(&(*slot_va as u32).to_le_bytes());
-
-            let hr_skip_store = code.len();
-            code[hr_jz_skip + 1] = (hr_skip_store - (hr_jz_skip + 2)) as u8;
-        }
-
-        // JMP over strings
-        let hr_jmp_over_strings = code.len();
-        code.extend_from_slice(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
-
-        // Embed library path string
-        let hr_lib_str_offset = code.len();
-        let hr_lib_str_va = init_va + hr_lib_str_offset as u64;
-        code[hr_mov_lib + 1..hr_mov_lib + 5].copy_from_slice(&(hr_lib_str_va as u32).to_le_bytes());
-        code.extend_from_slice(hook_lib.library_path.as_bytes());
-        code.push(0x00);
-
-        // Embed handler symbol name strings
-        for (mov_pos, handler_idx) in &hr_sym_movs {
-            let str_offset = code.len();
-            let str_va = init_va + str_offset as u64;
-            code[mov_pos + 1..mov_pos + 5].copy_from_slice(&(str_va as u32).to_le_bytes());
-            let (name, _) = &hook_lib.handlers[*handler_idx];
-            code.extend_from_slice(name.as_bytes());
-            code.push(0x00);
-        }
-
-        // Fix up JMP over strings
-        let hr_after_strings = code.len();
-        let jmp_rel = (hr_after_strings as i32) - (hr_jmp_over_strings as i32 + 5);
-        code[hr_jmp_over_strings + 1..hr_jmp_over_strings + 5]
-            .copy_from_slice(&jmp_rel.to_le_bytes());
+        hr_fixup_to_real_epilogue = hr_fixups;
     } else {
         hook_resolve_label = None;
     }
@@ -4574,7 +4701,7 @@ mod tests {
             "PE init code generation failed: {:?}",
             result.err()
         );
-        let init = result.unwrap();
+        let init = result.expect("PE init code generation should succeed");
         assert!(!init.code.is_empty());
         assert!(
             init.code.len() > 100,
@@ -4604,11 +4731,12 @@ mod tests {
             "PE init code with hooks failed: {:?}",
             result.err()
         );
-        let init = result.unwrap();
+        let init = result.expect("PE init code with hooks should succeed");
         assert!(!init.code.is_empty());
         // With hooks, init code should be larger than without.
         let no_hooks =
-            generate_pe_init_code(0x140010000, 0x140010000 - 16, 0x140001000, None, None).unwrap();
+            generate_pe_init_code(0x140010000, 0x140010000 - 16, 0x140001000, None, None)
+                .expect("PE init code without hooks should succeed");
         assert!(
             init.code.len() > no_hooks.code.len(),
             "hook init code ({}) should be larger than no-hook ({})",
@@ -4669,7 +4797,8 @@ mod tests {
     fn test_pe_init_code_with_persistent() {
         // Init code with persistent mode should be larger than without.
         let no_persistent =
-            generate_pe_init_code(0x140010000, 0x140010000 - 16, 0x140001000, None, None).unwrap();
+            generate_pe_init_code(0x140010000, 0x140010000 - 16, 0x140001000, None, None)
+                .expect("PE init code without persistent should succeed");
         let with_persistent = generate_pe_init_code(
             0x140010000,
             0x140010000 - 16,
@@ -4677,7 +4806,7 @@ mod tests {
             None,
             Some(0x14000F000),
         )
-        .unwrap();
+        .expect("PE init code with persistent should succeed");
         assert!(
             with_persistent.code.len() > no_persistent.code.len(),
             "persistent init ({}) should be larger than non-persistent ({})",
@@ -4709,7 +4838,7 @@ mod tests {
             "PE persistent wrapper generation failed: {:?}",
             result.err()
         );
-        let wrapper = result.unwrap();
+        let wrapper = result.expect("PE persistent wrapper generation should succeed");
         assert!(!wrapper.code.is_empty(), "persistent wrapper code is empty");
         assert!(
             wrapper.code.len() > 100,
@@ -4734,7 +4863,7 @@ mod tests {
             "PE32 init code generation failed: {:?}",
             result.err()
         );
-        let init = result.unwrap();
+        let init = result.expect("PE32 init code generation should succeed");
         assert!(!init.code.is_empty(), "PE32 init code is empty");
         // Should contain the wide-string needle for __AFL_SHM_ID=.
         let needle = b"_\x00_\x00A\x00F\x00L\x00";
@@ -4754,8 +4883,8 @@ mod tests {
         // Should NOT contain REX.W prefix (0x48).
         // (Some 0x48 bytes may appear as data, but the init code should not have REX prefixes.)
         // Just check it's smaller than the 64-bit version.
-        let init64 =
-            generate_pe_init_code(0x00410000, 0x00410000 - 16, 0x00401000, None, None).unwrap();
+        let init64 = generate_pe_init_code(0x00410000, 0x00410000 - 16, 0x00401000, None, None)
+            .expect("PE64 init code should succeed for comparison");
         assert!(
             init.code.len() < init64.code.len(),
             "PE32 init ({}) should be smaller than PE64 init ({})",
@@ -4780,9 +4909,9 @@ mod tests {
             Some(&hook_lib),
             None,
         )
-        .unwrap();
-        let no_hooks =
-            generate_pe32_init_code(0x00410000, 0x00410000 - 16, 0x00401000, None, None).unwrap();
+        .expect("PE32 init code with hooks should succeed");
+        let no_hooks = generate_pe32_init_code(0x00410000, 0x00410000 - 16, 0x00401000, None, None)
+            .expect("PE32 init code without hooks should succeed");
         assert!(
             init.code.len() > no_hooks.code.len(),
             "PE32 hook init code ({}) should be larger than no-hook ({})",
@@ -4800,7 +4929,8 @@ mod tests {
 
     #[test]
     fn test_pe32_init_code_contains_afl_shm_needle() {
-        let init = generate_pe32_init_code(0x00410000, 0x0040FFF0, 0x00401000, None, None).unwrap();
+        let init = generate_pe32_init_code(0x00410000, 0x0040FFF0, 0x00401000, None, None)
+            .expect("PE32 init code should succeed for SHM needle test");
         // Full wide-string needle: "__AFL_SHM_ID=" as UTF-16LE.
         let full_needle: Vec<u8> = b"__AFL_SHM_ID="
             .iter()
@@ -4819,7 +4949,8 @@ mod tests {
     #[test]
     fn test_pe32_init_code_ends_with_jmp_to_oep() {
         let oep = 0x00401000u64;
-        let init = generate_pe32_init_code(0x00410000, 0x0040FFF0, oep, None, None).unwrap();
+        let init = generate_pe32_init_code(0x00410000, 0x0040FFF0, oep, None, None)
+            .expect("PE32 init code should succeed for JMP OEP test");
         // The last 5 bytes should be a JMP rel32 to the original entry point.
         // Find the JMP (0xE9) near the end of executable code (before embedded data).
         // The code ends with JMP rel32 followed by embedded data (needle + padding).
@@ -4865,7 +4996,7 @@ mod tests {
             "PE32 persistent wrapper generation failed: {:?}",
             result.err()
         );
-        let wrapper = result.unwrap();
+        let wrapper = result.expect("PE32 persistent wrapper generation should succeed");
         assert!(
             !wrapper.code.is_empty(),
             "PE32 persistent wrapper code is empty"
@@ -4905,7 +5036,8 @@ mod tests {
             "PE32 persistent wrapper generation failed: {:?}",
             result.err()
         );
-        let wrapper = result.unwrap();
+        let wrapper =
+            result.expect("PE32 persistent wrapper generation should succeed for counter test");
         // The persistent_count value (5000 = 0x1388) should appear as a little-endian imm32.
         let count_bytes = persistent_count.to_le_bytes();
         let found = wrapper.code.windows(4).any(|w| w == count_bytes);

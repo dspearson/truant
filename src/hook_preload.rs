@@ -486,7 +486,7 @@ mod tests {
             false,
         );
         assert!(spec.is_some());
-        let spec = spec.unwrap();
+        let spec = spec.expect("hook library spec should be Some");
         assert_eq!(spec.handlers.len(), 1);
         assert_eq!(spec.handlers[0].0, "my_hook");
         assert_eq!(spec.handlers[0].1, 0x500000);
