@@ -1,5 +1,16 @@
 //! Shared types for the patching subsystem.
 
+/// Options controlling instrumentation behaviour during patching.
+#[derive(Debug, Clone)]
+pub struct InstrumentationOptions {
+    pub enable_forkserver: bool,
+    pub enable_heap_san: bool,
+    pub persistent_addr: Option<u64>,
+    pub persistent_count: u32,
+    pub defer: bool,
+    pub no_coverage: bool,
+}
+
 /// Result of the patching operation.
 ///
 /// Shared across ELF, Mach-O, and PE patchers.

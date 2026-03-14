@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use crate::disasm::BasicBlock;
 use crate::hook_trampoline::TargetAbi;
 use crate::hooks::{self, HookSource, ResolvedHook};
-use crate::patcher::PatchResult;
+use crate::patcher::{InstrumentationOptions, PatchResult};
 use crate::pe::PeContext;
 use crate::traits::{BinaryContext, Patcher, TrampolineGenerator};
 use crate::trampoline::{DATA_SIZE, PREV_LOC_OFFSET};
@@ -102,13 +102,8 @@ impl Patcher for PePatcher {
         ctx: &dyn BinaryContext,
         blocks: &[BasicBlock],
         data: Vec<u8>,
-        _enable_forkserver: bool,
-        _enable_heap_san: bool,
-        persistent_addr: Option<u64>,
-        persistent_count: u32,
-        _defer: bool,
+        opts: &InstrumentationOptions,
         hooks: &[ResolvedHook],
-        no_coverage: bool,
     ) -> Result<PatchResult> {
         let pe_ctx = ctx
             .as_any()
@@ -119,12 +114,10 @@ impl Patcher for PePatcher {
             pe_ctx.inner(),
             blocks,
             data,
+            opts,
             &*self.tramp_gen,
             hooks,
-            no_coverage,
             self.hook_library_path.as_ref(),
-            persistent_addr,
-            persistent_count,
         )
     }
 }
@@ -335,18 +328,18 @@ fn update_pe_headers(
 /// 5. Patch basic blocks with JMP rel32
 /// 6. Append section data
 /// 7. Update PE headers
-#[allow(clippy::too_many_arguments)]
 fn patch_pe(
     ctx: &PeContext,
     blocks: &[BasicBlock],
     mut data: Vec<u8>,
+    opts: &InstrumentationOptions,
     tramp_gen: &dyn TrampolineGenerator,
     resolved_hooks: &[ResolvedHook],
-    no_coverage: bool,
     hook_library_path: Option<&String>,
-    persistent_addr: Option<u64>,
-    persistent_count: u32,
 ) -> Result<PatchResult> {
+    let no_coverage = opts.no_coverage;
+    let persistent_addr = opts.persistent_addr;
+    let persistent_count = opts.persistent_count;
     if blocks.is_empty() && !no_coverage {
         bail!("no basic blocks to instrument");
     }
@@ -590,28 +583,22 @@ fn patch_pe(
         })?;
         persistent_displaced_len = displaced_len;
 
+        let pw_params = crate::trampoline::PersistentWrapperParams {
+            wrapper_va,
+            persistent_data_va: p_data_va,
+            data_va,
+            persistent_addr: p_addr,
+            displaced_bytes: &displaced,
+            displaced_len,
+            persistent_count,
+            include_forkserver: false,
+        };
         let wrapper = if ctx.is_64bit {
-            generate_pe_persistent_wrapper(
-                wrapper_va,
-                p_data_va,
-                data_va,
-                p_addr,
-                &displaced,
-                displaced_len,
-                persistent_count,
-            )
-            .context("failed to generate PE persistent wrapper")?
+            generate_pe_persistent_wrapper(&pw_params)
+                .context("failed to generate PE persistent wrapper")?
         } else {
-            generate_pe32_persistent_wrapper(
-                wrapper_va,
-                p_data_va,
-                data_va,
-                p_addr,
-                &displaced,
-                displaced_len,
-                persistent_count,
-            )
-            .context("failed to generate PE32 persistent wrapper")?
+            generate_pe32_persistent_wrapper(&pw_params)
+                .context("failed to generate PE32 persistent wrapper")?
         };
 
         current_va += wrapper.code.len() as u64;
@@ -690,14 +677,16 @@ fn patch_pe(
                         * ptr_size;
 
                 match crate::hook_trampoline::generate_return_hook_trampolines(
-                    entry_va,
-                    ret_tramp_va,
+                    &crate::hook_trampoline::ReturnHookContext {
+                        entry_va,
+                        ret_tramp_va,
+                        hook_data_va,
+                        shellcode_va: sc_va,
+                        toggle_va,
+                        return_slot_va: slot_va,
+                    },
                     hook,
-                    hook_data_va,
-                    sc_va,
                     hook_abi,
-                    toggle_va,
-                    slot_va,
                 ) {
                     Ok((entry_tramp, ret_tramp)) => {
                         assert!(
@@ -3104,7 +3093,6 @@ fn generate_pe_init_code(
 /// - 32-bit registers, cdecl calling convention
 /// - No RIP-relative addressing; use absolute immediates for data_va
 /// - Export directory at OptHdr+0x60 (PE32, not PE32+ which uses +0x70)
-#[allow(clippy::too_many_arguments)]
 fn generate_pe32_init_code(
     init_va: u64,
     data_va: u64,
@@ -4031,16 +4019,16 @@ fn generate_trampoline_pe32(
 /// The fuzzer communicates via pipe handles 198 (read) and 199 (write).
 ///
 /// See `PE_PERSISTENT_DATA_SIZE` for the data layout.
-#[allow(clippy::too_many_arguments)]
 fn generate_pe_persistent_wrapper(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
+    params: &crate::trampoline::PersistentWrapperParams,
 ) -> Result<crate::trampoline::PersistentWrapper> {
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
     let mut code = Vec::with_capacity(512);
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -4370,16 +4358,16 @@ fn generate_pe_persistent_wrapper(
 /// 4-byte pointers.
 ///
 /// See `PE32_PERSISTENT_DATA_SIZE` for the data layout.
-#[allow(clippy::too_many_arguments)]
 fn generate_pe32_persistent_wrapper(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
+    params: &crate::trampoline::PersistentWrapperParams,
 ) -> Result<crate::trampoline::PersistentWrapper> {
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
     let mut code = Vec::with_capacity(512);
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -4824,15 +4812,16 @@ mod tests {
         let persistent_addr = 0x140001000u64;
         // Simulated displaced bytes: 3x NOP + 2-byte NOP = 5 bytes, valid x86_64.
         let displaced = [0x90, 0x90, 0x90, 0x66, 0x90];
-        let result = generate_pe_persistent_wrapper(
+        let result = generate_pe_persistent_wrapper(&crate::trampoline::PersistentWrapperParams {
             wrapper_va,
             persistent_data_va,
             data_va,
             persistent_addr,
-            &displaced,
-            5,
-            1000,
-        );
+            displaced_bytes: &displaced,
+            displaced_len: 5,
+            persistent_count: 1000,
+            include_forkserver: false,
+        });
         assert!(
             result.is_ok(),
             "PE persistent wrapper generation failed: {:?}",
@@ -4982,15 +4971,17 @@ mod tests {
         let persistent_addr = 0x00401000u64;
         // Simulated displaced bytes: 3x NOP + 2-byte NOP = 5 bytes, valid x86-32.
         let displaced = [0x90, 0x90, 0x90, 0x66, 0x90];
-        let result = generate_pe32_persistent_wrapper(
-            wrapper_va,
-            persistent_data_va,
-            data_va,
-            persistent_addr,
-            &displaced,
-            5,
-            1000,
-        );
+        let result =
+            generate_pe32_persistent_wrapper(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va,
+                persistent_data_va,
+                data_va,
+                persistent_addr,
+                displaced_bytes: &displaced,
+                displaced_len: 5,
+                persistent_count: 1000,
+                include_forkserver: false,
+            });
         assert!(
             result.is_ok(),
             "PE32 persistent wrapper generation failed: {:?}",
@@ -5022,15 +5013,17 @@ mod tests {
         let persistent_addr = 0x00401000u64;
         let displaced = [0x90, 0x90, 0x90, 0x66, 0x90];
         let persistent_count: u32 = 5000;
-        let result = generate_pe32_persistent_wrapper(
-            wrapper_va,
-            persistent_data_va,
-            data_va,
-            persistent_addr,
-            &displaced,
-            5,
-            persistent_count,
-        );
+        let result =
+            generate_pe32_persistent_wrapper(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va,
+                persistent_data_va,
+                data_va,
+                persistent_addr,
+                displaced_bytes: &displaced,
+                displaced_len: 5,
+                persistent_count,
+                include_forkserver: false,
+            });
         assert!(
             result.is_ok(),
             "PE32 persistent wrapper generation failed: {:?}",

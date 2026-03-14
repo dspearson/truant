@@ -11,6 +11,16 @@ use anyhow::{Context, Result};
 use crate::hooks::{CondOp, HookCondition, HookMode, HookSource, ResolvedHook};
 use crate::trampoline::Trampoline;
 
+/// Context for return-hook trampoline generation.
+pub struct ReturnHookContext {
+    pub entry_va: u64,
+    pub ret_tramp_va: u64,
+    pub hook_data_va: u64,
+    pub shellcode_va: Option<u64>,
+    pub toggle_va: Option<u64>,
+    pub return_slot_va: u64,
+}
+
 /// Target architecture and calling convention for hook trampolines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAbi {
@@ -210,16 +220,10 @@ pub fn generate_hook_trampoline(
 ///
 /// The `return_slot_va` is the VA of an 8-byte data slot used to store the
 /// original return address between entry and return.
-#[allow(clippy::too_many_arguments)]
 pub fn generate_return_hook_trampolines(
-    entry_va: u64,
-    ret_tramp_va: u64,
+    rctx: &ReturnHookContext,
     hook: &ResolvedHook,
-    hook_data_va: u64,
-    shellcode_va: Option<u64>,
     abi: TargetAbi,
-    toggle_va: Option<u64>,
-    return_slot_va: u64,
 ) -> Result<(Trampoline, Trampoline)> {
     assert_eq!(
         hook.mode,
@@ -227,53 +231,19 @@ pub fn generate_return_hook_trampolines(
         "generate_return_hook_trampolines requires Return mode"
     );
     match abi {
-        TargetAbi::Win32 => generate_return_hook_trampolines_pe32(
-            entry_va,
-            ret_tramp_va,
-            hook,
-            hook_data_va,
-            shellcode_va,
-            toggle_va,
-            return_slot_va,
-        ),
+        TargetAbi::Win32 => generate_return_hook_trampolines_pe32(rctx, hook),
         TargetAbi::Aarch64 => {
             #[cfg(feature = "aarch64")]
             {
-                crate::arch::aarch64::hook_trampoline::generate_return_hook_trampolines(
-                    entry_va,
-                    ret_tramp_va,
-                    hook,
-                    hook_data_va,
-                    shellcode_va,
-                    toggle_va,
-                    return_slot_va,
-                )
+                crate::arch::aarch64::hook_trampoline::generate_return_hook_trampolines(rctx, hook)
             }
             #[cfg(not(feature = "aarch64"))]
             {
                 anyhow::bail!("AArch64 hook trampolines require --features aarch64")
             }
         }
-        TargetAbi::SysV64 => generate_return_hook_trampolines_x86_64(
-            entry_va,
-            ret_tramp_va,
-            hook,
-            hook_data_va,
-            shellcode_va,
-            toggle_va,
-            return_slot_va,
-            false,
-        ),
-        TargetAbi::Win64 => generate_return_hook_trampolines_x86_64(
-            entry_va,
-            ret_tramp_va,
-            hook,
-            hook_data_va,
-            shellcode_va,
-            toggle_va,
-            return_slot_va,
-            true,
-        ),
+        TargetAbi::SysV64 => generate_return_hook_trampolines_x86_64(rctx, hook, false),
+        TargetAbi::Win64 => generate_return_hook_trampolines_x86_64(rctx, hook, true),
     }
 }
 
@@ -1477,17 +1447,17 @@ fn generate_replace_hook_trampoline(
 ///   6. Restore regs + deallocate + restore red zone
 ///   7. Load saved original RA from data slot
 ///   8. Push it and RET (return to original caller)
-#[allow(clippy::too_many_arguments)]
 fn generate_return_hook_trampolines_x86_64(
-    entry_va: u64,
-    ret_tramp_va: u64,
+    rctx: &ReturnHookContext,
     hook: &ResolvedHook,
-    hook_data_va: u64,
-    shellcode_va: Option<u64>,
-    toggle_va: Option<u64>,
-    return_slot_va: u64,
     windows_abi: bool,
 ) -> Result<(Trampoline, Trampoline)> {
+    let entry_va = rctx.entry_va;
+    let ret_tramp_va = rctx.ret_tramp_va;
+    let hook_data_va = rctx.hook_data_va;
+    let shellcode_va = rctx.shellcode_va;
+    let toggle_va = rctx.toggle_va;
+    let return_slot_va = rctx.return_slot_va;
     let return_va = hook.target_va + hook.displaced_len as u64;
 
     // === Entry trampoline ===
@@ -2251,16 +2221,16 @@ fn generate_pe32_chained_hook_trampoline(
 /// **Return trampoline**: save regs, call handler, restore, load saved RA, push+ret.
 ///
 /// The `return_slot_va` is the VA of a 4-byte data slot for the original return address.
-#[allow(clippy::too_many_arguments)]
 fn generate_return_hook_trampolines_pe32(
-    entry_va: u64,
-    ret_tramp_va: u64,
+    rctx: &ReturnHookContext,
     hook: &ResolvedHook,
-    hook_data_va: u64,
-    shellcode_va: Option<u64>,
-    toggle_va: Option<u64>,
-    return_slot_va: u64,
 ) -> Result<(Trampoline, Trampoline)> {
+    let entry_va = rctx.entry_va;
+    let ret_tramp_va = rctx.ret_tramp_va;
+    let hook_data_va = rctx.hook_data_va;
+    let shellcode_va = rctx.shellcode_va;
+    let toggle_va = rctx.toggle_va;
+    let return_slot_va = rctx.return_slot_va;
     let return_va = hook.target_va + hook.displaced_len as u64;
 
     // === Entry trampoline ===
@@ -2797,14 +2767,16 @@ mod tests {
         let ret_tramp_va = 0x600100u64;
         let return_slot_va = 0x580000u64;
         let result = generate_return_hook_trampolines(
-            entry_va,
-            ret_tramp_va,
+            &ReturnHookContext {
+                entry_va,
+                ret_tramp_va,
+                hook_data_va: 0x500000,
+                shellcode_va: Some(0x500000),
+                toggle_va: None,
+                return_slot_va,
+            },
             &hook,
-            0x500000,
-            Some(0x500000),
             TargetAbi::SysV64,
-            None,
-            return_slot_va,
         );
         assert!(result.is_ok(), "return hook failed: {:?}", result.err());
         let (entry, ret_tramp) = result.expect("return hook trampoline generation should succeed");
@@ -2828,14 +2800,16 @@ mod tests {
         let ret_tramp_va = 0x600100u64;
         let return_slot_va = 0x580000u64;
         let (entry, _) = generate_return_hook_trampolines(
-            entry_va,
-            ret_tramp_va,
+            &ReturnHookContext {
+                entry_va,
+                ret_tramp_va,
+                hook_data_va: 0x500000,
+                shellcode_va: Some(0x500000),
+                toggle_va: None,
+                return_slot_va,
+            },
             &hook,
-            0x500000,
-            Some(0x500000),
             TargetAbi::SysV64,
-            None,
-            return_slot_va,
         )
         .expect("return hook entry trampoline generation should succeed");
         // Entry trampoline should start with push rax (0x50)
@@ -2857,14 +2831,16 @@ mod tests {
         let ret_tramp_va = 0x600100u64;
         let return_slot_va = 0x580000u64;
         let (_, ret_tramp) = generate_return_hook_trampolines(
-            entry_va,
-            ret_tramp_va,
+            &ReturnHookContext {
+                entry_va,
+                ret_tramp_va,
+                hook_data_va: 0x500000,
+                shellcode_va: Some(0x500000),
+                toggle_va: None,
+                return_slot_va,
+            },
             &hook,
-            0x500000,
-            Some(0x500000),
             TargetAbi::SysV64,
-            None,
-            return_slot_va,
         )
         .expect("return hook return trampoline generation should succeed");
         // Return trampoline should end with RET (0xC3)
@@ -3110,14 +3086,16 @@ mod tests {
     fn test_pe32_return_hook_generates() {
         let hook = make_test_hook_pe32(HookMode::Return);
         let result = generate_return_hook_trampolines(
-            0x600000,
-            0x600100,
+            &ReturnHookContext {
+                entry_va: 0x600000,
+                ret_tramp_va: 0x600100,
+                hook_data_va: 0x500000,
+                shellcode_va: Some(0x500000),
+                toggle_va: None,
+                return_slot_va: 0x580000,
+            },
             &hook,
-            0x500000,
-            Some(0x500000),
             TargetAbi::Win32,
-            None,
-            0x580000,
         );
         assert!(
             result.is_ok(),

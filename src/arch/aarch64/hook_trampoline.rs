@@ -15,6 +15,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::hook_trampoline::ReturnHookContext;
 use crate::hooks::{CondOp, HookCondition, HookMode, HookSource, ResolvedHook};
 use crate::trampoline::Trampoline;
 
@@ -65,14 +66,15 @@ pub fn generate_hook_trampoline(
 ///   5. Load saved original LR from data slot into x16
 ///   6. BR x16 (return to original caller)
 pub fn generate_return_hook_trampolines(
-    entry_va: u64,
-    ret_tramp_va: u64,
+    rctx: &ReturnHookContext,
     hook: &ResolvedHook,
-    hook_data_va: u64,
-    shellcode_va: Option<u64>,
-    toggle_va: Option<u64>,
-    return_slot_va: u64,
 ) -> Result<(Trampoline, Trampoline)> {
+    let entry_va = rctx.entry_va;
+    let ret_tramp_va = rctx.ret_tramp_va;
+    let hook_data_va = rctx.hook_data_va;
+    let shellcode_va = rctx.shellcode_va;
+    let toggle_va = rctx.toggle_va;
+    let return_slot_va = rctx.return_slot_va;
     let return_va = hook.target_va + hook.displaced_len as u64;
 
     // === Entry trampoline ===
@@ -1555,15 +1557,15 @@ mod tests {
         let entry_va = 0x200000u64;
         let ret_tramp_va = 0x200100u64;
         let return_slot_va = 0x180010u64;
-        let result = generate_return_hook_trampolines(
+        let rctx = ReturnHookContext {
             entry_va,
             ret_tramp_va,
-            &hook,
-            0x180000,
-            Some(0x1F0000),
-            None,
+            hook_data_va: 0x180000,
+            shellcode_va: Some(0x1F0000),
+            toggle_va: None,
             return_slot_va,
-        );
+        };
+        let result = generate_return_hook_trampolines(&rctx, &hook);
         assert!(
             result.is_ok(),
             "AArch64 return hook failed: {:?}",
@@ -1590,16 +1592,16 @@ mod tests {
         let entry_va = 0x200000u64;
         let ret_tramp_va = 0x200100u64;
         let return_slot_va = 0x180010u64;
-        let (entry, _) = generate_return_hook_trampolines(
+        let rctx = ReturnHookContext {
             entry_va,
             ret_tramp_va,
-            &hook,
-            0x180000,
-            Some(0x1F0000),
-            None,
+            hook_data_va: 0x180000,
+            shellcode_va: Some(0x1F0000),
+            toggle_va: None,
             return_slot_va,
-        )
-        .expect("return hook entry trampoline should succeed");
+        };
+        let (entry, _) = generate_return_hook_trampolines(&rctx, &hook)
+            .expect("return hook entry trampoline should succeed");
         // Last instruction should be B (unconditional branch)
         let last_word = u32::from_le_bytes(
             entry.code[entry.code.len() - 4..]
@@ -1620,16 +1622,16 @@ mod tests {
         let entry_va = 0x200000u64;
         let ret_tramp_va = 0x200100u64;
         let return_slot_va = 0x180010u64;
-        let (_, ret_tramp) = generate_return_hook_trampolines(
+        let rctx = ReturnHookContext {
             entry_va,
             ret_tramp_va,
-            &hook,
-            0x180000,
-            Some(0x1F0000),
-            None,
+            hook_data_va: 0x180000,
+            shellcode_va: Some(0x1F0000),
+            toggle_va: None,
             return_slot_va,
-        )
-        .expect("return hook return trampoline should succeed");
+        };
+        let (_, ret_tramp) = generate_return_hook_trampolines(&rctx, &hook)
+            .expect("return hook return trampoline should succeed");
         // Last instruction should be BR x16 (0xD61F0200)
         let last_word = u32::from_le_bytes(
             ret_tramp.code[ret_tramp.code.len() - 4..]

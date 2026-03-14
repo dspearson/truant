@@ -4,7 +4,7 @@ use crate::disasm::BasicBlock;
 use crate::elf::{AllocEntryKind, ElfContext};
 use crate::hook_trampoline::{self, TargetAbi};
 use crate::hooks::{self, HookSource, ResolvedHook};
-use crate::patcher::PatchResult;
+use crate::patcher::{InstrumentationOptions, PatchResult};
 use crate::traits::{BinaryContext, Patcher, TrampolineGenerator};
 use crate::trampoline::{self, DATA_SIZE};
 
@@ -36,31 +36,14 @@ impl Patcher for ElfPatcher {
         ctx: &dyn BinaryContext,
         blocks: &[BasicBlock],
         data: Vec<u8>,
-        enable_forkserver: bool,
-        enable_heap_san: bool,
-        persistent_addr: Option<u64>,
-        persistent_count: u32,
-        defer: bool,
+        opts: &InstrumentationOptions,
         hooks: &[ResolvedHook],
-        no_coverage: bool,
     ) -> Result<PatchResult> {
         let elf_ctx = ctx
             .as_any()
             .downcast_ref::<crate::elf_impl::context::ElfBinaryContext>()
             .ok_or_else(|| anyhow::anyhow!("ElfPatcher requires ElfBinaryContext"))?;
-        patch(
-            elf_ctx.inner(),
-            blocks,
-            data,
-            enable_forkserver,
-            enable_heap_san,
-            persistent_addr,
-            persistent_count,
-            defer,
-            &*self.tramp_gen,
-            hooks,
-            no_coverage,
-        )
+        patch(elf_ctx.inner(), blocks, data, opts, &*self.tramp_gen, hooks)
     }
 }
 
@@ -75,20 +58,20 @@ fn align_up(val: u64, align: u64) -> u64 {
 /// 3. Patch basic blocks with JMP rel32
 /// 4. Convert PT_NOTE → PT_LOAD
 /// 5. Redirect entry point
-#[allow(clippy::too_many_arguments)]
 pub fn patch(
     ctx: &ElfContext,
     blocks: &[BasicBlock],
     mut data: Vec<u8>,
-    enable_forkserver: bool,
-    enable_heap_san: bool,
-    persistent_addr: Option<u64>,
-    persistent_count: u32,
-    defer: bool,
+    opts: &InstrumentationOptions,
     tramp_gen: &dyn TrampolineGenerator,
     resolved_hooks: &[ResolvedHook],
-    no_coverage: bool,
 ) -> Result<PatchResult> {
+    let enable_forkserver = opts.enable_forkserver;
+    let enable_heap_san = opts.enable_heap_san;
+    let persistent_addr = opts.persistent_addr;
+    let persistent_count = opts.persistent_count;
+    let defer = opts.defer;
+    let no_coverage = opts.no_coverage;
     if blocks.is_empty() && !no_coverage {
         bail!("no basic blocks to instrument");
     }
@@ -217,14 +200,16 @@ pub fn patch(
             #[cfg(feature = "aarch64")]
             {
                 crate::arch::aarch64::generate_persistent_wrapper_aarch64(
-                    current_va,
-                    pd_va,
-                    data_va,
-                    p_addr,
-                    &displaced_bytes,
-                    displaced_len,
-                    persistent_count,
-                    defer,
+                    &trampoline::PersistentWrapperParams {
+                        wrapper_va: current_va,
+                        persistent_data_va: pd_va,
+                        data_va,
+                        persistent_addr: p_addr,
+                        displaced_bytes: &displaced_bytes,
+                        displaced_len,
+                        persistent_count,
+                        include_forkserver: defer,
+                    },
                 )
                 .context("failed to generate AArch64 persistent wrapper")?
             }
@@ -233,16 +218,16 @@ pub fn patch(
                 bail!("AArch64 persistent mode requires --features aarch64")
             }
         } else {
-            trampoline::generate_persistent_wrapper(
-                current_va,
-                pd_va,
+            trampoline::generate_persistent_wrapper(&trampoline::PersistentWrapperParams {
+                wrapper_va: current_va,
+                persistent_data_va: pd_va,
                 data_va,
-                p_addr,
-                &displaced_bytes,
+                persistent_addr: p_addr,
+                displaced_bytes: &displaced_bytes,
                 displaced_len,
                 persistent_count,
-                defer,
-            )
+                include_forkserver: defer,
+            })
             .context("failed to generate persistent wrapper")?
         };
 
@@ -424,14 +409,16 @@ pub fn patch(
                             * 8;
 
                     match hook_trampoline::generate_return_hook_trampolines(
-                        entry_va,
-                        ret_tramp_va,
+                        &hook_trampoline::ReturnHookContext {
+                            entry_va,
+                            ret_tramp_va,
+                            hook_data_va,
+                            shellcode_va: sc_va,
+                            toggle_va,
+                            return_slot_va: slot_va,
+                        },
                         hook,
-                        hook_data_va,
-                        sc_va,
                         hook_abi,
-                        toggle_va,
-                        slot_va,
                     ) {
                         Ok((entry_tramp, ret_tramp)) => {
                             // Verify entry trampoline fits within estimate.

@@ -968,6 +968,18 @@ pub fn generate_so_init_code(
     })
 }
 
+/// Parameters for persistent wrapper generation.
+pub struct PersistentWrapperParams<'a> {
+    pub wrapper_va: u64,
+    pub persistent_data_va: u64,
+    pub data_va: u64,
+    pub persistent_addr: u64,
+    pub displaced_bytes: &'a [u8],
+    pub displaced_len: usize,
+    pub persistent_count: u32,
+    pub include_forkserver: bool,
+}
+
 /// Generated persistent wrapper code.
 #[derive(Debug)]
 pub struct PersistentWrapper {
@@ -996,17 +1008,15 @@ pub struct PersistentWrapper {
 /// `include_forkserver`: when true, prepend forkserver protocol before the
 ///   persistent loop (deferred mode). The forkserver runs once at the first
 ///   call to the persistent function, after all init code has completed.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_persistent_wrapper(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
-    include_forkserver: bool,
-) -> Result<PersistentWrapper> {
+pub fn generate_persistent_wrapper(params: &PersistentWrapperParams) -> Result<PersistentWrapper> {
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
+    let include_forkserver = params.include_forkserver;
     let mut code = Vec::with_capacity(if include_forkserver { 1024 } else { 512 });
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -2479,16 +2489,16 @@ mod tests {
         let displaced_len = 5;
         let persistent_count = 1000;
 
-        let wrapper = generate_persistent_wrapper(
+        let wrapper = generate_persistent_wrapper(&PersistentWrapperParams {
             wrapper_va,
             persistent_data_va,
             data_va,
             persistent_addr,
-            &displaced_bytes,
+            displaced_bytes: &displaced_bytes,
             displaced_len,
             persistent_count,
-            false,
-        )
+            include_forkserver: false,
+        })
         .expect("persistent wrapper generation failed");
 
         assert!(!wrapper.code.is_empty());

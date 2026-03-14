@@ -14,7 +14,7 @@ use std::path::Path;
 use truant::disasm::BasicBlock;
 use truant::hook_preload;
 use truant::hook_trampoline::{
-    TargetAbi, generate_chained_hook_trampoline, generate_hook_trampoline,
+    ReturnHookContext, TargetAbi, generate_chained_hook_trampoline, generate_hook_trampoline,
     generate_return_hook_trampolines,
 };
 use truant::hooks::{CondOp, HookCondition, HookMode, HookSource, ResolvedHook};
@@ -23,7 +23,7 @@ use truant::macho_trampoline;
 use truant::preload;
 #[cfg(feature = "coverage")]
 use truant::sidecar_preload;
-use truant::trampoline;
+use truant::trampoline::{self, PersistentWrapperParams};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -331,17 +331,16 @@ fn test_conditional_hook_aarch64() {
 #[test]
 fn test_return_hook_x86_64() {
     let hook = make_return_hook(&X86_NOP5);
-    let (entry, ret_tramp) = generate_return_hook_trampolines(
-        0x50_0000, // entry_va
-        0x50_1000, // ret_tramp_va
-        &hook,
-        0x60_0000,       // hook_data_va
-        Some(0x70_0000), // shellcode_va
-        TargetAbi::SysV64,
-        None,      // toggle_va
-        0x60_0100, // return_slot_va
-    )
-    .expect("x86_64 return hook generation failed");
+    let rctx = ReturnHookContext {
+        entry_va: 0x50_0000,
+        ret_tramp_va: 0x50_1000,
+        hook_data_va: 0x60_0000,
+        shellcode_va: Some(0x70_0000),
+        toggle_va: None,
+        return_slot_va: 0x60_0100,
+    };
+    let (entry, ret_tramp) = generate_return_hook_trampolines(&rctx, &hook, TargetAbi::SysV64)
+        .expect("x86_64 return hook generation failed");
 
     assert!(
         !entry.code.is_empty(),
@@ -361,17 +360,16 @@ fn test_return_hook_x86_64() {
 #[test]
 fn test_return_hook_aarch64() {
     let hook = make_return_hook(&AARCH64_NOP);
-    let (entry, ret_tramp) = generate_return_hook_trampolines(
-        0x50_0000, // entry_va
-        0x50_1000, // ret_tramp_va
-        &hook,
-        0x60_0000,       // hook_data_va
-        Some(0x70_0000), // shellcode_va
-        TargetAbi::Aarch64,
-        None,      // toggle_va
-        0x60_0100, // return_slot_va
-    )
-    .expect("AArch64 return hook generation failed");
+    let rctx = ReturnHookContext {
+        entry_va: 0x50_0000,
+        ret_tramp_va: 0x50_1000,
+        hook_data_va: 0x60_0000,
+        shellcode_va: Some(0x70_0000),
+        toggle_va: None,
+        return_slot_va: 0x60_0100,
+    };
+    let (entry, ret_tramp) = generate_return_hook_trampolines(&rctx, &hook, TargetAbi::Aarch64)
+        .expect("AArch64 return hook generation failed");
 
     assert!(
         !entry.code.is_empty(),
@@ -855,16 +853,16 @@ fn test_init_code_aarch64_macho() {
 
 #[test]
 fn test_persistent_wrapper_x86_64_elf() {
-    let wrapper = trampoline::generate_persistent_wrapper(
-        0x80_0000,      // wrapper_va
-        0x90_0000,      // persistent_data_va
-        0xA0_0000,      // data_va
-        0x40_1000,      // persistent_addr
-        &X86_NOP5,      // displaced_bytes
-        X86_NOP5.len(), // displaced_len
-        1000,           // persistent_count
-        false,          // include_forkserver
-    )
+    let wrapper = trampoline::generate_persistent_wrapper(&PersistentWrapperParams {
+        wrapper_va: 0x80_0000,
+        persistent_data_va: 0x90_0000,
+        data_va: 0xA0_0000,
+        persistent_addr: 0x40_1000,
+        displaced_bytes: &X86_NOP5,
+        displaced_len: X86_NOP5.len(),
+        persistent_count: 1000,
+        include_forkserver: false,
+    })
     .expect("x86_64 ELF persistent wrapper generation failed");
 
     assert!(
@@ -885,16 +883,16 @@ fn test_persistent_wrapper_aarch64_elf() {
 
     // AArch64 ADR instruction has +/-1 MiB range, so wrapper_va and data areas
     // must be close together. Use nearby VAs to stay within range.
-    let wrapper = generate_persistent_wrapper_aarch64(
-        0x10_0000,         // wrapper_va
-        0x10_2000,         // persistent_data_va (8 KiB away)
-        0x10_4000,         // data_va (16 KiB away)
-        0x10_8000,         // persistent_addr (32 KiB away)
-        &AARCH64_NOP,      // displaced_bytes
-        AARCH64_NOP.len(), // displaced_len
-        1000,              // persistent_count
-        false,             // include_forkserver
-    )
+    let wrapper = generate_persistent_wrapper_aarch64(&PersistentWrapperParams {
+        wrapper_va: 0x10_0000,
+        persistent_data_va: 0x10_2000,
+        data_va: 0x10_4000,
+        persistent_addr: 0x10_8000,
+        displaced_bytes: &AARCH64_NOP,
+        displaced_len: AARCH64_NOP.len(),
+        persistent_count: 1000,
+        include_forkserver: false,
+    })
     .expect("AArch64 ELF persistent wrapper generation failed");
 
     assert!(
@@ -911,17 +909,18 @@ fn test_persistent_wrapper_aarch64_elf() {
 
 #[test]
 fn test_persistent_wrapper_x86_64_macho() {
-    let wrapper = macho_trampoline::generate_macho_persistent_wrapper_x86_64(
-        0x80_0000,      // wrapper_va
-        0x90_0000,      // persistent_data_va
-        0xA0_0000,      // data_va
-        0x40_1000,      // persistent_addr
-        &X86_NOP5,      // displaced_bytes
-        X86_NOP5.len(), // displaced_len
-        1000,           // persistent_count
-        false,          // include_forkserver
-    )
-    .expect("x86_64 Mach-O persistent wrapper generation failed");
+    let wrapper =
+        macho_trampoline::generate_macho_persistent_wrapper_x86_64(&PersistentWrapperParams {
+            wrapper_va: 0x80_0000,
+            persistent_data_va: 0x90_0000,
+            data_va: 0xA0_0000,
+            persistent_addr: 0x40_1000,
+            displaced_bytes: &X86_NOP5,
+            displaced_len: X86_NOP5.len(),
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
+        .expect("x86_64 Mach-O persistent wrapper generation failed");
 
     assert!(!wrapper.code.is_empty());
     assert!(
@@ -934,17 +933,18 @@ fn test_persistent_wrapper_x86_64_macho() {
 #[test]
 fn test_persistent_wrapper_aarch64_macho() {
     // AArch64 ADR has +/-1 MiB range -- use nearby VAs.
-    let wrapper = macho_trampoline::generate_macho_persistent_wrapper_aarch64(
-        0x10_0000,         // wrapper_va
-        0x10_2000,         // persistent_data_va
-        0x10_4000,         // data_va
-        0x10_8000,         // persistent_addr
-        &AARCH64_NOP,      // displaced_bytes
-        AARCH64_NOP.len(), // displaced_len
-        1000,              // persistent_count
-        false,             // include_forkserver
-    )
-    .expect("AArch64 Mach-O persistent wrapper generation failed");
+    let wrapper =
+        macho_trampoline::generate_macho_persistent_wrapper_aarch64(&PersistentWrapperParams {
+            wrapper_va: 0x10_0000,
+            persistent_data_va: 0x10_2000,
+            data_va: 0x10_4000,
+            persistent_addr: 0x10_8000,
+            displaced_bytes: &AARCH64_NOP,
+            displaced_len: AARCH64_NOP.len(),
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
+        .expect("AArch64 Mach-O persistent wrapper generation failed");
 
     assert!(!wrapper.code.is_empty());
     assert_eq!(
@@ -1067,29 +1067,29 @@ fn test_init_code_elf_both_arches_generate() {
 fn test_persistent_wrapper_both_arches_elf() {
     use truant::arch::aarch64::trampoline_gen::generate_persistent_wrapper_aarch64;
 
-    let x86_wrapper = trampoline::generate_persistent_wrapper(
-        0x80_0000,
-        0x90_0000,
-        0xA0_0000,
-        0x40_1000,
-        &X86_NOP5,
-        X86_NOP5.len(),
-        1000,
-        false,
-    )
+    let x86_wrapper = trampoline::generate_persistent_wrapper(&PersistentWrapperParams {
+        wrapper_va: 0x80_0000,
+        persistent_data_va: 0x90_0000,
+        data_va: 0xA0_0000,
+        persistent_addr: 0x40_1000,
+        displaced_bytes: &X86_NOP5,
+        displaced_len: X86_NOP5.len(),
+        persistent_count: 1000,
+        include_forkserver: false,
+    })
     .expect("x86_64 persistent wrapper");
 
     // AArch64 ADR has +/-1 MiB range -- use nearby VAs.
-    let a64_wrapper = generate_persistent_wrapper_aarch64(
-        0x10_0000,
-        0x10_2000,
-        0x10_4000,
-        0x10_8000,
-        &AARCH64_NOP,
-        AARCH64_NOP.len(),
-        1000,
-        false,
-    )
+    let a64_wrapper = generate_persistent_wrapper_aarch64(&PersistentWrapperParams {
+        wrapper_va: 0x10_0000,
+        persistent_data_va: 0x10_2000,
+        data_va: 0x10_4000,
+        persistent_addr: 0x10_8000,
+        displaced_bytes: &AARCH64_NOP,
+        displaced_len: AARCH64_NOP.len(),
+        persistent_count: 1000,
+        include_forkserver: false,
+    })
     .expect("AArch64 persistent wrapper");
 
     assert!(x86_wrapper.code.len() > 50);
@@ -1099,30 +1099,32 @@ fn test_persistent_wrapper_both_arches_elf() {
 
 #[test]
 fn test_persistent_wrapper_both_arches_macho() {
-    let x86_wrapper = macho_trampoline::generate_macho_persistent_wrapper_x86_64(
-        0x80_0000,
-        0x90_0000,
-        0xA0_0000,
-        0x40_1000,
-        &X86_NOP5,
-        X86_NOP5.len(),
-        1000,
-        false,
-    )
-    .expect("x86_64 Mach-O persistent wrapper");
+    let x86_wrapper =
+        macho_trampoline::generate_macho_persistent_wrapper_x86_64(&PersistentWrapperParams {
+            wrapper_va: 0x80_0000,
+            persistent_data_va: 0x90_0000,
+            data_va: 0xA0_0000,
+            persistent_addr: 0x40_1000,
+            displaced_bytes: &X86_NOP5,
+            displaced_len: X86_NOP5.len(),
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
+        .expect("x86_64 Mach-O persistent wrapper");
 
     // AArch64 ADR has +/-1 MiB range -- use nearby VAs.
-    let a64_wrapper = macho_trampoline::generate_macho_persistent_wrapper_aarch64(
-        0x10_0000,
-        0x10_2000,
-        0x10_4000,
-        0x10_8000,
-        &AARCH64_NOP,
-        AARCH64_NOP.len(),
-        1000,
-        false,
-    )
-    .expect("AArch64 Mach-O persistent wrapper");
+    let a64_wrapper =
+        macho_trampoline::generate_macho_persistent_wrapper_aarch64(&PersistentWrapperParams {
+            wrapper_va: 0x10_0000,
+            persistent_data_va: 0x10_2000,
+            data_va: 0x10_4000,
+            persistent_addr: 0x10_8000,
+            displaced_bytes: &AARCH64_NOP,
+            displaced_len: AARCH64_NOP.len(),
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
+        .expect("AArch64 Mach-O persistent wrapper");
 
     assert!(x86_wrapper.code.len() > 50);
     assert!(a64_wrapper.code.len() > 50);

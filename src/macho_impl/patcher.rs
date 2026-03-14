@@ -5,7 +5,7 @@ use crate::hook_trampoline::TargetAbi;
 use crate::hooks::ResolvedHook;
 use crate::macho::MachOContext;
 use crate::macho_trampoline;
-use crate::patcher::PatchResult;
+use crate::patcher::{InstrumentationOptions, PatchResult};
 use crate::traits::{BinaryContext, Patcher, TrampolineGenerator};
 use crate::trampoline::{DATA_SIZE, PERSISTENT_DATA_SIZE};
 
@@ -82,13 +82,8 @@ impl Patcher for MachOPatcher {
         ctx: &dyn BinaryContext,
         blocks: &[BasicBlock],
         data: Vec<u8>,
-        enable_forkserver: bool,
-        enable_heap_san: bool,
-        persistent_addr: Option<u64>,
-        persistent_count: u32,
-        defer: bool,
+        opts: &InstrumentationOptions,
         hooks: &[ResolvedHook],
-        no_coverage: bool,
     ) -> Result<PatchResult> {
         let macho_ctx = ctx
             .as_any()
@@ -99,14 +94,9 @@ impl Patcher for MachOPatcher {
             macho_ctx.inner(),
             blocks,
             data,
-            enable_forkserver,
-            enable_heap_san,
+            opts,
             &*self.tramp_gen,
             hooks,
-            persistent_addr,
-            persistent_count,
-            defer,
-            no_coverage,
         )
     }
 }
@@ -141,6 +131,9 @@ struct FileLayout {
     new_linkedit_fileoff: u64,
     new_fixups_fileoff: u32,
     new_fixups_size: u32,
+    new_linkedit_vmaddr: u64,
+    new_linkedit_vmsize: u64,
+    new_linkedit_filesize: u64,
 }
 
 /// Strip LC_CODE_SIGNATURE if present, reclaiming load command space.
@@ -347,7 +340,6 @@ fn generate_init_and_trampolines<'a>(
 /// shellcode blobs, and hook trampolines.
 /// Returns (hook_data_va, toggle_data_va, current_va, hook_trampolines,
 ///          shellcode_blobs, return_trampolines).
-#[allow(clippy::too_many_arguments)]
 fn setup_hook_infrastructure(
     hooks: &[ResolvedHook],
     layout: &MachoLayout,
@@ -435,14 +427,16 @@ fn setup_hook_infrastructure(
                         * 8;
 
                 match crate::hook_trampoline::generate_return_hook_trampolines(
-                    entry_va,
-                    ret_tramp_va,
+                    &crate::hook_trampoline::ReturnHookContext {
+                        entry_va,
+                        ret_tramp_va,
+                        hook_data_va,
+                        shellcode_va: sc_va,
+                        toggle_va,
+                        return_slot_va: slot_va,
+                    },
                     hook,
-                    hook_data_va,
-                    sc_va,
                     layout.hook_abi,
-                    toggle_va,
-                    slot_va,
                 ) {
                     Ok((entry_tramp, ret_tramp)) => {
                         assert!(
@@ -532,18 +526,18 @@ fn setup_hook_infrastructure(
 
 /// Generate persistent mode wrapper and data area.
 /// Returns (persistent_data_va, persistent_wrapper, current_va).
-#[allow(clippy::too_many_arguments)]
 fn generate_persistent_wrapper(
     ctx: &MachOContext,
     data: &[u8],
     layout: &MachoLayout,
     mut current_va: u64,
-    persistent_addr: Option<u64>,
-    persistent_count: u32,
-    enable_forkserver: bool,
-    defer: bool,
+    opts: &InstrumentationOptions,
     tramp_gen: &dyn TrampolineGenerator,
 ) -> Result<PersistentResult> {
+    let persistent_addr = opts.persistent_addr;
+    let persistent_count = opts.persistent_count;
+    let enable_forkserver = opts.enable_forkserver;
+    let defer = opts.defer;
     let persistent_data_va;
     let persistent_wrapper = if let Some(p_addr) = persistent_addr {
         if ctx.is_dylib {
@@ -576,30 +570,22 @@ fn generate_persistent_wrapper(
 
         let include_forkserver = enable_forkserver && defer;
         let wrapper_va = current_va;
+        let pw_params = crate::trampoline::PersistentWrapperParams {
+            wrapper_va,
+            persistent_data_va,
+            data_va: layout.data_va,
+            persistent_addr: p_addr,
+            displaced_bytes: &displaced_bytes,
+            displaced_len,
+            persistent_count,
+            include_forkserver,
+        };
         let wrapper = if layout.is_arm64 {
-            macho_trampoline::generate_macho_persistent_wrapper_aarch64(
-                wrapper_va,
-                persistent_data_va,
-                layout.data_va,
-                p_addr,
-                &displaced_bytes,
-                displaced_len,
-                persistent_count,
-                include_forkserver,
-            )
-            .context("failed to generate macOS ARM64 persistent wrapper")?
+            macho_trampoline::generate_macho_persistent_wrapper_aarch64(&pw_params)
+                .context("failed to generate macOS ARM64 persistent wrapper")?
         } else {
-            macho_trampoline::generate_macho_persistent_wrapper_x86_64(
-                wrapper_va,
-                persistent_data_va,
-                layout.data_va,
-                p_addr,
-                &displaced_bytes,
-                displaced_len,
-                persistent_count,
-                include_forkserver,
-            )
-            .context("failed to generate macOS x86_64 persistent wrapper")?
+            macho_trampoline::generate_macho_persistent_wrapper_x86_64(&pw_params)
+                .context("failed to generate macOS x86_64 persistent wrapper")?
         };
 
         current_va += wrapper.code.len() as u64;
@@ -1070,6 +1056,10 @@ fn restructure_file_layout(
         new_linkedit_fileoff,
         new_fixups_fileoff,
         new_fixups_size,
+        // These are set by the caller after computing segment sizes.
+        new_linkedit_vmaddr: 0,
+        new_linkedit_vmsize: 0,
+        new_linkedit_filesize: 0,
     }
 }
 
@@ -1155,33 +1145,12 @@ fn insert_load_commands_and_update_entry(
     // Update __LINKEDIT and all LCs that reference LINKEDIT file offsets.
     if ctx.linkedit_segment_offset.is_some() && file_layout.new_linkedit_fileoff > 0 {
         let linkedit_shift = file_layout.new_linkedit_fileoff - ctx.linkedit_fileoff;
-        let total_tr_vmsize = sizes.segment_vmsize
-            + if layout.arm64_split {
-                sizes.code_segment_vmsize
-            } else {
-                0
-            };
-        let new_linkedit_vmaddr = layout.segment_va + total_tr_vmsize;
-        let new_linkedit_filesize = data.len() as u64 - file_layout.new_linkedit_fileoff;
-        let new_linkedit_vmsize = align_up(new_linkedit_filesize, layout.page_sz);
-
-        update_linkedit_lc_offsets(
-            data,
-            ctx,
-            ncmds,
-            linkedit_shift,
-            new_linkedit_vmaddr,
-            new_linkedit_vmsize,
-            file_layout.new_linkedit_fileoff,
-            new_linkedit_filesize,
-            file_layout.new_fixups_fileoff,
-            file_layout.new_fixups_size,
-        );
+        update_linkedit_lc_offsets(data, ctx, ncmds, linkedit_shift, file_layout);
 
         tracing::info!(
             "relocated __LINKEDIT: VA 0x{:x} → 0x{:x}, fileoff 0x{:x} → 0x{:x} (shift +0x{:x})",
             ctx.linkedit_vmaddr,
-            new_linkedit_vmaddr,
+            file_layout.new_linkedit_vmaddr,
             ctx.linkedit_fileoff,
             file_layout.new_linkedit_fileoff,
             linkedit_shift,
@@ -1244,20 +1213,18 @@ fn insert_load_commands_and_update_entry(
 /// 8. Patch code sites
 /// 9. Restructure file layout
 /// 10. Insert load commands + update entry point
-#[allow(clippy::too_many_arguments)]
 fn patch_macho(
     ctx: &MachOContext,
     blocks: &[BasicBlock],
     mut data: Vec<u8>,
-    enable_forkserver: bool,
-    enable_heap_san: bool,
+    opts: &InstrumentationOptions,
     tramp_gen: &dyn TrampolineGenerator,
     hooks: &[ResolvedHook],
-    persistent_addr: Option<u64>,
-    persistent_count: u32,
-    defer: bool,
-    no_coverage: bool,
 ) -> Result<PatchResult> {
+    let enable_forkserver = opts.enable_forkserver;
+    let enable_heap_san = opts.enable_heap_san;
+    let persistent_addr = opts.persistent_addr;
+    let no_coverage = opts.no_coverage;
     if blocks.is_empty() && !no_coverage {
         bail!("no basic blocks to instrument");
     }
@@ -1303,17 +1270,8 @@ fn patch_macho(
     current_va = new_current_va;
 
     // Step 6: Generate persistent wrapper.
-    let (persistent_data_va, persistent_wrapper, new_current_va) = generate_persistent_wrapper(
-        ctx,
-        &data,
-        &layout,
-        current_va,
-        persistent_addr,
-        persistent_count,
-        enable_forkserver,
-        defer,
-        tramp_gen,
-    )?;
+    let (persistent_data_va, persistent_wrapper, new_current_va) =
+        generate_persistent_wrapper(ctx, &data, &layout, current_va, opts, tramp_gen)?;
     current_va = new_current_va;
 
     // Step 7: Generate heap san wrappers.
@@ -1360,7 +1318,7 @@ fn patch_macho(
     let new_fixups_blob = build_fixups_blob(&data, ctx, &layout, no_coverage)?;
 
     // Step 12: Restructure file layout — insert segments before __LINKEDIT.
-    let file_layout = restructure_file_layout(
+    let mut file_layout = restructure_file_layout(
         &mut data,
         ctx,
         &layout,
@@ -1368,6 +1326,20 @@ fn patch_macho(
         &code_segment_data,
         &new_fixups_blob,
     );
+
+    // Compute LINKEDIT layout fields now that data is restructured.
+    if ctx.linkedit_segment_offset.is_some() && file_layout.new_linkedit_fileoff > 0 {
+        let total_tr_vmsize = sizes.segment_vmsize
+            + if layout.arm64_split {
+                sizes.code_segment_vmsize
+            } else {
+                0
+            };
+        file_layout.new_linkedit_vmaddr = layout.segment_va + total_tr_vmsize;
+        file_layout.new_linkedit_filesize = data.len() as u64 - file_layout.new_linkedit_fileoff;
+        file_layout.new_linkedit_vmsize =
+            align_up(file_layout.new_linkedit_filesize, layout.page_sz);
+    }
 
     // Step 13: Insert load commands, update LINKEDIT offsets, redirect entry point.
     insert_load_commands_and_update_entry(
@@ -1589,19 +1561,19 @@ fn shift_lc_u32_field(data: &mut [u8], offset: usize, shift: u64) {
 /// When __TR_COV is inserted before __LINKEDIT in the file layout, all LINKEDIT
 /// data moves to a higher file offset. This function adjusts every LC that
 /// references data within LINKEDIT.
-#[allow(clippy::too_many_arguments)]
 fn update_linkedit_lc_offsets(
     data: &mut [u8],
     ctx: &MachOContext,
     ncmds: u32,
     linkedit_shift: u64,
-    new_linkedit_vmaddr: u64,
-    new_linkedit_vmsize: u64,
-    new_linkedit_fileoff: u64,
-    new_linkedit_filesize: u64,
-    new_fixups_fileoff: u32,
-    new_fixups_size: u32,
+    fl: &FileLayout,
 ) {
+    let new_linkedit_vmaddr = fl.new_linkedit_vmaddr;
+    let new_linkedit_vmsize = fl.new_linkedit_vmsize;
+    let new_linkedit_fileoff = fl.new_linkedit_fileoff;
+    let new_linkedit_filesize = fl.new_linkedit_filesize;
+    let new_fixups_fileoff = fl.new_fixups_fileoff;
+    let new_fixups_size = fl.new_fixups_size;
     let mut lc_off = ctx.header_size;
 
     for _ in 0..ncmds {
@@ -2049,6 +2021,44 @@ mod tests {
     use crate::traits::TrampolineGenerator;
     use crate::trampoline::{InitCode, Trampoline};
 
+    fn default_opts() -> InstrumentationOptions {
+        InstrumentationOptions {
+            enable_forkserver: false,
+            enable_heap_san: false,
+            persistent_addr: None,
+            persistent_count: 0,
+            defer: false,
+            no_coverage: false,
+        }
+    }
+
+    fn no_coverage_opts() -> InstrumentationOptions {
+        InstrumentationOptions {
+            no_coverage: true,
+            ..default_opts()
+        }
+    }
+
+    fn make_file_layout(
+        new_linkedit_vmaddr: u64,
+        new_linkedit_vmsize: u64,
+        new_linkedit_fileoff: u64,
+        new_linkedit_filesize: u64,
+        new_fixups_fileoff: u32,
+        new_fixups_size: u32,
+    ) -> FileLayout {
+        FileLayout {
+            file_offset_of_segment: 0,
+            file_offset_of_code_seg: 0,
+            new_linkedit_fileoff,
+            new_fixups_fileoff,
+            new_fixups_size,
+            new_linkedit_vmaddr,
+            new_linkedit_vmsize,
+            new_linkedit_filesize,
+        }
+    }
+
     #[test]
     fn test_align_up() {
         assert_eq!(align_up(0x1000, 0x1000), 0x1000);
@@ -2372,12 +2382,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize + shift, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize + shift, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         assert_eq!(
@@ -2405,12 +2417,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize + shift, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize + shift, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         assert_eq!(
@@ -2441,12 +2455,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         // Zero fields must remain zero (skip rule).
@@ -2500,12 +2516,7 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            new_vmaddr,
-            new_vmsize,
-            new_fileoff,
-            new_filesize,
-            0,
-            0,
+            &make_file_layout(new_vmaddr, new_vmsize, new_fileoff, new_filesize, 0, 0),
         );
 
         assert_eq!(
@@ -2699,14 +2710,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2756,14 +2762,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2807,14 +2808,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2853,14 +2849,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2897,14 +2888,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2949,14 +2935,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -2995,14 +2976,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -3039,14 +3015,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -3078,14 +3049,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(), // ARM64 MockTrampolineGen emits x86
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true, // no_coverage — ARM64 MockTrampolineGen emits x86
         )
         .expect("patch_macho should succeed");
 
@@ -3122,14 +3088,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3159,14 +3120,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3191,14 +3147,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3242,14 +3193,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3281,14 +3227,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3326,14 +3267,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true, // no_coverage
         )
         .expect("no-coverage patch should succeed");
 
@@ -3667,12 +3603,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DATA_IN_CODE)
@@ -3699,12 +3637,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         let new = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_EXPORTS_TRIE)
@@ -3731,12 +3671,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         let new = read_linkedit_data_lc(&data, ctx.header_size, LC_SEGMENT_SPLIT_INFO)
@@ -3763,12 +3705,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            new_blob_off,
-            new_blob_size,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                new_blob_off,
+                new_blob_size,
+            ),
         );
 
         let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
@@ -3798,12 +3742,14 @@ mod tests {
             &ctx,
             ctx.ncmds,
             shift,
-            ctx.linkedit_vmaddr + shift,
-            align_up(ctx.linkedit_filesize, 0x1000),
-            ctx.linkedit_fileoff + shift,
-            ctx.linkedit_filesize,
-            0,
-            0,
+            &make_file_layout(
+                ctx.linkedit_vmaddr + shift,
+                align_up(ctx.linkedit_filesize, 0x1000),
+                ctx.linkedit_fileoff + shift,
+                ctx.linkedit_filesize,
+                0,
+                0,
+            ),
         );
 
         let fixups = read_linkedit_data_lc(&data, ctx.header_size, LC_DYLD_CHAINED_FIXUPS)
@@ -3846,14 +3792,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -3917,14 +3858,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -3958,14 +3894,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true, // no_coverage
         )
         .expect("patch_macho with chained fixups should succeed");
 
@@ -4017,14 +3948,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -4089,14 +4015,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -4148,14 +4069,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 
@@ -4209,14 +4125,9 @@ mod tests {
             &ctx,
             &[block],
             data,
-            false,
-            false,
+            &default_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            false,
         )
         .expect("patch_macho should succeed");
 
@@ -4246,14 +4157,9 @@ mod tests {
             &ctx,
             &[],
             data,
-            false,
-            false,
+            &no_coverage_opts(),
             &MockTrampolineGen,
             &[],
-            None,
-            0,
-            false,
-            true,
         )
         .expect("patch_macho should succeed");
 

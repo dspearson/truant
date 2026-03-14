@@ -10,7 +10,7 @@
 //! Dylibs: __mod_init_func constructors get no arguments. Use sysctl
 //! KERN_PROCARGS2 to read process environment.
 
-use crate::trampoline::{InitCode, PersistentWrapper};
+use crate::trampoline::{InitCode, PersistentWrapper, PersistentWrapperParams};
 use anyhow::{Context, Result};
 
 // macOS BSD syscall numbers (from XNU bsd/kern/syscalls.master)
@@ -2146,17 +2146,17 @@ fn relocate_instructions(bytes: &[u8], orig_ip: u64, new_ip: u64) -> Result<Vec<
 ///   +136: save_ret_addr (8 bytes)
 ///   +144: save_rsp (8 bytes)
 ///   +152: padding (8 bytes)
-#[allow(clippy::too_many_arguments)]
 pub fn generate_macho_persistent_wrapper_x86_64(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
-    include_forkserver: bool,
+    params: &PersistentWrapperParams,
 ) -> Result<PersistentWrapper> {
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
+    let include_forkserver = params.include_forkserver;
     let mut code = Vec::with_capacity(if include_forkserver { 1024 } else { 512 });
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -2674,19 +2674,19 @@ pub fn generate_macho_persistent_wrapper_x86_64(
 ///   +16:  save_lr (8 bytes)
 ///   +24:  save_x0 (8 bytes)  -- we save x0 for restoring after displaced instrs
 ///   +32:  reserved (128 bytes)
-#[allow(clippy::too_many_arguments)]
 pub fn generate_macho_persistent_wrapper_aarch64(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
-    include_forkserver: bool,
+    params: &PersistentWrapperParams,
 ) -> Result<PersistentWrapper> {
     use arm64::*;
 
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
+    let include_forkserver = params.include_forkserver;
     let mut code = Vec::with_capacity(if include_forkserver { 2048 } else { 1024 });
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -3218,9 +3218,16 @@ mod tests {
     fn test_persistent_wrapper_x86_64_basic() {
         // 5 NOPs as displaced bytes (typical minimum for JMP rel32)
         let displaced = vec![0x90; 5];
-        let wrapper = generate_macho_persistent_wrapper_x86_64(
-            0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, false,
-        )
+        let wrapper = generate_macho_persistent_wrapper_x86_64(&PersistentWrapperParams {
+            wrapper_va: 0x300000,
+            persistent_data_va: 0x200000,
+            data_va: 0x100000,
+            persistent_addr: 0x100800,
+            displaced_bytes: &displaced,
+            displaced_len: 5,
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
         .expect("persistent wrapper x86_64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert!(
@@ -3256,9 +3263,16 @@ mod tests {
     #[test]
     fn test_persistent_wrapper_x86_64_with_forkserver() {
         let displaced = vec![0x90; 5];
-        let wrapper = generate_macho_persistent_wrapper_x86_64(
-            0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, true,
-        )
+        let wrapper = generate_macho_persistent_wrapper_x86_64(&PersistentWrapperParams {
+            wrapper_va: 0x300000,
+            persistent_data_va: 0x200000,
+            data_va: 0x100000,
+            persistent_addr: 0x100800,
+            displaced_bytes: &displaced,
+            displaced_len: 5,
+            persistent_count: 1000,
+            include_forkserver: true,
+        })
         .expect("persistent wrapper x86_64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         // Forkserver adds significant code
@@ -3285,9 +3299,16 @@ mod tests {
     fn test_persistent_wrapper_x86_64_sigstop_value() {
         // Verify SIGSTOP=17 (macOS) not 19 (Linux)
         let displaced = vec![0x90; 5];
-        let wrapper = generate_macho_persistent_wrapper_x86_64(
-            0x300000, 0x200000, 0x100000, 0x100800, &displaced, 5, 1000, false,
-        )
+        let wrapper = generate_macho_persistent_wrapper_x86_64(&PersistentWrapperParams {
+            wrapper_va: 0x300000,
+            persistent_data_va: 0x200000,
+            data_va: 0x100000,
+            persistent_addr: 0x100800,
+            displaced_bytes: &displaced,
+            displaced_len: 5,
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
         .expect("persistent wrapper x86_64 for sigstop test should succeed");
         // SIGSTOP=17 should appear as mov esi, 17 (BE 11 00 00 00)
         assert!(
@@ -3301,9 +3322,16 @@ mod tests {
         // ARM64 NOP (d503201f) as displaced instruction
         // VAs must be within ADR range (±1MB) — in practice they're in the same segment.
         let displaced = [0x1F, 0x20, 0x03, 0xD5];
-        let wrapper = generate_macho_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
-        )
+        let wrapper = generate_macho_persistent_wrapper_aarch64(&PersistentWrapperParams {
+            wrapper_va: 0x201000,
+            persistent_data_va: 0x200000,
+            data_va: 0x200000,
+            persistent_addr: 0x100800,
+            displaced_bytes: &displaced,
+            displaced_len: 4,
+            persistent_count: 1000,
+            include_forkserver: false,
+        })
         .expect("persistent wrapper aarch64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(
@@ -3322,9 +3350,16 @@ mod tests {
     #[test]
     fn test_persistent_wrapper_aarch64_with_forkserver() {
         let displaced = [0x1F, 0x20, 0x03, 0xD5]; // NOP
-        let wrapper = generate_macho_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, true,
-        )
+        let wrapper = generate_macho_persistent_wrapper_aarch64(&PersistentWrapperParams {
+            wrapper_va: 0x201000,
+            persistent_data_va: 0x200000,
+            data_va: 0x200000,
+            persistent_addr: 0x100800,
+            displaced_bytes: &displaced,
+            displaced_len: 4,
+            persistent_count: 1000,
+            include_forkserver: true,
+        })
         .expect("persistent wrapper aarch64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(wrapper.code.len() % 4, 0);

@@ -599,19 +599,17 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
         BinaryFormat::Fat => unreachable!("fat binaries handled above"),
     };
 
+    let instrumentation_opts = crate::patcher::InstrumentationOptions {
+        enable_forkserver: config.forkserver,
+        enable_heap_san: inline_heap_san,
+        persistent_addr: config.persistent_addr,
+        persistent_count: config.persistent_count,
+        defer: config.defer,
+        no_coverage: config.no_coverage,
+    };
+
     let patch_result = patcher
-        .patch(
-            &*ctx,
-            &blocks,
-            data,
-            config.forkserver,
-            inline_heap_san,
-            config.persistent_addr,
-            config.persistent_count,
-            config.defer,
-            &resolved_hooks,
-            config.no_coverage,
-        )
+        .patch(&*ctx, &blocks, data, &instrumentation_opts, &resolved_hooks)
         .context("patching failed")?;
 
     // Write output

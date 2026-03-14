@@ -1897,17 +1897,17 @@ fn emit_forkserver_arm64(code: &mut Vec<u8>) {
 ///   +64:  save_x5 (u64)
 ///   +72:  save_x6 (u64)
 ///   +80:  save_x7 (u64)
-#[allow(clippy::too_many_arguments)]
 pub fn generate_persistent_wrapper_aarch64(
-    wrapper_va: u64,
-    persistent_data_va: u64,
-    data_va: u64,
-    persistent_addr: u64,
-    displaced_bytes: &[u8],
-    displaced_len: usize,
-    persistent_count: u32,
-    include_forkserver: bool,
+    params: &crate::trampoline::PersistentWrapperParams,
 ) -> Result<PersistentWrapper> {
+    let wrapper_va = params.wrapper_va;
+    let persistent_data_va = params.persistent_data_va;
+    let data_va = params.data_va;
+    let persistent_addr = params.persistent_addr;
+    let displaced_bytes = params.displaced_bytes;
+    let displaced_len = params.displaced_len;
+    let persistent_count = params.persistent_count;
+    let include_forkserver = params.include_forkserver;
     let mut code = Vec::with_capacity(if include_forkserver { 2048 } else { 1024 });
     let return_va = persistent_addr + displaced_len as u64;
 
@@ -3614,10 +3614,18 @@ mod tests {
     #[test]
     fn test_elf_persistent_wrapper_aarch64_basic() {
         let displaced = [0x1F, 0x20, 0x03, 0xD5]; // NOP
-        let wrapper = generate_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
-        )
-        .expect("ELF persistent wrapper aarch64 basic should succeed");
+        let wrapper =
+            generate_persistent_wrapper_aarch64(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va: 0x201000,
+                persistent_data_va: 0x200000,
+                data_va: 0x200000,
+                persistent_addr: 0x100800,
+                displaced_bytes: &displaced,
+                displaced_len: 4,
+                persistent_count: 1000,
+                include_forkserver: false,
+            })
+            .expect("ELF persistent wrapper aarch64 basic should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(
             wrapper.code.len() % 4,
@@ -3629,17 +3637,33 @@ mod tests {
     #[test]
     fn test_elf_persistent_wrapper_aarch64_with_forkserver() {
         let displaced = [0x1F, 0x20, 0x03, 0xD5]; // NOP
-        let wrapper = generate_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, true,
-        )
-        .expect("ELF persistent wrapper aarch64 with forkserver should succeed");
+        let wrapper =
+            generate_persistent_wrapper_aarch64(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va: 0x201000,
+                persistent_data_va: 0x200000,
+                data_va: 0x200000,
+                persistent_addr: 0x100800,
+                displaced_bytes: &displaced,
+                displaced_len: 4,
+                persistent_count: 1000,
+                include_forkserver: true,
+            })
+            .expect("ELF persistent wrapper aarch64 with forkserver should succeed");
         assert!(!wrapper.code.is_empty());
         assert_eq!(wrapper.code.len() % 4, 0);
         // Forkserver variant should be larger
-        let basic = generate_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
-        )
-        .expect("ELF persistent wrapper aarch64 basic for comparison should succeed");
+        let basic =
+            generate_persistent_wrapper_aarch64(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va: 0x201000,
+                persistent_data_va: 0x200000,
+                data_va: 0x200000,
+                persistent_addr: 0x100800,
+                displaced_bytes: &displaced,
+                displaced_len: 4,
+                persistent_count: 1000,
+                include_forkserver: false,
+            })
+            .expect("ELF persistent wrapper aarch64 basic for comparison should succeed");
         assert!(
             wrapper.code.len() > basic.code.len(),
             "forkserver wrapper ({}) should be larger than basic ({})",
@@ -3651,10 +3675,18 @@ mod tests {
     #[test]
     fn test_elf_persistent_wrapper_aarch64_linux_sigstop() {
         let displaced = [0x1F, 0x20, 0x03, 0xD5]; // NOP
-        let wrapper = generate_persistent_wrapper_aarch64(
-            0x201000, 0x200000, 0x200000, 0x100800, &displaced, 4, 1000, false,
-        )
-        .expect("ELF persistent wrapper aarch64 for sigstop test should succeed");
+        let wrapper =
+            generate_persistent_wrapper_aarch64(&crate::trampoline::PersistentWrapperParams {
+                wrapper_va: 0x201000,
+                persistent_data_va: 0x200000,
+                data_va: 0x200000,
+                persistent_addr: 0x100800,
+                displaced_bytes: &displaced,
+                displaced_len: 4,
+                persistent_count: 1000,
+                include_forkserver: false,
+            })
+            .expect("ELF persistent wrapper aarch64 for sigstop test should succeed");
         // Check SIGSTOP=19 (0x13) is in the code, not macOS SIGSTOP=17
         // MOVZ x1, #19 = 0xD2800261
         let sigstop_movz = 0xD280_0261u32.to_le_bytes();
