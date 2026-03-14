@@ -1,4 +1,7 @@
 #[cfg(feature = "aarch64")]
+pub mod relocation;
+
+#[cfg(feature = "aarch64")]
 pub mod disasm;
 
 #[cfg(feature = "aarch64")]

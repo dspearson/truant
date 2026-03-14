@@ -19,17 +19,7 @@ impl AArch64Disassembler {
     }
 }
 
-/// FNV-1a hash of a u64, masked to 16 bits.
-/// Must match the formula in crate::disasm::fnv_hash_u16.
-fn block_id_for_va(va: u64) -> u16 {
-    let bytes = va.to_le_bytes();
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in &bytes {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    (hash & 0xFFFF) as u16
-}
+use crate::disasm::fnv_hash_u16;
 
 impl Disassembler for AArch64Disassembler {
     fn find_basic_blocks(
@@ -183,7 +173,7 @@ impl Disassembler for AArch64Disassembler {
                 file_offset: file_offset as u64,
                 displaced_len: 4,
                 displaced_bytes,
-                block_id: block_id_for_va(block_va),
+                block_id: fnv_hash_u16(block_va),
             });
         }
 

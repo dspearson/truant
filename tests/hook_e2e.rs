@@ -3,37 +3,23 @@
 //! Every test compiles a real C binary, rewrites it with hooks via truant,
 //! executes the result, and verifies the hook genuinely modified behaviour.
 //!
+//! Arch-portable: shellcode is provided for both x86_64 and AArch64 via
+//! the `shellcode` module. Tests that are inherently single-arch (inline
+//! asm, PLT) are gated with `#[cfg(target_arch)]`.
+//!
 //! Run with: cargo test -p truant --test hook_e2e -- --test-threads=1
 
 mod common;
+mod shellcode;
+
 use common::*;
-
-// ============================================================================
-// RegContext layout (x86_64, 18 * 8 = 144 bytes)
-// ============================================================================
-//
-//   +0   rax     +64  r8      +128 rip
-//   +8   rbx     +72  r9      +136 rflags
-//   +16  rcx     +80  r10
-//   +24  rdx     +88  r11
-//   +32  rsi     +96  r12
-//   +40  rdi     +104 r13
-//   +48  rbp     +112 r14
-//   +56  rsp     +120 r15
-//
-// Shellcode is called with: rdi = &RegContext
-
-// ============================================================================
-// Tests
-// ============================================================================
+use shellcode::*;
 
 // ---------------------------------------------------------------------------
 // 1. Pre-hook modifies function argument
 // ---------------------------------------------------------------------------
 #[test]
 fn pre_hook_modifies_argument() {
-    // add_ten(5) would return 15. Pre-hook writes 20 to RegContext.rdi (+40),
-    // so add_ten receives 20 and returns 30.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -47,18 +33,13 @@ fn pre_hook_modifies_argument() {
     let output = td.path().join("e2e_prearg_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
-    // mov qword [rdi+0x28], 20; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_prearg",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0xC7, 0x47, 0x28, 0x14, 0x00, 0x00, 0x00, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(SET_ARG_20),
         ),
     );
 
@@ -76,7 +57,6 @@ shellcode = [0x48, 0xC7, 0x47, 0x28, 0x14, 0x00, 0x00, 0x00, 0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn replace_reads_args_computes() {
-    // target(11) would return 11. Replace reads rdi(+40), triples, stores rax(+0).
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -90,18 +70,13 @@ fn replace_reads_args_computes() {
     let output = td.path().join("e2e_repcmp_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // mov rax,[rdi+0x28]; imul rax,rax,3; mov [rdi],rax; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_repcmp",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x6B, 0xC0, 0x03, 0x48, 0x89, 0x07, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(TRIPLE_ARG_TO_RETVAL),
         ),
     );
 
@@ -128,18 +103,13 @@ fn replace_constant_return() {
     let output = td.path().join("e2e_repconst_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // mov qword [rdi], 99; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_repconst",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(RETURN_99),
         ),
     );
 
@@ -153,31 +123,20 @@ shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn conditional_fires_when_true() {
-    // On entry to main, rdi = argc = 1. Condition: rdi >= 1 → true → fires.
     let td = test_dir();
-    let input = compile_bin(
-        td.path(),
-        "e2e_condtrue",
-        r#"
-        int main() { return 42; }
-    "#,
-    );
+    let input = compile_bin(td.path(), "e2e_condtrue", "int main() { return 42; }\n");
     let output = td.path().join("e2e_condtrue_out");
     let va = find_symbol_va(&input, "main").expect("main not found");
 
-    // mov qword [rdi], 7; ret  — sets rax=7 via RegContext
     let hooks = write_hooks(
         td.path(),
         "e2e_condtrue",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x07, 0x00, 0x00, 0x00, 0xC3]
-condition = {{ register = "rdi", op = "gte", value = 1 }}
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n\
+             condition = {{ register = \"{}\", op = \"gte\", value = 1 }}\n",
+            va,
+            shellcode_toml(RETURN_7),
+            FIRST_ARG_REG,
         ),
     );
 
@@ -186,7 +145,7 @@ condition = {{ register = "rdi", op = "gte", value = 1 }}
     assert_eq!(
         run(&output),
         7,
-        "condition true (argc>=1) → hook fires → exit 7"
+        "condition true (argc>=1) -> hook fires -> exit 7"
     );
 }
 
@@ -195,8 +154,6 @@ condition = {{ register = "rdi", op = "gte", value = 1 }}
 // ---------------------------------------------------------------------------
 #[test]
 fn conditional_bit_set() {
-    // add_ten(15): rdi=15=0x0F. bit_set with value=1 checks bit 0.
-    // 15 & 1 = 1 → condition true → hook fires → changes rdi to 100 → exit 110.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -210,19 +167,15 @@ fn conditional_bit_set() {
     let output = td.path().join("e2e_bitset_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
-    // mov qword [rdi+0x28], 100; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_bitset",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0xC7, 0x47, 0x28, 0x64, 0x00, 0x00, 0x00, 0xC3]
-condition = {{ register = "rdi", op = "bit_set", value = 1 }}
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n\
+             condition = {{ register = \"{}\", op = \"bit_set\", value = 1 }}\n",
+            va,
+            shellcode_toml(SET_ARG_100),
+            FIRST_ARG_REG,
         ),
     );
 
@@ -231,7 +184,7 @@ condition = {{ register = "rdi", op = "bit_set", value = 1 }}
     assert_eq!(
         run(&output),
         110,
-        "bit_set(0) on 0x0F → fires → add_ten(100)=110"
+        "bit_set(0) on 0x0F -> fires -> add_ten(100)=110"
     );
 }
 
@@ -240,8 +193,6 @@ condition = {{ register = "rdi", op = "bit_set", value = 1 }}
 // ---------------------------------------------------------------------------
 #[test]
 fn conditional_bit_clear() {
-    // add_ten(14): rdi=14=0x0E. bit_clear with value=1 checks bit 0 is clear.
-    // 14 & 1 = 0 → condition true → hook fires → changes rdi to 100 → exit 110.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -255,19 +206,15 @@ fn conditional_bit_clear() {
     let output = td.path().join("e2e_bitclr_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
-    // mov qword [rdi+0x28], 100; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_bitclr",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0xC7, 0x47, 0x28, 0x64, 0x00, 0x00, 0x00, 0xC3]
-condition = {{ register = "rdi", op = "bit_clear", value = 1 }}
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n\
+             condition = {{ register = \"{}\", op = \"bit_clear\", value = 1 }}\n",
+            va,
+            shellcode_toml(SET_ARG_100),
+            FIRST_ARG_REG,
         ),
     );
 
@@ -276,7 +223,7 @@ condition = {{ register = "rdi", op = "bit_clear", value = 1 }}
     assert_eq!(
         run(&output),
         110,
-        "bit_clear(0) on 0x0E → fires → add_ten(100)=110"
+        "bit_clear(0) on 0x0E -> fires -> add_ten(100)=110"
     );
 }
 
@@ -285,8 +232,6 @@ condition = {{ register = "rdi", op = "bit_clear", value = 1 }}
 // ---------------------------------------------------------------------------
 #[test]
 fn hook_fires_every_call() {
-    // add_one(0) called 3 times. Pre-hook adds 10 to rdi each time.
-    // Each call: add_one(0+10) = 11. Total: 11+11+11 = 33.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -300,18 +245,13 @@ fn hook_fires_every_call() {
     let output = td.path().join("e2e_every_out");
     let va = find_symbol_va(&input, "add_one").expect("add_one not found");
 
-    // mov rax,[rdi+0x28]; add rax,10; mov [rdi+0x28],rax; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_every",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x83, 0xC0, 0x0A, 0x48, 0x89, 0x47, 0x28, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(ADD_10_TO_ARG),
         ),
     );
 
@@ -325,7 +265,6 @@ shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x83, 0xC0, 0x0A, 0x48, 0x89, 0x47, 0
 // ---------------------------------------------------------------------------
 #[test]
 fn recursive_function_stable() {
-    // factorial(5) = 120. Pre-hook NOP must not corrupt the stack.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -343,13 +282,9 @@ fn recursive_function_stable() {
         td.path(),
         "e2e_recurse",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(NOP),
         ),
     );
 
@@ -367,7 +302,6 @@ shellcode = [0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn chained_hooks_accumulate() {
-    // identity(0): hook A adds 10 to rdi, hook B adds 5. Result: identity(15)=15.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -381,26 +315,16 @@ fn chained_hooks_accumulate() {
     let output = td.path().join("e2e_chain_out");
     let va = find_symbol_va(&input, "identity").expect("identity not found");
 
-    // Hook A: add 10 to rdi(+40)
-    // mov rax,[rdi+0x28]; add rax,10; mov [rdi+0x28],rax; ret
-    // Hook B: add 5 to rdi(+40)
-    // mov rax,[rdi+0x28]; add rax,5; mov [rdi+0x28],rax; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_chain",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x83, 0xC0, 0x0A, 0x48, 0x89, 0x47, 0x28, 0xC3]
-
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x83, 0xC0, 0x05, 0x48, 0x89, 0x47, 0x28, 0xC3]
-"#,
-            va, va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n\n\
+             [[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(ADD_10_TO_ARG),
+            va,
+            shellcode_toml(ADD_5_TO_ARG),
         ),
     );
 
@@ -414,8 +338,6 @@ shellcode = [0x48, 0x8B, 0x47, 0x28, 0x48, 0x83, 0xC0, 0x05, 0x48, 0x89, 0x47, 0
 // ---------------------------------------------------------------------------
 #[test]
 fn mixed_pre_post_both_work() {
-    // func(0): pre-hook writes 20 to rdi → func(20) → returns 21.
-    // Post-hook is NOP, verifies it doesn't break the chain.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -433,18 +355,12 @@ fn mixed_pre_post_both_work() {
         td.path(),
         "e2e_mixed",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x48, 0xC7, 0x47, 0x28, 0x14, 0x00, 0x00, 0x00, 0xC3]
-
-[[hook]]
-target = "0x{:x}"
-mode = "post"
-shellcode = [0xC3]
-"#,
-            va, va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n\n\
+             [[hook]]\ntarget = \"0x{:x}\"\nmode = \"post\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(SET_ARG_20),
+            va,
+            shellcode_toml(NOP),
         ),
     );
 
@@ -453,16 +369,16 @@ shellcode = [0xC3]
     assert_eq!(
         run(&output),
         21,
-        "pre sets arg=20 → func(20)=21, post NOP preserves"
+        "pre sets arg=20 -> func(20)=21, post NOP preserves"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 11. PLT replace suppresses library call
+// 11. PLT replace suppresses library call (ELF x86_64 only)
 // ---------------------------------------------------------------------------
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn plt_replace_suppresses_output() {
-    // Replace puts@plt so it never actually calls puts.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -476,19 +392,13 @@ fn plt_replace_suppresses_output() {
     let plt_va = find_plt_va(&input, "puts")
         .expect("puts@plt not found — binary must be dynamically linked");
 
-    // Replace: set rax=0 (success) and return.
-    // mov qword [rdi], 0; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_pltrepl",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x00, 0x00, 0x00, 0x00, 0xC3]
-"#,
-            plt_va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n",
+            plt_va,
+            shellcode_toml(RETURN_0),
         ),
     );
 
@@ -506,19 +416,21 @@ shellcode = [0x48, 0xC7, 0x07, 0x00, 0x00, 0x00, 0x00, 0xC3]
 // ---------------------------------------------------------------------------
 // 12. Library handler hook (.so based)
 // ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
 #[test]
 fn library_handler_hook() {
-    // Handler .so sets RegContext.rax = 77.
     let td = test_dir();
     let handler_so = compile_so(
         td.path(),
         "e2e_handler",
-        r#"
+        &format!(
+            r#"
         #include <stdint.h>
-        void my_handler(void *ctx) {
+        void my_handler(void *ctx) {{
             *(uint64_t *)ctx = 77;
-        }
+        }}
     "#,
+        ),
     );
 
     let input = compile_bin(
@@ -536,15 +448,8 @@ fn library_handler_hook() {
         td.path(),
         "e2e_libhook",
         &format!(
-            r#"
-[hooks]
-library = "{}"
-
-[[hook]]
-target = "target"
-mode = "replace"
-handler = "my_handler"
-"#,
+            "[hooks]\nlibrary = \"{}\"\n\n\
+             [[hook]]\ntarget = \"target\"\nmode = \"replace\"\nhandler = \"my_handler\"\n",
             handler_so.display()
         ),
     );
@@ -562,7 +467,7 @@ handler = "my_handler"
     );
 
     let code = run_with_preload(&output, preload);
-    assert_eq!(code, 77, "library handler should set rax=77 → exit 77");
+    assert_eq!(code, 77, "library handler should set rax=77 -> exit 77");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +475,6 @@ handler = "my_handler"
 // ---------------------------------------------------------------------------
 #[test]
 fn return_hook_modifies_retval() {
-    // target() returns 42. Return hook adds 8 to rax → exit 50.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -584,18 +488,13 @@ fn return_hook_modifies_retval() {
     let output = td.path().join("e2e_rethook_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // mov rax,[rdi]; add rax,8; mov [rdi],rax; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_rethook",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "return"
-shellcode = [0x48, 0x8B, 0x07, 0x48, 0x83, 0xC0, 0x08, 0x48, 0x89, 0x07, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"return\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(ADD_8_TO_RETVAL),
         ),
     );
 
@@ -609,7 +508,6 @@ shellcode = [0x48, 0x8B, 0x07, 0x48, 0x83, 0xC0, 0x08, 0x48, 0x89, 0x07, 0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn toggle_disabled_skips_hook() {
-    // Replace hook with enabled=false → toggle byte=0 → hook skipped → exit 42.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -623,19 +521,13 @@ fn toggle_disabled_skips_hook() {
     let output = td.path().join("e2e_togoff_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // Would set rax=99 if it fired.
     let hooks = write_hooks(
         td.path(),
         "e2e_togoff",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
-enabled = false
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\nenabled = false\n",
+            va,
+            shellcode_toml(RETURN_99),
         ),
     );
 
@@ -644,7 +536,7 @@ enabled = false
     assert_eq!(
         run(&output),
         42,
-        "enabled=false → hook skipped → original exit 42"
+        "enabled=false -> hook skipped -> original exit 42"
     );
 }
 
@@ -653,7 +545,6 @@ enabled = false
 // ---------------------------------------------------------------------------
 #[test]
 fn toggle_enabled_fires_hook() {
-    // Same as above but enabled=true → toggle byte=1 → hook fires → exit 99.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -671,31 +562,23 @@ fn toggle_enabled_fires_hook() {
         td.path(),
         "e2e_togon",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
-enabled = true
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\nenabled = true\n",
+            va,
+            shellcode_toml(RETURN_99),
         ),
     );
 
     let result = rewrite_hooked(&input, &output, &hooks);
     assert_eq!(result.hooks_applied, 1);
-    assert_eq!(run(&output), 99, "enabled=true → hook fires → exit 99");
+    assert_eq!(run(&output), 99, "enabled=true -> hook fires -> exit 99");
 }
 
 // ---------------------------------------------------------------------------
-// 16. Callee-saved registers preserved across hook
+// 16. Callee-saved registers preserved across hook (x86_64 only — uses inline asm)
 // ---------------------------------------------------------------------------
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn callee_saved_regs_preserved() {
-    // main sets callee-saved regs (rbx, r12-r15) to known values, calls
-    // target() through inline asm so they're live across the call, then sums
-    // them. A pre-hook that clobbers those machine regs must not affect the
-    // result because the trampoline's save/restore restores them from RegContext.
     let td = test_dir();
     let input = compile_bin_flags(
         td.path(),
@@ -732,18 +615,14 @@ fn callee_saved_regs_preserved() {
     let output = td.path().join("e2e_callee_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // Shellcode clobbers rbx, r12, r13, r14, r15 (machine regs, NOT RegContext fields).
+    // Shellcode clobbers rbx, r12-r15 (machine regs, NOT RegContext fields).
     // xor ebx,ebx; xor r12d,r12d; xor r13d,r13d; xor r14d,r14d; xor r15d,r15d; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_callee",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0x31, 0xDB, 0x45, 0x31, 0xE4, 0x45, 0x31, 0xED, 0x45, 0x31, 0xF6, 0x45, 0x31, 0xFF, 0xC3]
-"#,
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\n\
+             shellcode = [0x31, 0xDB, 0x45, 0x31, 0xE4, 0x45, 0x31, 0xED, 0x45, 0x31, 0xF6, 0x45, 0x31, 0xFF, 0xC3]\n",
             va
         ),
     );
@@ -762,7 +641,6 @@ shellcode = [0x31, 0xDB, 0x45, 0x31, 0xE4, 0x45, 0x31, 0xED, 0x45, 0x31, 0xF6, 0
 // ---------------------------------------------------------------------------
 #[test]
 fn stripped_binary_hook_by_va() {
-    // Compile with symbols, find VA, strip, hook by VA.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -775,7 +653,6 @@ fn stripped_binary_hook_by_va() {
     );
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // Strip symbols.
     let stripped = td.path().join("e2e_strip_stripped");
     std::fs::copy(&input, &stripped).unwrap();
     let st = std::process::Command::new("strip")
@@ -783,33 +660,25 @@ fn stripped_binary_hook_by_va() {
         .status()
         .unwrap();
     assert!(st.success(), "strip failed");
-
-    // Verify symbol is gone.
     assert!(
         find_symbol_va(&stripped, "target").is_none(),
         "target should not be found after stripping"
     );
 
     let output = td.path().join("e2e_strip_out");
-
-    // Replace hook by hex VA → exit 99.
     let hooks = write_hooks(
         td.path(),
         "e2e_strip",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(RETURN_99),
         ),
     );
 
     let result = rewrite_hooked(&stripped, &output, &hooks);
     assert_eq!(result.hooks_applied, 1);
-    assert_eq!(run(&output), 99, "hook by VA on stripped binary → exit 99");
+    assert_eq!(run(&output), 99, "hook by VA on stripped binary -> exit 99");
 }
 
 // ---------------------------------------------------------------------------
@@ -817,8 +686,6 @@ shellcode = [0x48, 0xC7, 0x07, 0x63, 0x00, 0x00, 0x00, 0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn selective_multi_function() {
-    // Three functions: a()=10, b()=20, c()=30. Hook only b() to return 100.
-    // Original: 10+20+30=60. With hook: 10+100+30=140.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -833,18 +700,13 @@ fn selective_multi_function() {
     let output = td.path().join("e2e_select_out");
     let va_b = find_symbol_va(&input, "func_b").expect("func_b not found");
 
-    // Replace func_b: mov qword [rdi], 100; ret
     let hooks = write_hooks(
         td.path(),
         "e2e_select",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "replace"
-shellcode = [0x48, 0xC7, 0x07, 0x64, 0x00, 0x00, 0x00, 0xC3]
-"#,
-            va_b
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"replace\"\nshellcode = {}\n",
+            va_b,
+            shellcode_toml(RETURN_100),
         ),
     );
 
@@ -858,7 +720,6 @@ shellcode = [0x48, 0xC7, 0x07, 0x64, 0x00, 0x00, 0x00, 0xC3]
 // ---------------------------------------------------------------------------
 #[test]
 fn hook_preserves_stdio() {
-    // Pre-hook NOP on main should not interfere with printf output.
     let td = test_dir();
     let input = compile_bin(
         td.path(),
@@ -875,13 +736,9 @@ fn hook_preserves_stdio() {
         td.path(),
         "e2e_stdio",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(NOP),
         ),
     );
 
@@ -914,18 +771,13 @@ fn no_coverage_hooks_only() {
     let output = td.path().join("e2e_nocov_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    // Pre-hook NOP.
     let hooks = write_hooks(
         td.path(),
         "e2e_nocov",
         &format!(
-            r#"
-[[hook]]
-target = "0x{:x}"
-mode = "pre"
-shellcode = [0xC3]
-"#,
-            va
+            "[[hook]]\ntarget = \"0x{:x}\"\nmode = \"pre\"\nshellcode = {}\n",
+            va,
+            shellcode_toml(NOP),
         ),
     );
 

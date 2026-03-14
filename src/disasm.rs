@@ -604,15 +604,19 @@ pub fn extract_displaced_bytes(
     Ok((data[file_offset..file_offset + total].to_vec(), total))
 }
 
-/// FNV-1a hash of a u64, masked to 16 bits.
-fn fnv_hash_u16(val: u64) -> u16 {
+/// FNV-1a hash of a u64, folded to 16 bits via XOR.
+///
+/// Used to generate block IDs for coverage instrumentation.
+/// All format-specific disassemblers must use this single implementation
+/// to ensure consistent block IDs across ELF, Mach-O, and PE.
+pub(crate) fn fnv_hash_u16(val: u64) -> u16 {
     let bytes = val.to_le_bytes();
     let mut hash: u32 = 0x811c_9dc5;
     for &b in &bytes {
         hash ^= b as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    (hash & 0xFFFF) as u16
+    (hash ^ (hash >> 16)) as u16
 }
 
 #[cfg(test)]

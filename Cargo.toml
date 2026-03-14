@@ -9,7 +9,6 @@ description = "Static binary rewriter for arbitrary function hooking across ELF,
 [features]
 default = ["aarch64", "coverage"]
 aarch64 = ["capstone"]
-macho = []
 coverage = []
 
 [dependencies]

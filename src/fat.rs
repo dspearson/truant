@@ -324,4 +324,32 @@ mod tests {
         assert_eq!(slices[0].offset, 28);
         assert_eq!(slices[0].size, 16);
     }
+
+    #[test]
+    fn test_is_fat_binary_too_short() {
+        assert!(!is_fat_binary(&[]));
+        assert!(!is_fat_binary(&[0xCA, 0xFE]));
+    }
+
+    #[test]
+    fn test_parse_fat_header_truncated() {
+        let data = vec![0u8; 4];
+        assert!(parse_fat_header(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_fat_header_zero_slices() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        data[4..8].copy_from_slice(&0u32.to_be_bytes()); // nfat_arch = 0
+        assert!(parse_fat_header(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_fat_header_too_many_slices() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        data[4..8].copy_from_slice(&17u32.to_be_bytes()); // nfat_arch = 17 (> limit of 16)
+        assert!(parse_fat_header(&data).is_err());
+    }
 }

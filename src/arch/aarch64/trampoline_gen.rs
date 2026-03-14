@@ -376,183 +376,7 @@ fn emit_syscall(code: &mut Vec<u8>, syscall_nr: u32) {
     code.extend_from_slice(&encode_svc0());
 }
 
-/// Sign-extend a value from `bits` width to i64.
-fn sign_extend(val: u32, bits: u32) -> i64 {
-    let shift = 64 - bits;
-    ((val as i64) << shift) >> shift
-}
-
-/// Relocate a PC-relative AArch64 instruction from `original_va` to `new_va`.
-///
-/// Decodes the instruction, computes its original target, then re-encodes with an
-/// adjusted immediate so it reaches the same target from the new location.
-/// Returns the relocated instruction word, or an error if the new offset is out of range.
-fn relocate_pc_relative(raw: u32, original_va: u64, new_va: u64) -> Result<u32> {
-    let is_adrp = (raw & 0x9F00_0000) == 0x9000_0000;
-    let is_adr = (raw & 0x9F00_0000) == 0x1000_0000;
-    let is_ldr_lit = (raw & 0x3B00_0000) == 0x1800_0000;
-    let is_b = (raw & 0xFC00_0000) == 0x1400_0000;
-    let is_bl = (raw & 0xFC00_0000) == 0x9400_0000;
-    // B.cond: [31:25]=0101010 [24]=0 [23:5]=imm19 [4]=0 [3:0]=cond
-    let is_bcond = (raw & 0xFF00_0010) == 0x5400_0000;
-    // CBZ/CBNZ: [31]=sf [30:25]=011010 [24]=op [23:5]=imm19 [4:0]=Rt
-    let is_cbz_cbnz = (raw & 0x7E00_0000) == 0x3400_0000;
-    // TBZ/TBNZ: [31]=b5 [30:25]=011011 [24]=op [23:19]=b40 [18:5]=imm14 [4:0]=Rt
-    let is_tbz_tbnz = (raw & 0x7E00_0000) == 0x3600_0000;
-
-    if is_adrp {
-        // ADRP Xd, label: target_page = (PC & ~0xFFF) + (SignExtend(immhi:immlo) << 12)
-        let rd = raw & 0x1F;
-        let immlo = (raw >> 29) & 0x3;
-        let immhi = (raw >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        let imm_signed = sign_extend(imm21, 21);
-        let target_page = ((original_va & !0xFFF) as i64 + (imm_signed << 12)) as u64;
-
-        let new_imm = ((target_page as i64) - (new_va as i64 & !0xFFF_i64)) >> 12;
-        if !(-(1 << 20)..(1 << 20)).contains(&new_imm) {
-            anyhow::bail!(
-                "ADRP relocation out of range: target page 0x{:x}, new VA 0x{:x}, delta {} pages (max +/-1M pages)",
-                target_page,
-                new_va,
-                new_imm
-            );
-        }
-        let new_imm21 = (new_imm as u32) & 0x1F_FFFF;
-        let new_immhi = (new_imm21 >> 2) & 0x7_FFFF;
-        let new_immlo = new_imm21 & 0x3;
-        let relocated =
-            (1u32 << 31) | (new_immlo << 29) | (0b10000u32 << 24) | (new_immhi << 5) | rd;
-        Ok(relocated)
-    } else if is_adr {
-        // ADR Xd, label: target = PC + SignExtend(immhi:immlo)
-        let rd = raw & 0x1F;
-        let immlo = (raw >> 29) & 0x3;
-        let immhi = (raw >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        let imm_signed = sign_extend(imm21, 21);
-        let target = (original_va as i64 + imm_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if !(-(1 << 20)..(1 << 20)).contains(&new_offset) {
-            anyhow::bail!(
-                "ADR relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {} (max +/-1M)",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm21 = (new_offset as u32) & 0x1F_FFFF;
-        let new_immhi = (new_imm21 >> 2) & 0x7_FFFF;
-        let new_immlo = new_imm21 & 0x3;
-        let relocated = (new_immlo << 29) | (0b10000u32 << 24) | (new_immhi << 5) | rd;
-        Ok(relocated)
-    } else if is_ldr_lit {
-        // LDR Xt, label: target = PC + SignExtend(imm19) * 4
-        let rt = raw & 0x1F;
-        let opc_v = raw & 0xFF00_0000; // preserve opc and V bits
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let offset_signed = sign_extend(imm19, 19) * 4;
-        let target = (original_va as i64 + offset_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!(
-                "LDR literal relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {}",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm19 = ((new_offset / 4) as u32) & 0x7_FFFF;
-        let relocated = opc_v | (new_imm19 << 5) | rt;
-        Ok(relocated)
-    } else if is_b || is_bl {
-        // B/BL: target = PC + SignExtend(imm26) * 4
-        let opcode_bits = raw & 0xFC00_0000;
-        let imm26 = raw & 0x03FF_FFFF;
-        let offset_signed = sign_extend(imm26, 26) * 4;
-        let target = (original_va as i64 + offset_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 25) || new_offset / 4 >= (1 << 25) {
-            anyhow::bail!(
-                "B/BL relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {}",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm26 = ((new_offset / 4) as u32) & 0x03FF_FFFF;
-        let relocated = opcode_bits | new_imm26;
-        Ok(relocated)
-    } else if is_bcond {
-        // B.cond: target = PC + SignExtend(imm19) * 4
-        let cond = raw & 0xF;
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let offset_signed = sign_extend(imm19, 19) * 4;
-        let target = (original_va as i64 + offset_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!(
-                "B.cond relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {}",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm19 = ((new_offset / 4) as u32) & 0x7_FFFF;
-        let relocated = 0x5400_0000 | (new_imm19 << 5) | cond;
-        Ok(relocated)
-    } else if is_cbz_cbnz {
-        // CBZ/CBNZ: target = PC + SignExtend(imm19) * 4
-        let sf_op = raw & 0xFF00_0000; // preserve sf and op bits
-        let rt = raw & 0x1F;
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let offset_signed = sign_extend(imm19, 19) * 4;
-        let target = (original_va as i64 + offset_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!(
-                "CBZ/CBNZ relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {}",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm19 = ((new_offset / 4) as u32) & 0x7_FFFF;
-        let relocated = sf_op | (new_imm19 << 5) | rt;
-        Ok(relocated)
-    } else if is_tbz_tbnz {
-        // TBZ/TBNZ: target = PC + SignExtend(imm14) * 4
-        let b5_op = raw & 0xFF00_0000;
-        let b40 = (raw >> 19) & 0x1F;
-        let rt = raw & 0x1F;
-        let imm14 = (raw >> 5) & 0x3FFF;
-        let offset_signed = sign_extend(imm14, 14) * 4;
-        let target = (original_va as i64 + offset_signed) as u64;
-
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 13) || new_offset / 4 >= (1 << 13) {
-            anyhow::bail!(
-                "TBZ/TBNZ relocation out of range: target 0x{:x}, new VA 0x{:x}, delta {}",
-                target,
-                new_va,
-                new_offset
-            );
-        }
-        let new_imm14 = ((new_offset / 4) as u32) & 0x3FFF;
-        let relocated = b5_op | (b40 << 19) | (new_imm14 << 5) | rt;
-        Ok(relocated)
-    } else {
-        anyhow::bail!(
-            "instruction 0x{:08x} is not a recognised PC-relative encoding",
-            raw
-        );
-    }
-}
+use super::relocation::{is_pc_relative, relocate_pc_relative, sign_extend};
 
 /// Extract the original branch target VA from a conditional branch instruction that can
 /// benefit from branch island synthesis.
@@ -574,8 +398,6 @@ fn compute_branch_target(raw: u32, insn_va: u64) -> Option<u64> {
         let offset = sign_extend(imm19, 19) * 4;
         Some((insn_va as i64 + offset) as u64)
     } else {
-        // B/BL have ±128 MiB range — same as the island B instruction, so islands can't
-        // extend their reach. ADRP/ADR/LDR literal are not branches at all.
         None
     }
 }
@@ -595,20 +417,17 @@ fn rewrite_branch_to_island(raw: u32, island_offset_bytes: i64) -> u32 {
     let offset_insns = island_offset_bytes / 4;
 
     if is_tbz_tbnz {
-        // TBZ/TBNZ: [31]=b5 [30:25]=011011 [24]=op [23:19]=b40 [18:5]=imm14 [4:0]=Rt
         let b5_op = raw & 0xFF00_0000;
         let b40 = (raw >> 19) & 0x1F;
         let rt = raw & 0x1F;
         let new_imm14 = (offset_insns as u32) & 0x3FFF;
         b5_op | (b40 << 19) | (new_imm14 << 5) | rt
     } else if is_cbz_cbnz {
-        // CBZ/CBNZ: [31]=sf [30:25]=011010 [24]=op [23:5]=imm19 [4:0]=Rt
         let sf_op = raw & 0xFF00_0000;
         let rt = raw & 0x1F;
         let new_imm19 = (offset_insns as u32) & 0x7_FFFF;
         sf_op | (new_imm19 << 5) | rt
     } else if is_bcond {
-        // B.cond: [31:25]=0101010 [24]=0 [23:5]=imm19 [4]=0 [3:0]=cond
         let cond = raw & 0xF;
         let new_imm19 = (offset_insns as u32) & 0x7_FFFF;
         0x5400_0000 | (new_imm19 << 5) | cond
@@ -618,19 +437,6 @@ fn rewrite_branch_to_island(raw: u32, island_offset_bytes: i64) -> u32 {
             raw
         );
     }
-}
-
-/// Return true if the instruction word is PC-relative.
-fn is_pc_relative(raw: u32) -> bool {
-    let is_adrp = (raw & 0x9F00_0000) == 0x9000_0000;
-    let is_adr = (raw & 0x9F00_0000) == 0x1000_0000;
-    let is_ldr_lit = (raw & 0x3B00_0000) == 0x1800_0000;
-    let is_b = (raw & 0xFC00_0000) == 0x1400_0000;
-    let is_bl = (raw & 0xFC00_0000) == 0x9400_0000;
-    let is_bcond = (raw & 0xFF00_0010) == 0x5400_0000;
-    let is_cbz_cbnz = (raw & 0x7E00_0000) == 0x3400_0000;
-    let is_tbz_tbnz = (raw & 0x7E00_0000) == 0x3600_0000;
-    is_adrp || is_adr || is_ldr_lit || is_b || is_bl || is_bcond || is_cbz_cbnz || is_tbz_tbnz
 }
 
 /// Check that a branch from `from_va` to `to_va` is within ARM64 B range (±128 MiB).

@@ -52,7 +52,7 @@ pub struct InitOffsetsInfo {
 }
 
 /// Parsed Mach-O binary context with all metadata needed for instrumentation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MachOContext {
     // Core
     pub text: TextSection,

@@ -244,12 +244,4 @@ fn uses_rip_relative(instr: &Instruction) -> bool {
 }
 
 /// FNV-1a hash of a VA, reduced to 16 bits.
-fn fnv_hash_u16(va: u64) -> u16 {
-    let bytes = va.to_le_bytes();
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in &bytes {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    (hash ^ (hash >> 16)) as u16
-}
+use crate::disasm::fnv_hash_u16;

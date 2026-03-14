@@ -17,46 +17,69 @@ pub fn test_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("failed to create temp dir for test")
 }
 
+/// Platform-appropriate C compiler and flags for test binaries.
+/// On Linux: `gcc -no-pie` for non-PIE ELF.
+/// On macOS: `cc -Wl,-headerpad_max_install_names` (non-PIE not applicable on ARM64).
+fn cc_command() -> (String, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        (
+            "cc".to_string(),
+            vec!["-Wl,-headerpad_max_install_names".to_string()],
+        )
+    } else {
+        ("gcc".to_string(), vec!["-no-pie".to_string()])
+    }
+}
+
 /// Compile a non-PIE test binary from custom C source into `dir`.
 pub fn compile_bin(dir: &Path, suffix: &str, src: &str) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
     let bin = dir.join(suffix);
     std::fs::write(&src_path, src).unwrap();
-    let cc = Command::new("gcc")
-        .args([
-            "-o",
-            bin.to_str().unwrap(),
-            "-no-pie",
-            src_path.to_str().unwrap(),
-        ])
+    let (cc, base_flags) = cc_command();
+    let status = Command::new(&cc)
+        .arg("-o")
+        .arg(bin.to_str().unwrap())
+        .args(&base_flags)
+        .arg(src_path.to_str().unwrap())
         .status()
-        .expect("gcc not available");
-    assert!(cc.success(), "failed to compile test binary {}", suffix);
+        .unwrap_or_else(|_| panic!("{} not available", cc));
+    assert!(status.success(), "failed to compile test binary {}", suffix);
     let _ = std::fs::remove_file(&src_path);
     bin
 }
 
-/// Compile a non-PIE test binary with extra gcc flags into `dir`.
+/// Compile a non-PIE test binary with extra flags into `dir`.
 pub fn compile_bin_flags(dir: &Path, suffix: &str, src: &str, flags: &[&str]) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
     let bin = dir.join(suffix);
     std::fs::write(&src_path, src).unwrap();
-    let mut cmd = Command::new("gcc");
-    cmd.args(["-o", bin.to_str().unwrap(), "-no-pie"]);
+    let (cc, base_flags) = cc_command();
+    let mut cmd = Command::new(&cc);
+    cmd.arg("-o").arg(bin.to_str().unwrap());
+    cmd.args(&base_flags);
     cmd.args(flags);
     cmd.arg(src_path.to_str().unwrap());
-    let cc = cmd.status().expect("gcc not available");
-    assert!(cc.success(), "failed to compile test binary {}", suffix);
+    let status = cmd
+        .status()
+        .unwrap_or_else(|_| panic!("{} not available", cc));
+    assert!(status.success(), "failed to compile test binary {}", suffix);
     let _ = std::fs::remove_file(&src_path);
     bin
 }
 
-/// Compile a shared library (.so) from C source into `dir`.
+/// Compile a shared library (.so / .dylib) from C source into `dir`.
 pub fn compile_so(dir: &Path, suffix: &str, src: &str) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
-    let lib = dir.join(format!("{}.so", suffix));
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let lib = dir.join(format!("{}.{}", suffix, ext));
     std::fs::write(&src_path, src).unwrap();
-    let cc = Command::new("gcc")
+    let (cc, _) = cc_command();
+    let status = Command::new(&cc)
         .args([
             "-shared",
             "-fPIC",
@@ -65,8 +88,12 @@ pub fn compile_so(dir: &Path, suffix: &str, src: &str) -> PathBuf {
             src_path.to_str().unwrap(),
         ])
         .status()
-        .expect("gcc not available");
-    assert!(cc.success(), "failed to compile shared library {}", suffix);
+        .unwrap_or_else(|_| panic!("{} not available", cc));
+    assert!(
+        status.success(),
+        "failed to compile shared library {}",
+        suffix
+    );
     let _ = std::fs::remove_file(&src_path);
     lib
 }
@@ -79,14 +106,18 @@ pub fn write_hooks(dir: &Path, suffix: &str, content: &str) -> PathBuf {
 }
 
 /// Find a symbol's VA in a non-stripped binary via `nm`.
+/// On macOS, also tries with a `_` prefix (Mach-O name mangling).
 pub fn find_symbol_va(binary: &Path, name: &str) -> Option<u64> {
     let output = Command::new("nm").arg(binary).output().expect("nm failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let prefixed = format!("_{}", name);
     stdout
         .lines()
         .find(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            parts.len() >= 3 && (parts[1] == "T" || parts[1] == "t") && parts[2] == name
+            parts.len() >= 3
+                && (parts[1] == "T" || parts[1] == "t")
+                && (parts[2] == name || parts[2] == prefixed)
         })
         .and_then(|line| {
             let addr_str = line.split_whitespace().next()?;

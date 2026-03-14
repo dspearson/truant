@@ -674,118 +674,7 @@ fn relocate_displaced_aarch64(bytes: &[u8], orig_va: u64, new_va: u64) -> Result
     Ok(result)
 }
 
-/// Return true if the instruction word is PC-relative.
-fn is_pc_relative(raw: u32) -> bool {
-    let is_adrp = (raw & 0x9F00_0000) == 0x9000_0000;
-    let is_adr = (raw & 0x9F00_0000) == 0x1000_0000;
-    let is_ldr_lit = (raw & 0x3B00_0000) == 0x1800_0000;
-    let is_b = (raw & 0xFC00_0000) == 0x1400_0000;
-    let is_bl = (raw & 0xFC00_0000) == 0x9400_0000;
-    let is_bcond = (raw & 0xFF00_0010) == 0x5400_0000;
-    let is_cbz_cbnz = (raw & 0x7E00_0000) == 0x3400_0000;
-    let is_tbz_tbnz = (raw & 0x7E00_0000) == 0x3600_0000;
-    is_adrp || is_adr || is_ldr_lit || is_b || is_bl || is_bcond || is_cbz_cbnz || is_tbz_tbnz
-}
-
-/// Sign-extend a value from `bits` width to i64.
-fn sign_extend(val: u32, bits: u32) -> i64 {
-    let shift = 64 - bits;
-    ((val as i64) << shift) >> shift
-}
-
-/// Relocate a single PC-relative ARM64 instruction.
-fn relocate_pc_relative(raw: u32, original_va: u64, new_va: u64) -> Result<u32> {
-    let is_adrp = (raw & 0x9F00_0000) == 0x9000_0000;
-    let is_adr = (raw & 0x9F00_0000) == 0x1000_0000;
-    let is_ldr_lit = (raw & 0x3B00_0000) == 0x1800_0000;
-    let is_b = (raw & 0xFC00_0000) == 0x1400_0000;
-    let is_bl = (raw & 0xFC00_0000) == 0x9400_0000;
-    let is_bcond = (raw & 0xFF00_0010) == 0x5400_0000;
-    let is_cbz_cbnz = (raw & 0x7E00_0000) == 0x3400_0000;
-    let is_tbz_tbnz = (raw & 0x7E00_0000) == 0x3600_0000;
-
-    if is_adrp {
-        let rd = raw & 0x1F;
-        let immlo = (raw >> 29) & 0x3;
-        let immhi = (raw >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        let imm_signed = sign_extend(imm21, 21);
-        let target_page = ((original_va & !0xFFF) as i64 + (imm_signed << 12)) as u64;
-        let new_imm = ((target_page as i64) - (new_va as i64 & !0xFFF_i64)) >> 12;
-        if !(-(1 << 20)..(1 << 20)).contains(&new_imm) {
-            anyhow::bail!("ADRP relocation out of range");
-        }
-        let ni = (new_imm as u32) & 0x1F_FFFF;
-        Ok((1u32 << 31)
-            | ((ni & 0x3) << 29)
-            | (0b10000u32 << 24)
-            | (((ni >> 2) & 0x7_FFFF) << 5)
-            | rd)
-    } else if is_adr {
-        let rd = raw & 0x1F;
-        let immlo = (raw >> 29) & 0x3;
-        let immhi = (raw >> 5) & 0x7_FFFF;
-        let imm21 = (immhi << 2) | immlo;
-        let target = (original_va as i64 + sign_extend(imm21, 21)) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if !(-(1 << 20)..(1 << 20)).contains(&new_offset) {
-            anyhow::bail!("ADR relocation out of range");
-        }
-        let ni = (new_offset as u32) & 0x1F_FFFF;
-        Ok(((ni & 0x3) << 29) | (0b10000u32 << 24) | (((ni >> 2) & 0x7_FFFF) << 5) | rd)
-    } else if is_ldr_lit {
-        let rt = raw & 0x1F;
-        let opc_v = raw & 0xFF00_0000;
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let target = (original_va as i64 + sign_extend(imm19, 19) * 4) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!("LDR literal relocation out of range");
-        }
-        Ok(opc_v | ((((new_offset / 4) as u32) & 0x7_FFFF) << 5) | rt)
-    } else if is_b || is_bl {
-        let opcode_bits = raw & 0xFC00_0000;
-        let imm26 = raw & 0x03FF_FFFF;
-        let target = (original_va as i64 + sign_extend(imm26, 26) * 4) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 25) || new_offset / 4 >= (1 << 25) {
-            anyhow::bail!("B/BL relocation out of range");
-        }
-        Ok(opcode_bits | (((new_offset / 4) as u32) & 0x03FF_FFFF))
-    } else if is_bcond {
-        let cond = raw & 0xF;
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let target = (original_va as i64 + sign_extend(imm19, 19) * 4) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!("B.cond relocation out of range");
-        }
-        Ok(0x5400_0000 | ((((new_offset / 4) as u32) & 0x7_FFFF) << 5) | cond)
-    } else if is_cbz_cbnz {
-        let sf_op = raw & 0xFF00_0000;
-        let rt = raw & 0x1F;
-        let imm19 = (raw >> 5) & 0x7_FFFF;
-        let target = (original_va as i64 + sign_extend(imm19, 19) * 4) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 18) || new_offset / 4 >= (1 << 18) {
-            anyhow::bail!("CBZ/CBNZ relocation out of range");
-        }
-        Ok(sf_op | ((((new_offset / 4) as u32) & 0x7_FFFF) << 5) | rt)
-    } else if is_tbz_tbnz {
-        let b5_op = raw & 0xFF00_0000;
-        let b40 = (raw >> 19) & 0x1F;
-        let rt = raw & 0x1F;
-        let imm14 = (raw >> 5) & 0x3FFF;
-        let target = (original_va as i64 + sign_extend(imm14, 14) * 4) as u64;
-        let new_offset = target as i64 - new_va as i64;
-        if new_offset % 4 != 0 || new_offset / 4 < -(1 << 13) || new_offset / 4 >= (1 << 13) {
-            anyhow::bail!("TBZ/TBNZ relocation out of range");
-        }
-        Ok(b5_op | (b40 << 19) | ((((new_offset / 4) as u32) & 0x3FFF) << 5) | rt)
-    } else {
-        anyhow::bail!("unrecognised PC-relative instruction 0x{:08x}", raw);
-    }
-}
+use super::relocation::{is_pc_relative, relocate_pc_relative};
 
 // ============================================================
 // Condition check (AArch64)
@@ -1546,7 +1435,7 @@ mod tests {
         assert_eq!(relocated & 0xFC00_0000, 0x1400_0000);
         // Verify target: new_va(0x2000) + imm26*4 should == 0x1100
         let imm26 = relocated & 0x03FF_FFFF;
-        let offset = sign_extend(imm26, 26) * 4;
+        let offset = crate::arch::aarch64::relocation::sign_extend(imm26, 26) * 4;
         let target = (0x2000i64 + offset) as u64;
         assert_eq!(target, 0x1100);
     }

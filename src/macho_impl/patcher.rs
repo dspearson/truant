@@ -136,17 +136,47 @@ struct FileLayout {
     new_linkedit_filesize: u64,
 }
 
-/// Strip LC_CODE_SIGNATURE if present, reclaiming load command space.
+/// Non-essential load command types that can be stripped to reclaim header space.
+/// These are informational or debugging LCs that dyld does not require for loading.
+const LC_UUID: u32 = 0x1B;
+const LC_BUILD_VERSION: u32 = 0x32;
+const LC_SOURCE_VERSION: u32 = 0x2A;
+const LC_LOAD_DYLINKER: u32 = 0x0E;
+const LC_MAIN: u32 = 0x80000028;
+const LC_UNIXTHREAD: u32 = 0x05;
+
+/// LCs that are safe to strip — ordered from least to most useful so we strip
+/// the most expendable ones first.
+const STRIPPABLE_LCS: &[u32] = &[
+    LC_UUID,            // 24 bytes — binary identity, not needed for execution
+    LC_BUILD_VERSION,   // 32 bytes — build metadata
+    LC_SOURCE_VERSION,  // 16 bytes — source version info
+    LC_DATA_IN_CODE,    // 16 bytes — marks non-code regions, rarely populated
+    LC_FUNCTION_STARTS, // 16 bytes — function boundary hints for stack traces
+    LC_LOAD_DYLINKER,   // ~32 bytes — dyld path, kernel supplies it anyway
+];
+
+/// Reclaim load command space by stripping non-essential LCs.
+///
+/// Always strips LC_CODE_SIGNATURE (it will be re-signed after patching).
+/// If that's not enough for `min_space`, progressively strips informational LCs
+/// (UUID, build version, source version, data-in-code, function starts, dylinker)
+/// and compacts the remaining LC area.
+///
+/// After compaction, re-scans the LC area to update cached offsets in `ctx`
+/// (linkedit_segment_offset, lc_main_entryoff_offset, etc.).
+///
 /// Returns (ncmds, sizeofcmds, available_lc_space) after stripping.
-fn strip_code_signature(data: &mut [u8], ctx: &MachOContext) -> (u32, u32, u64) {
+/// Mutates `ctx` in place to update cached LC offsets after compaction.
+fn reclaim_lc_space(data: &mut [u8], ctx: &mut MachOContext, min_space: u64) -> (u32, u32, u64) {
     let mut ncmds = ctx.ncmds;
     let mut sizeofcmds = ctx.sizeofcmds;
     let mut available_lc_space = ctx.available_lc_space;
 
+    // Phase 1: Strip LC_CODE_SIGNATURE if present.
     if let Some(codesig_offset) = ctx.code_signature_lc_offset {
         let off = codesig_offset as usize;
         if off + ctx.code_signature_lc_size as usize <= data.len() {
-            // Zero out the load command
             for b in &mut data[off..off + ctx.code_signature_lc_size as usize] {
                 *b = 0;
             }
@@ -154,18 +184,133 @@ fn strip_code_signature(data: &mut [u8], ctx: &MachOContext) -> (u32, u32, u64) 
             sizeofcmds -= ctx.code_signature_lc_size;
             available_lc_space += ctx.code_signature_lc_size as u64;
 
-            // Update header
-            data[ctx.ncmds_offset as usize..ctx.ncmds_offset as usize + 4]
-                .copy_from_slice(&ncmds.to_le_bytes());
-            data[ctx.sizeofcmds_offset as usize..ctx.sizeofcmds_offset as usize + 4]
-                .copy_from_slice(&sizeofcmds.to_le_bytes());
-
             tracing::info!(
                 "stripped LC_CODE_SIGNATURE ({} bytes) — re-sign with: codesign -f -s - <output>",
                 ctx.code_signature_lc_size,
             );
         }
     }
+
+    // Phase 2: If still insufficient, strip non-essential LCs and compact.
+    if available_lc_space < min_space {
+        let lc_area_start = ctx.header_size;
+        let lc_area_end = ctx.lc_end_offset as usize;
+
+        // Collect (offset, size, cmd_type) for all LCs in the area.
+        let mut lcs: Vec<(usize, usize, u32)> = Vec::new();
+        let mut pos = lc_area_start;
+        while pos + 8 <= lc_area_end {
+            let cmd = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("slice is 4 bytes"));
+            let cmdsize =
+                u32::from_le_bytes(data[pos + 4..pos + 8].try_into().expect("slice is 4 bytes"))
+                    as usize;
+            if cmdsize == 0 || pos + cmdsize > lc_area_end {
+                break;
+            }
+            lcs.push((pos, cmdsize, cmd));
+            pos += cmdsize;
+        }
+
+        // Mark non-essential LCs for removal until we have enough space.
+        let mut to_strip: Vec<bool> = vec![false; lcs.len()];
+        for &target_cmd in STRIPPABLE_LCS {
+            if available_lc_space >= min_space {
+                break;
+            }
+            for (i, &(_, size, cmd)) in lcs.iter().enumerate() {
+                if cmd == target_cmd && !to_strip[i] {
+                    to_strip[i] = true;
+                    ncmds -= 1;
+                    sizeofcmds -= size as u32;
+                    available_lc_space += size as u64;
+                    tracing::info!(
+                        "stripped LC 0x{:x} ({} bytes) to reclaim header space",
+                        target_cmd,
+                        size,
+                    );
+                }
+            }
+        }
+
+        // Compact: copy surviving LCs into a contiguous block, then re-scan
+        // to find updated offsets for LINKEDIT, LC_MAIN, etc.
+        if to_strip.iter().any(|&s| s) {
+            let mut write_pos = lc_area_start;
+            for (i, &(read_pos, size, _)) in lcs.iter().enumerate() {
+                if to_strip[i] {
+                    continue;
+                }
+                if write_pos != read_pos {
+                    data.copy_within(read_pos..read_pos + size, write_pos);
+                }
+                write_pos += size;
+            }
+            // Zero out the freed tail.
+            for b in &mut data[write_pos..lc_area_end] {
+                *b = 0;
+            }
+
+            // Re-scan compacted LCs to update cached offsets in ctx.
+            ctx.linkedit_segment_offset = None;
+            ctx.lc_main_entryoff_offset = None;
+            ctx.lc_unixthread_pc_offset = None;
+            ctx.chained_fixups_lc_offset = None;
+
+            let mut offset = lc_area_start;
+            for _ in 0..ncmds {
+                if offset + 8 > data.len() {
+                    break;
+                }
+                let cmd = u32::from_le_bytes(
+                    data[offset..offset + 4]
+                        .try_into()
+                        .expect("slice is 4 bytes"),
+                );
+                let cmdsize = u32::from_le_bytes(
+                    data[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("slice is 4 bytes"),
+                ) as usize;
+                if cmd == 0 || cmdsize < 8 {
+                    break;
+                }
+                match cmd {
+                    LC_SEGMENT_64 => {
+                        if offset + 24 <= data.len()
+                            && data[offset + 8..offset + 24].starts_with(b"__LINKEDIT\0")
+                        {
+                            ctx.linkedit_segment_offset = Some(offset as u64);
+                        }
+                    }
+                    LC_MAIN => {
+                        if cmdsize >= 24 {
+                            ctx.lc_main_entryoff_offset = Some(offset as u64 + 8);
+                        }
+                    }
+                    LC_UNIXTHREAD => {
+                        if ctx.cputype == 0x0100_0007 && cmdsize >= 152 {
+                            ctx.lc_unixthread_pc_offset = Some(offset as u64 + 144);
+                        } else if ctx.cputype == 0x0100_000C && cmdsize >= 280 {
+                            ctx.lc_unixthread_pc_offset = Some(offset as u64 + 272);
+                        }
+                    }
+                    LC_DYLD_CHAINED_FIXUPS => {
+                        if cmdsize >= 16 {
+                            ctx.chained_fixups_lc_offset = Some(offset as u64);
+                        }
+                    }
+                    _ => {}
+                }
+                offset += cmdsize;
+            }
+        }
+    }
+
+    // Update header fields.
+    data[ctx.ncmds_offset as usize..ctx.ncmds_offset as usize + 4]
+        .copy_from_slice(&ncmds.to_le_bytes());
+    data[ctx.sizeofcmds_offset as usize..ctx.sizeofcmds_offset as usize + 4]
+        .copy_from_slice(&sizeofcmds.to_le_bytes());
 
     (ncmds, sizeofcmds, available_lc_space)
 }
@@ -1229,12 +1374,22 @@ fn patch_macho(
         bail!("no basic blocks to instrument");
     }
 
+    // Clone ctx so we can update cached LC offsets after stripping/compaction.
+    let mut ctx = ctx.clone();
+    let ctx = &mut ctx;
+
     let page_sz = page_size_for_arch(ctx);
 
-    // Step 1: Strip code signature if present (reclaims LC space).
-    let (ncmds, sizeofcmds, available_lc_space) = strip_code_signature(&mut data, ctx);
+    // Step 1: Reclaim LC space by stripping non-essential load commands.
+    // ARM64 split layout needs up to 3 * 72 = 216 bytes (2 segments + LC_ROUTINES_64).
+    let min_lc_space = if ctx.cputype == 0x0100_000C {
+        LC_SEGMENT_64_SIZE as u64 * 3
+    } else {
+        LC_SEGMENT_64_SIZE as u64
+    };
+    let (ncmds, sizeofcmds, available_lc_space) = reclaim_lc_space(&mut data, ctx, min_lc_space);
 
-    // Step 2: Verify we have room for a new LC_SEGMENT_64 (72 bytes).
+    // Step 2: Verify we have room for at least one LC_SEGMENT_64.
     if available_lc_space < LC_SEGMENT_64_SIZE as u64 {
         bail!(
             "insufficient load command space for LC_SEGMENT_64: {} bytes available, {} needed.\n\

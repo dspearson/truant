@@ -204,7 +204,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_detect_arch_x86_64() {
-        // Read a real ELF binary known to be x86-64
         let data = std::fs::read("/usr/bin/true").expect("could not read /usr/bin/true");
         let result = detect_architecture(&data);
         assert!(
@@ -216,5 +215,159 @@ mod tests {
             result.expect("x86_64 architecture detection should succeed"),
             CpuArchitecture::X86_64
         );
+    }
+
+    #[test]
+    fn test_detect_format_macho_cigam64() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+        assert_eq!(detect_format(&data).unwrap(), BinaryFormat::MachO);
+    }
+
+    #[test]
+    fn test_detect_format_fat() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(b"\xca\xfe\xba\xbe");
+        assert_eq!(detect_format(&data).unwrap(), BinaryFormat::Fat);
+    }
+
+    #[test]
+    fn test_detect_format_fat_64() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(b"\xca\xfe\xba\xbf");
+        assert_eq!(detect_format(&data).unwrap(), BinaryFormat::Fat);
+    }
+
+    #[test]
+    fn test_detect_format_pe() {
+        // Minimal MZ + PE signature
+        let mut data = vec![0u8; 128];
+        data[0] = 0x4D; // 'M'
+        data[1] = 0x5A; // 'Z'
+        data[60..64].copy_from_slice(&64u32.to_le_bytes()); // e_lfanew = 64
+        data[64..68].copy_from_slice(b"PE\0\0");
+        assert_eq!(detect_format(&data).unwrap(), BinaryFormat::Pe);
+    }
+
+    #[test]
+    fn test_detect_format_mz_without_pe_sig() {
+        // MZ header but no valid PE signature — still detected as PE
+        let mut data = vec![0u8; 8];
+        data[0] = 0x4D;
+        data[1] = 0x5A;
+        assert_eq!(detect_format(&data).unwrap(), BinaryFormat::Pe);
+    }
+
+    #[test]
+    fn test_detect_format_empty() {
+        assert!(detect_format(&[]).is_err());
+    }
+
+    #[test]
+    fn test_detect_format_three_bytes() {
+        assert!(detect_format(&[0x7f, b'E', b'L']).is_err());
+    }
+
+    #[test]
+    fn test_detect_arch_elf_x86_64() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64
+        assert_eq!(detect_architecture(&data).unwrap(), CpuArchitecture::X86_64);
+    }
+
+    #[test]
+    fn test_detect_arch_elf_aarch64() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[18..20].copy_from_slice(&0xB7u16.to_le_bytes()); // e_machine = EM_AARCH64
+        assert_eq!(
+            detect_architecture(&data).unwrap(),
+            CpuArchitecture::AArch64
+        );
+    }
+
+    #[test]
+    fn test_detect_arch_elf_unsupported() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(b"\x7fELF");
+        data[18..20].copy_from_slice(&0x28u16.to_le_bytes()); // e_machine = EM_ARM (32-bit)
+        assert!(detect_architecture(&data).is_err());
+    }
+
+    #[test]
+    fn test_detect_arch_macho_le_x86_64() {
+        let mut data = vec![0u8; 12];
+        data[0..4].copy_from_slice(b"\xcf\xfa\xed\xfe"); // MH_CIGAM_64 (little-endian)
+        data[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes()); // CPU_TYPE_X86_64
+        assert_eq!(detect_architecture(&data).unwrap(), CpuArchitecture::X86_64);
+    }
+
+    #[test]
+    fn test_detect_arch_macho_le_arm64() {
+        let mut data = vec![0u8; 12];
+        data[0..4].copy_from_slice(b"\xcf\xfa\xed\xfe"); // MH_CIGAM_64 (little-endian)
+        data[4..8].copy_from_slice(&0x0100_000Cu32.to_le_bytes()); // CPU_TYPE_ARM64
+        assert_eq!(
+            detect_architecture(&data).unwrap(),
+            CpuArchitecture::AArch64
+        );
+    }
+
+    #[test]
+    fn test_detect_arch_macho_be_x86_64() {
+        let mut data = vec![0u8; 12];
+        data[0..4].copy_from_slice(b"\xfe\xed\xfa\xcf"); // MH_MAGIC_64 (big-endian)
+        data[4..8].copy_from_slice(&0x0100_0007u32.to_be_bytes()); // CPU_TYPE_X86_64
+        assert_eq!(detect_architecture(&data).unwrap(), CpuArchitecture::X86_64);
+    }
+
+    #[test]
+    fn test_detect_arch_pe_x86_64() {
+        let mut data = vec![0u8; 128];
+        data[0] = 0x4D;
+        data[1] = 0x5A;
+        data[60..64].copy_from_slice(&64u32.to_le_bytes());
+        data[64..68].copy_from_slice(b"PE\0\0");
+        data[68..70].copy_from_slice(&0x8664u16.to_le_bytes()); // IMAGE_FILE_MACHINE_AMD64
+        assert_eq!(detect_architecture(&data).unwrap(), CpuArchitecture::X86_64);
+    }
+
+    #[test]
+    fn test_detect_arch_pe_x86() {
+        let mut data = vec![0u8; 128];
+        data[0] = 0x4D;
+        data[1] = 0x5A;
+        data[60..64].copy_from_slice(&64u32.to_le_bytes());
+        data[64..68].copy_from_slice(b"PE\0\0");
+        data[68..70].copy_from_slice(&0x014Cu16.to_le_bytes()); // IMAGE_FILE_MACHINE_I386
+        assert_eq!(detect_architecture(&data).unwrap(), CpuArchitecture::X86);
+    }
+
+    #[test]
+    fn test_detect_arch_pe_arm64() {
+        let mut data = vec![0u8; 128];
+        data[0] = 0x4D;
+        data[1] = 0x5A;
+        data[60..64].copy_from_slice(&64u32.to_le_bytes());
+        data[64..68].copy_from_slice(b"PE\0\0");
+        data[68..70].copy_from_slice(&0xAA64u16.to_le_bytes()); // IMAGE_FILE_MACHINE_ARM64
+        assert_eq!(
+            detect_architecture(&data).unwrap(),
+            CpuArchitecture::AArch64
+        );
+    }
+
+    #[test]
+    fn test_detect_arch_elf_truncated() {
+        let data = b"\x7fELF"; // 4 bytes — not enough for e_machine at offset 18
+        assert!(detect_architecture(data).is_err());
+    }
+
+    #[test]
+    fn test_detect_arch_fat_errors() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(b"\xca\xfe\xba\xbe");
+        assert!(detect_architecture(&data).is_err()); // Fat needs slice extraction
     }
 }

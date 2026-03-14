@@ -956,6 +956,411 @@ fn test_persistent_wrapper_aarch64_macho() {
 }
 
 // ===========================================================================
+// 11b. Persistent wrapper ARM64 PC-relative relocation
+// ===========================================================================
+
+/// Encode an ADRP instruction: ADRP Xd, #imm (page offset from PC).
+fn encode_adrp(rd: u32, imm_pages: i32) -> [u8; 4] {
+    let imm21 = (imm_pages as u32) & 0x1F_FFFF;
+    let immhi = (imm21 >> 2) & 0x7_FFFF;
+    let immlo = imm21 & 0x3;
+    ((1u32 << 31) | (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd).to_le_bytes()
+}
+
+/// Encode a B instruction: B #offset (in instructions, not bytes).
+fn encode_b_insn(offset_insns: i32) -> [u8; 4] {
+    (0x1400_0000u32 | ((offset_insns as u32) & 0x03FF_FFFF)).to_le_bytes()
+}
+
+/// Encode a BL instruction: BL #offset (in instructions).
+fn encode_bl_insn(offset_insns: i32) -> [u8; 4] {
+    (0x9400_0000u32 | ((offset_insns as u32) & 0x03FF_FFFF)).to_le_bytes()
+}
+
+/// Encode a CBZ instruction: CBZ Xt, #offset (in instructions).
+fn encode_cbz(rt: u32, offset_insns: i32) -> [u8; 4] {
+    let imm19 = (offset_insns as u32) & 0x7_FFFF;
+    (0xB400_0000u32 | (imm19 << 5) | rt).to_le_bytes()
+}
+
+/// Encode a TBZ instruction: TBZ Xt, #bit, #offset (in instructions).
+fn encode_tbz(rt: u32, bit: u32, offset_insns: i32) -> [u8; 4] {
+    let b5 = (bit >> 5) & 1;
+    let b40 = bit & 0x1F;
+    let imm14 = (offset_insns as u32) & 0x3FFF;
+    ((b5 << 31) | (0b011011u32 << 25) | (b40 << 19) | (imm14 << 5) | rt).to_le_bytes()
+}
+
+/// Encode an ADR instruction: ADR Xd, #byte_offset.
+fn encode_adr_insn(rd: u32, byte_offset: i32) -> [u8; 4] {
+    let imm21 = (byte_offset as u32) & 0x1F_FFFF;
+    let immhi = (imm21 >> 2) & 0x7_FFFF;
+    let immlo = imm21 & 0x3;
+    ((immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd).to_le_bytes()
+}
+
+/// Encode a LDR literal instruction: LDR Xt, #offset (in instructions).
+fn encode_ldr_literal(rt: u32, offset_insns: i32) -> [u8; 4] {
+    let imm19 = (offset_insns as u32) & 0x7_FFFF;
+    (0x5800_0000u32 | (imm19 << 5) | rt).to_le_bytes()
+}
+
+/// Generate a Mach-O persistent wrapper with specific displaced bytes and return all
+/// instruction words for inspection.
+fn gen_macho_wrapper_insns(
+    displaced_bytes: &[u8],
+    persistent_addr: u64,
+    wrapper_va: u64,
+) -> Vec<u32> {
+    let wrapper =
+        macho_trampoline::generate_macho_persistent_wrapper_aarch64(&PersistentWrapperParams {
+            wrapper_va,
+            persistent_data_va: wrapper_va + 0x2000,
+            data_va: wrapper_va + 0x4000,
+            persistent_addr,
+            displaced_bytes,
+            displaced_len: displaced_bytes.len(),
+            persistent_count: 100,
+            include_forkserver: false,
+        })
+        .expect("wrapper generation");
+
+    let mut insns = Vec::new();
+    for i in 0..wrapper.code.len() / 4 {
+        let off = i * 4;
+        insns.push(u32::from_le_bytes([
+            wrapper.code[off],
+            wrapper.code[off + 1],
+            wrapper.code[off + 2],
+            wrapper.code[off + 3],
+        ]));
+    }
+    insns
+}
+
+/// Find the index of the displaced instruction in the wrapper by comparing with a
+/// NOP-based wrapper: the first differing instruction is the displaced slot.
+fn find_displaced_index(nop_insns: &[u32], test_insns: &[u32]) -> usize {
+    assert_eq!(
+        nop_insns.len(),
+        test_insns.len(),
+        "wrapper lengths differ: NOP={} vs test={}",
+        nop_insns.len(),
+        test_insns.len()
+    );
+    for i in 0..nop_insns.len() {
+        if nop_insns[i] != test_insns[i] {
+            return i;
+        }
+    }
+    panic!("no difference found between NOP and test wrappers");
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_adrp() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // ADRP x0, #3 (3 pages = 0x3000 forward from persistent_addr)
+    let adrp_bytes = encode_adrp(0, 3);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let adrp_insns = gen_macho_wrapper_insns(&adrp_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &adrp_insns);
+    let relocated = adrp_insns[idx];
+
+    // The ADRP should still be an ADRP (bit 31 set, bits [28:24] = 10000)
+    assert_eq!(
+        relocated & 0x9F00_0000,
+        0x9000_0000,
+        "relocated instruction should still be ADRP, got 0x{:08x}",
+        relocated
+    );
+
+    // Original target page: (persistent_addr & ~0xFFF) + 3 * 0x1000 = 0x103000
+    // New VA of displaced insn: wrapper_va + idx * 4
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let original_target_page = (persistent_addr & !0xFFF) + 3 * 0x1000;
+
+    // Extract the new immediate from the relocated ADRP
+    let rd = relocated & 0x1F;
+    let immlo = (relocated >> 29) & 0x3;
+    let immhi = (relocated >> 5) & 0x7_FFFF;
+    let imm21 = (immhi << 2) | immlo;
+    let imm_signed = ((imm21 as i64) << 43) >> 43; // sign extend 21 bits
+    let new_target_page = ((displaced_va & !0xFFF) as i64 + (imm_signed << 12)) as u64;
+
+    assert_eq!(rd, 0, "destination register should still be x0");
+    assert_eq!(
+        new_target_page, original_target_page,
+        "ADRP should target same page 0x{:x} after relocation, but targets 0x{:x}",
+        original_target_page, new_target_page
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_b() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // B +0x100 (64 instructions forward from persistent_addr)
+    let b_bytes = encode_b_insn(64);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let b_insns = gen_macho_wrapper_insns(&b_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &b_insns);
+    let relocated = b_insns[idx];
+
+    // Should still be a B instruction
+    assert_eq!(
+        relocated & 0xFC00_0000,
+        0x1400_0000,
+        "relocated instruction should still be B, got 0x{:08x}",
+        relocated
+    );
+
+    // Original target: persistent_addr + 64 * 4 = persistent_addr + 0x100
+    let original_target = persistent_addr + 64 * 4;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+
+    // Extract new immediate
+    let imm26 = relocated & 0x03FF_FFFF;
+    let offset_signed = (((imm26 as i64) << 38) >> 38) * 4;
+    let new_target = (displaced_va as i64 + offset_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "B should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_bl() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // BL -0x80 (32 instructions backward from persistent_addr)
+    let bl_bytes = encode_bl_insn(-32);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let bl_insns = gen_macho_wrapper_insns(&bl_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &bl_insns);
+    let relocated = bl_insns[idx];
+
+    assert_eq!(
+        relocated & 0xFC00_0000,
+        0x9400_0000,
+        "relocated instruction should still be BL, got 0x{:08x}",
+        relocated
+    );
+
+    let original_target = (persistent_addr as i64 + (-32 * 4)) as u64;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let imm26 = relocated & 0x03FF_FFFF;
+    let offset_signed = (((imm26 as i64) << 38) >> 38) * 4;
+    let new_target = (displaced_va as i64 + offset_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "BL should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_adr() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // ADR x5, #0x200 (512 bytes forward)
+    let adr_bytes = encode_adr_insn(5, 0x200);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let adr_insns = gen_macho_wrapper_insns(&adr_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &adr_insns);
+    let relocated = adr_insns[idx];
+
+    // Should still be ADR (not ADRP)
+    assert_eq!(
+        relocated & 0x9F00_0000,
+        0x1000_0000,
+        "relocated instruction should still be ADR, got 0x{:08x}",
+        relocated
+    );
+    assert_eq!(
+        relocated & 0x1F,
+        5,
+        "destination register should still be x5"
+    );
+
+    let original_target = persistent_addr + 0x200;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let immlo = (relocated >> 29) & 0x3;
+    let immhi = (relocated >> 5) & 0x7_FFFF;
+    let imm21 = (immhi << 2) | immlo;
+    let imm_signed = ((imm21 as i64) << 43) >> 43;
+    let new_target = (displaced_va as i64 + imm_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "ADR should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_ldr_literal() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // LDR x3, #0x40 (16 instructions forward = 64 bytes)
+    let ldr_bytes = encode_ldr_literal(3, 16);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let ldr_insns = gen_macho_wrapper_insns(&ldr_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &ldr_insns);
+    let relocated = ldr_insns[idx];
+
+    // Should still be LDR literal
+    assert_eq!(
+        relocated & 0xFF00_0000,
+        0x5800_0000,
+        "relocated instruction should still be LDR literal, got 0x{:08x}",
+        relocated
+    );
+    assert_eq!(
+        relocated & 0x1F,
+        3,
+        "destination register should still be x3"
+    );
+
+    let original_target = persistent_addr + 16 * 4;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let imm19 = (relocated >> 5) & 0x7_FFFF;
+    let offset_signed = (((imm19 as i64) << 45) >> 45) * 4;
+    let new_target = (displaced_va as i64 + offset_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "LDR literal should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_cbz() {
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    // CBZ x7, #0x80 (32 instructions forward)
+    let cbz_bytes = encode_cbz(7, 32);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let cbz_insns = gen_macho_wrapper_insns(&cbz_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &cbz_insns);
+    let relocated = cbz_insns[idx];
+
+    // Should still be CBZ (64-bit variant)
+    assert_eq!(
+        relocated & 0xFF00_0000,
+        0xB400_0000,
+        "relocated instruction should still be CBZ, got 0x{:08x}",
+        relocated
+    );
+    assert_eq!(relocated & 0x1F, 7, "register should still be x7");
+
+    let original_target = persistent_addr + 32 * 4;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let imm19 = (relocated >> 5) & 0x7_FFFF;
+    let offset_signed = (((imm19 as i64) << 45) >> 45) * 4;
+    let new_target = (displaced_va as i64 + offset_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "CBZ should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_relocates_tbz() {
+    // TBZ has only ±32 KiB range, so wrapper and persistent_addr must be close.
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_1000u64;
+    // TBZ x2, #5, #0x20 (8 instructions forward)
+    let tbz_bytes = encode_tbz(2, 5, 8);
+    let nop_bytes: [u8; 4] = AARCH64_NOP;
+
+    let nop_insns = gen_macho_wrapper_insns(&nop_bytes, persistent_addr, wrapper_va);
+    let tbz_insns = gen_macho_wrapper_insns(&tbz_bytes, persistent_addr, wrapper_va);
+
+    let idx = find_displaced_index(&nop_insns, &tbz_insns);
+    let relocated = tbz_insns[idx];
+
+    // Should still be TBZ
+    assert_eq!(
+        relocated & 0x7F00_0000,
+        0x3600_0000,
+        "relocated instruction should still be TBZ, got 0x{:08x}",
+        relocated
+    );
+    assert_eq!(relocated & 0x1F, 2, "register should still be x2");
+    assert_eq!((relocated >> 19) & 0x1F, 5, "bit number should still be 5");
+
+    let original_target = persistent_addr + 8 * 4;
+    let displaced_va = wrapper_va + (idx as u64) * 4;
+    let imm14 = (relocated >> 5) & 0x3FFF;
+    let offset_signed = (((imm14 as i64) << 50) >> 50) * 4;
+    let new_target = (displaced_va as i64 + offset_signed) as u64;
+
+    assert_eq!(
+        new_target, original_target,
+        "TBZ should target 0x{:x} after relocation, but targets 0x{:x}",
+        original_target, new_target
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_nop_unchanged() {
+    // A NOP is not PC-relative, so it should be copied verbatim.
+    let persistent_addr = 0x10_0000u64;
+    let wrapper_va = 0x10_8000u64;
+    let nop_insns = gen_macho_wrapper_insns(&AARCH64_NOP, persistent_addr, wrapper_va);
+
+    // NOP = 0xD503201F — verify it appears in the output
+    let nop_word = 0xD503_201Fu32;
+    assert!(
+        nop_insns.contains(&nop_word),
+        "NOP should appear verbatim in wrapper output"
+    );
+}
+
+#[test]
+fn test_macho_persistent_wrapper_identity_relocation() {
+    // When wrapper_va == persistent_addr, PC-relative instructions should be unchanged.
+    let va = 0x10_0000u64;
+    let adrp_bytes = encode_adrp(1, 5);
+    let original_word = u32::from_le_bytes(adrp_bytes);
+
+    let insns = gen_macho_wrapper_insns(&adrp_bytes, va, va);
+    let nop_insns = gen_macho_wrapper_insns(&AARCH64_NOP, va, va);
+
+    let idx = find_displaced_index(&nop_insns, &insns);
+    assert_eq!(
+        insns[idx], original_word,
+        "identity relocation (same VA) should preserve ADRP unchanged: expected 0x{:08x}, got 0x{:08x}",
+        original_word, insns[idx]
+    );
+}
+
+// ===========================================================================
 // 12. Coverage trampoline parity
 // ===========================================================================
 

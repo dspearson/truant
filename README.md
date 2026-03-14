@@ -117,17 +117,22 @@ Your handler receives a pointer to the saved register context:
 #include <stdio.h>
 #include <stdint.h>
 
-// x86_64 RegContext layout (144 bytes):
+// x86_64 RegContext (144 bytes):
 //   +0 rax, +8 rbx, +16 rcx, +24 rdx, +32 rsi, +40 rdi,
-//   +48 rbp, +56 rsp, +64 r8, +72 r9, +80 r10, +88 r11,
-//   +96 r12, +104 r13, +112 r14, +120 r15, +128 rip, +136 rflags
+//   +48 rbp, +56 rsp, +64 r8..+120 r15, +128 rip, +136 rflags
+//
+// AArch64 RegContext (272 bytes):
+//   +0 x0, +8 x1, ... +232 x29/fp, +240 x30/lr, +248 sp, +256 pc, +264 nzcv
 
 void my_pre_handler(uint64_t *regs) {
-    printf("process_input called with rdi=%lx rsi=%lx\n", regs[5], regs[4]);
+    // x86_64: rdi = regs[5], rsi = regs[4]
+    // AArch64: x0 = regs[0], x1 = regs[1]
+    printf("process_input called with arg0=%lx arg1=%lx\n", regs[5], regs[4]);
 }
 
 void my_post_handler(uint64_t *regs) {
-    printf("process_input returned rax=%lx\n", regs[0]);
+    // Return value: rax = regs[0] (x86_64), x0 = regs[0] (AArch64)
+    printf("process_input returned %lx\n", regs[0]);
 }
 ```
 
@@ -245,67 +250,105 @@ truant target.exe -o target_san.exe --heap-san
 - Statically-linked (musl)
 - Shared objects (.so)
 
+### Mach-O details
+
+- Automatically strips non-essential load commands (LC_UUID, LC_BUILD_VERSION, etc.) when header space is insufficient for the new segment, enabling instrumentation of tight system binaries
+- ARM64 displaced instructions are properly relocated (ADRP, ADR, LDR literal, B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ)
+- Universal (fat) binaries: each slice is instrumented independently and re-packaged
+
 ## Architecture
 
 ```
 src/
-  lib.rs                  Orchestration: detect format, dispatch to patchers
-  patcher.rs              Shared PatchResult type
-  hooks.rs                TOML config parsing, symbol resolution (generic + per-format)
-  hook_trampoline.rs      Hook trampoline codegen (TargetAbi dispatch)
-  trampoline.rs           Coverage trampoline + init code (ELF x86_64)
-  detect.rs               Binary format and architecture detection
+  lib.rs                    Orchestration: detect format, dispatch to patchers
+  main.rs                   CLI (clap)
+  detect.rs                 Binary format and architecture detection
+  patcher.rs                Shared PatchResult / InstrumentationOptions types
+  disasm.rs                 ELF basic block detection, shared FNV block ID hash
+  hooks.rs                  TOML config parsing, symbol resolution (all formats)
+  hook_trampoline.rs        Hook trampoline codegen (x86_64 / PE32 / AArch64 dispatch)
+  trampoline.rs             Coverage trampoline + init code (ELF x86_64)
 
-  elf.rs                  ELF parsing (sections, symbols, PLT, allocators)
+  elf.rs                    ELF parsing (sections, symbols, PLT, allocators)
   elf_impl/
-    patcher.rs            ELF patching (new segment via PT_NOTE or phdr append, block patching, heap san)
-    context.rs            ElfBinaryContext wrapper
+    patcher.rs              ELF patching (PT_NOTE segment, block patching, heap san)
+    context.rs              ElfBinaryContext wrapper
 
-  macho.rs                Mach-O parsing (segments, symbols, stubs)
+  macho.rs                  Mach-O parsing (segments, symbols, stubs, LC stripping)
   macho_impl/
-    patcher.rs            Mach-O patching (__TR_COV/__TR_DAT segments, LINKEDIT)
-    context.rs            MachOBinaryContext wrapper
-  macho_disasm.rs         Mach-O basic block detection
-  macho_trampoline.rs     Mach-O init code + persistent mode (x86_64 + AArch64)
-  fat.rs                  Universal (fat) binary support
+    patcher.rs              Mach-O patching (__TR_COV/__TR_DAT, LINKEDIT, LC space reclamation)
+    context.rs              MachOBinaryContext wrapper
+  macho_disasm.rs           Mach-O basic block detection
+  macho_trampoline.rs       Mach-O init code + persistent mode (x86_64 + AArch64)
+  fat.rs                    Universal (fat) binary support
 
-  pe.rs                   PE/COFF parsing (sections, imports, exports, IAT injection)
+  pe.rs                     PE/COFF parsing (sections, imports, exports, IAT)
   pe_impl/
-    patcher.rs            PE patching (.trcov section, PE32/PE64 init code, persistent)
-    context.rs            PeBinaryContext wrapper
-  pe_disasm.rs            PE basic block detection (32-bit + 64-bit)
+    patcher.rs              PE patching (.trcov section, PE32/PE64 init, persistent)
+    context.rs              PeBinaryContext wrapper
+  pe_disasm.rs              PE basic block detection (32-bit + 64-bit)
 
-  preload.rs              Heap sanitiser (LD_PRELOAD / DYLD_INSERT / companion DLL)
-  sidecar_preload.rs      Sidecar memory sanitiser (SHM ring buffer)
-  hook_preload.rs         Companion library for library-based hooks
+  preload.rs                Heap sanitiser (LD_PRELOAD / DYLD_INSERT / companion DLL)
+  sidecar_preload.rs        Sidecar memory sanitiser (SHM ring buffer)
+  hook_preload.rs           Companion library for library-based hooks
 
   arch/
-    x86_64/               x86_64 disassembly + trampoline generation
-    aarch64/              AArch64 disassembly + trampoline generation + hooks
+    x86_64/
+      disasm.rs             x86_64 basic block detection helpers
+      trampoline_gen.rs     x86_64 trampoline generation dispatch
+    aarch64/
+      disasm.rs             AArch64 basic block detection
+      trampoline_gen.rs     Coverage trampoline + persistent mode (AArch64)
+      hook_trampoline.rs    Hook trampoline codegen (AArch64)
+      relocation.rs         PC-relative instruction relocation (ADRP, ADR, B, etc.)
 
-  traits/                 Patcher, Disassembler, TrampolineGenerator traits
-  main.rs                 CLI (clap)
+  traits/
+    patcher.rs              Patcher trait
+    binary_context.rs       BinaryContext trait
+    trampoline_gen.rs       TrampolineGenerator trait
+    disassembler.rs         Disassembler trait
 ```
 
 ## Building and testing
 
 ```sh
 cargo build              # debug build
-cargo test               # 341 tests across 6 test suites (339 pass, 2 require Wine)
-cargo test -- --test-threads=1   # if parallel tests flake (subprocess races)
+cargo test -- --test-threads=1   # 381 tests across 8 test suites
 cargo build --release    # optimised build
 ```
+
+### Test suites
+
+| Suite | Tests | What it covers |
+|-------|-------|----------------|
+| Unit tests (`--lib`) | 270 | Trampoline codegen, hook resolution, parsing, PC-relative relocation, format detection |
+| `feature_parity` | 47 | Code generator parity across x86_64/AArch64, ELF/Mach-O |
+| `hook_e2e` | 20 | Live hook verification: pre/post/replace/return/conditional/toggle/chained/library |
+| `hook_unit` | 13 | Hook modes, coverage exclusion, symbol resolution |
+| `corpus_e2e` | 11 | 24 binary shapes x 7 hook types (~170 combos), multiple optimisation levels |
+| `pe_e2e` | 20 | PE structural validation, headers, entry points, DLL support |
+
+### CI matrix
+
+Tests run on 6 platform/architecture combinations:
+
+| Platform | Architecture | Runner |
+|----------|-------------|--------|
+| Linux | x86_64 | `ubuntu-latest` |
+| Linux | AArch64 | `ubuntu-24.04-arm` |
+| macOS | ARM64 (M-series) | `macos-latest` |
+| macOS | x86_64 (Intel) | `macos-13` |
+| Windows | x86_64 | `windows-latest` |
+
+Hook E2E and corpus tests are arch-portable (x86_64 + AArch64 shellcode).
+macOS CI also instruments a corpus of 20 system binaries (/usr/bin/true through /usr/bin/top).
 
 ### Cross-compiling PE test binaries
 
 PE integration tests require MinGW cross-compilers:
 
 ```sh
-# 64-bit PE tests
-sudo apt install gcc-mingw-w64-x86-64
-
-# 32-bit PE tests
-sudo apt install gcc-mingw-w64-i686
+sudo apt install gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
 ```
 
 Tests skip gracefully if cross-compilers are not available.
