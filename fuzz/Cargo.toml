@@ -1,0 +1,37 @@
+[package]
+name = "truant-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.truant]
+path = ".."
+
+[[bin]]
+name = "fuzz_pe_parse"
+path = "fuzz_targets/fuzz_pe_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_elf_parse"
+path = "fuzz_targets/fuzz_elf_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_macho_parse"
+path = "fuzz_targets/fuzz_macho_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pe_disasm"
+path = "fuzz_targets/fuzz_pe_disasm.rs"
+doc = false
+
+[workspace]
+members = ["."]

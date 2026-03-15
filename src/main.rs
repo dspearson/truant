@@ -177,7 +177,13 @@ fn cmd_rewrite(input: &Path, matches: &clap::ArgMatches) -> Result<()> {
         matches
             .get_one::<PathBuf>("output")
             .cloned()
-            .unwrap_or_else(|| PathBuf::from("/dev/null"))
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    PathBuf::from("NUL")
+                } else {
+                    PathBuf::from("/dev/null")
+                }
+            })
     } else {
         matches
             .get_one::<PathBuf>("output")
@@ -223,6 +229,12 @@ fn cmd_rewrite(input: &Path, matches: &clap::ArgMatches) -> Result<()> {
         no_coverage,
     };
 
+    if validate && no_coverage {
+        anyhow::bail!(
+            "--validate and --no-coverage are incompatible: validation requires coverage edges"
+        );
+    }
+
     #[cfg(all(feature = "coverage", unix))]
     if validate {
         let validated = truant::validate(&config)?;
@@ -244,6 +256,13 @@ fn cmd_rewrite(input: &Path, matches: &clap::ArgMatches) -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    #[cfg(not(all(feature = "coverage", unix)))]
+    if validate {
+        anyhow::bail!(
+            "--validate requires the 'coverage' feature on Unix (compile with: cargo build --features coverage)"
+        );
     }
 
     let result = truant::rewrite(&config)?;

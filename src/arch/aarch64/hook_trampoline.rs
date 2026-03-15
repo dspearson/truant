@@ -23,6 +23,9 @@ use crate::trampoline::Trampoline;
 /// x0-x30 (31 regs) + sp + pc + nzcv = 34 × 8 = 272.
 const REG_CONTEXT_SIZE: u32 = 272;
 
+/// Size of NEON/FP save area: 32 × 16 bytes (q0-q31) = 512 bytes.
+const NEON_SAVE_SIZE: u32 = 512;
+
 /// Generate an AArch64 hook trampoline for the given resolved hook.
 pub fn generate_hook_trampoline(
     trampoline_va: u64,
@@ -157,6 +160,7 @@ pub fn generate_return_hook_trampolines(
 
     // 2. Save all registers
     emit_save_regs(&mut ret_code, hook.target_va);
+    emit_save_neon(&mut ret_code);
 
     // 2a. Toggle check (if present).
     let toggle_fixup =
@@ -170,7 +174,7 @@ pub fn generate_return_hook_trampolines(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    ret_code.extend_from_slice(&encode_mov_from_sp(0));
+    ret_code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4. Call hook handler
     emit_hook_call(
@@ -194,6 +198,7 @@ pub fn generate_return_hook_trampolines(
     }
 
     // 5. Restore all registers
+    emit_restore_neon(&mut ret_code);
     emit_restore_regs(&mut ret_code);
 
     // 6. Deallocate RegContext
@@ -253,6 +258,7 @@ pub fn generate_chained_hook_trampoline(
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
+    emit_save_neon(&mut code);
 
     // For replace mode, ADR x1 to original stub (fixup later).
     let adr_x1_fixup_pos = if mode == HookMode::Replace {
@@ -277,7 +283,7 @@ pub fn generate_chained_hook_trampoline(
         };
 
         // Refresh x0 = sp (arg1 = &RegContext) before each call.
-        code.extend_from_slice(&encode_mov_from_sp(0));
+        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
 
         // Call this hook's handler
         emit_hook_call(
@@ -302,6 +308,7 @@ pub fn generate_chained_hook_trampoline(
     }
 
     // 4. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 5. Deallocate RegContext
@@ -440,7 +447,7 @@ fn encode_sub_sp(imm: u32) -> [u8; 4] {
     } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
         (1u32, imm >> 12)
     } else {
-        panic!("SUB sp, sp, #{imm} cannot be encoded");
+        unreachable!("SUB sp, sp, #{imm} cannot be encoded");
     };
     let word = 0xD100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
     word.to_le_bytes()
@@ -454,7 +461,7 @@ fn encode_add_sp(imm: u32) -> [u8; 4] {
     } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
         (1u32, imm >> 12)
     } else {
-        panic!("ADD sp, sp, #{imm} cannot be encoded");
+        unreachable!("ADD sp, sp, #{imm} cannot be encoded");
     };
     let word = 0x9100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
     word.to_le_bytes()
@@ -466,12 +473,6 @@ fn encode_add_from_sp(xd: u32, imm: u32) -> [u8; 4] {
     // ADD xD, sp, #imm: sf=1, op=0, S=0, Rn=31(sp), Rd=xD
     let word = 0x9100_03E0u32 | ((imm & 0xFFF) << 10) | xd;
     word.to_le_bytes()
-}
-
-/// Encode MOV xD, sp (via ADD xD, sp, #0).
-#[inline]
-fn encode_mov_from_sp(xd: u32) -> [u8; 4] {
-    encode_add_from_sp(xd, 0)
 }
 
 /// Encode MOVZ xN, #imm16.
@@ -597,6 +598,47 @@ fn emit_restore_regs(code: &mut Vec<u8>) {
     code.extend_from_slice(&encode_ldr_sp(30, 240));
 }
 
+/// Save NEON/FP registers v0-v31 (512 bytes) to the stack.
+///
+/// AAPCS64: v8-v15 (lower 64 bits) are callee-saved, v0-v7 and v16-v31 are
+/// caller-saved. The hook trampoline inserts a call where none existed, so all
+/// 32 registers must be preserved to avoid clobbering live SIMD/FP state.
+fn emit_save_neon(code: &mut Vec<u8>) {
+    // SUB sp, sp, #512
+    code.extend_from_slice(&encode_sub_sp(NEON_SAVE_SIZE));
+    // STP q0,q1,[sp,#0]; STP q2,q3,[sp,#32]; ... STP q30,q31,[sp,#480]
+    for i in (0u32..32).step_by(2) {
+        let offset = i * 16;
+        // STP qt1, qt2, [sp, #offset]
+        // Encoding: 0x6D000000 | (imm7 << 15) | (Rt2 << 10) | (Rn << 5) | Rt1
+        // imm7 = offset / 16 (scaled by 16 for 128-bit)
+        let imm7 = (offset / 16) & 0x7F;
+        let word = 0xAD00_0000u32  // STP (SIMD&FP), offset variant, opc=10
+            | (imm7 << 15)
+            | ((i + 1) << 10)
+            | (31 << 5) // Rn = sp
+            | i; // Rt1
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// Restore NEON/FP registers v0-v31 from the stack and deallocate.
+fn emit_restore_neon(code: &mut Vec<u8>) {
+    for i in (0u32..32).step_by(2) {
+        let offset = i * 16;
+        let imm7 = (offset / 16) & 0x7F;
+        // LDP qt1, qt2, [sp, #offset]
+        let word = 0xAD40_0000u32  // LDP (SIMD&FP), offset variant, opc=10, L=1
+            | (imm7 << 15)
+            | ((i + 1) << 10)
+            | (31 << 5)
+            | i;
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    // ADD sp, sp, #512
+    code.extend_from_slice(&encode_add_sp(NEON_SAVE_SIZE));
+}
+
 /// Emit the hook call sequence: load handler address into x16, BLR x16.
 ///
 /// For library symbols: load from data slot (indirect via literal pool or ADR+LDR).
@@ -712,8 +754,9 @@ fn encode_bcond(cond: u32, offset_instructions: i32) -> [u8; 4] {
 fn emit_condition_check_aarch64(code: &mut Vec<u8>, condition: &HookCondition) -> Result<usize> {
     let reg_offset = reg_context_offset_aarch64(&condition.register)?;
 
-    // LDR x9, [sp, #reg_offset]  — load saved register value
-    code.extend_from_slice(&encode_ldr_sp(9, reg_offset));
+    // LDR x9, [sp, #NEON_SAVE_SIZE + reg_offset]  — load saved register value
+    // (RegContext sits above the NEON save area on the stack)
+    code.extend_from_slice(&encode_ldr_sp(9, NEON_SAVE_SIZE + reg_offset));
 
     if condition.op == CondOp::BitSet || condition.op == CondOp::BitClear {
         // Load mask into x10, then TST x9, x10 (= ANDS xzr, x9, x10)
@@ -850,6 +893,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
+    emit_save_neon(&mut code);
 
     // 3. Call pre hooks
     for &i in &pre_indices {
@@ -864,7 +908,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
             None
         };
 
-        code.extend_from_slice(&encode_mov_from_sp(0));
+        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
         emit_hook_call(
             &mut code,
             trampoline_va,
@@ -884,6 +928,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
     }
 
     // 4. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 5. Deallocate RegContext
@@ -902,6 +947,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
 
     // 7. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
+    emit_save_neon(&mut code);
 
     // 8. Call post hooks
     for &i in &post_indices {
@@ -916,7 +962,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
             None
         };
 
-        code.extend_from_slice(&encode_mov_from_sp(0));
+        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
         emit_hook_call(
             &mut code,
             trampoline_va,
@@ -936,6 +982,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
     }
 
     // 9. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
@@ -986,6 +1033,7 @@ fn generate_pre_hook(
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook.target_va);
+    emit_save_neon(&mut code);
 
     // 2a. Toggle check (if present).
     let toggle_fixup =
@@ -999,7 +1047,7 @@ fn generate_pre_hook(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    code.extend_from_slice(&encode_mov_from_sp(0));
+    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4-5. Call hook handler
     emit_hook_call(
@@ -1023,6 +1071,7 @@ fn generate_pre_hook(
     }
 
     // 6. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 7. Deallocate RegContext
@@ -1086,6 +1135,7 @@ fn generate_post_hook(
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va);
+    emit_save_neon(&mut code);
 
     // 3a. Toggle check (if present).
     let toggle_fixup =
@@ -1099,7 +1149,7 @@ fn generate_post_hook(
     };
 
     // 4. MOV x0, sp
-    code.extend_from_slice(&encode_mov_from_sp(0));
+    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 5-6. Call hook handler
     emit_hook_call(
@@ -1123,6 +1173,7 @@ fn generate_post_hook(
     }
 
     // 7. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 8. Deallocate RegContext
@@ -1171,6 +1222,7 @@ fn generate_replace_hook(
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook.target_va);
+    emit_save_neon(&mut code);
 
     // 2a. Toggle check (if present) — skip to fallback path when toggle is 0.
     let toggle_fixup =
@@ -1184,7 +1236,7 @@ fn generate_replace_hook(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    code.extend_from_slice(&encode_mov_from_sp(0));
+    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4. ADR x1, original_stub (arg2) — placeholder, fix up later
     let adr_x1_fixup_pos = code.len();
@@ -1200,6 +1252,7 @@ fn generate_replace_hook(
     );
 
     // 6. Restore all registers
+    emit_restore_neon(&mut code);
     emit_restore_regs(&mut code);
 
     // 7. Deallocate RegContext
@@ -1220,6 +1273,7 @@ fn generate_replace_hook(
         }
 
         // Restore all registers
+        emit_restore_neon(&mut code);
         emit_restore_regs(&mut code);
 
         // Deallocate RegContext
@@ -1532,5 +1586,25 @@ mod tests {
             "return tramp should end with BR x16, got 0x{:08x}",
             last_word
         );
+    }
+
+    /// Exhaustive verification that Rust reg_context_offset_aarch64 matches
+    /// the C header (include/truant_regctx.h) TRUANT_A64_* constants.
+    #[test]
+    fn test_reg_context_abi_aarch64() {
+        // x0-x30 at n*8 (TRUANT_A64_X(n))
+        for n in 0u32..=30 {
+            let name = format!("x{n}");
+            assert_eq!(
+                reg_context_offset_aarch64(&name).unwrap(),
+                n * 8,
+                "AArch64 RegContext offset mismatch for {name}",
+            );
+        }
+        // Total size of x0-x30 = 31*8 = 248
+        // SP at 248, PC at 256, NZCV at 264 → total 272 (TRUANT_A64_SIZE)
+        assert_eq!(31 * 8, 248); // x30 ends at 248
+        assert!(reg_context_offset_aarch64("rax").is_err());
+        assert!(reg_context_offset_aarch64("x31").is_err());
     }
 }

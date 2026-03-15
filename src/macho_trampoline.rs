@@ -1017,7 +1017,7 @@ mod arm64 {
         } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
             (1u32, imm >> 12)
         } else {
-            panic!("SUB sp, sp, #{imm}: immediate too large for single ADD/SUB encoding")
+            unreachable!("SUB sp, sp, #{imm}: immediate too large for single ADD/SUB encoding")
         };
         (0xD100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10)).to_le_bytes()
     }
@@ -1028,7 +1028,7 @@ mod arm64 {
         } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
             (1u32, imm >> 12)
         } else {
-            panic!("ADD sp, sp, #{imm}: immediate too large for single ADD/SUB encoding")
+            unreachable!("ADD sp, sp, #{imm}: immediate too large for single ADD/SUB encoding")
         };
         (0x9100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10)).to_le_bytes()
     }

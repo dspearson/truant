@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use capstone::prelude::*;
 use std::collections::{BTreeSet, HashSet};
 
-use crate::disasm::BasicBlock;
+use crate::disasm::{BasicBlock, DisassemblyResult};
 use crate::traits::{BinaryContext, Disassembler};
 
 /// AArch64 disassembler implementing the Disassembler trait.
@@ -27,7 +27,7 @@ impl Disassembler for AArch64Disassembler {
         binary_data: &[u8],
         ctx: &dyn BinaryContext,
         instrument_modules: &Option<Vec<String>>,
-    ) -> Result<Vec<BasicBlock>> {
+    ) -> Result<DisassemblyResult> {
         // Verify context is a supported type (ELF or Mach-O).
         let is_elf = ctx
             .as_any()
@@ -123,24 +123,17 @@ impl Disassembler for AArch64Disassembler {
                 }
             }
 
-            // Jump table detection: ADRP followed by LDR (same reg) then BR (same reg).
-            // Mark all three instruction addresses as forbidden regions.
+            // Jump table detection: ADRP+LDR+BR patterns use computed branch
+            // targets that can't be statically resolved. Forbid all three.
             if mnemonic == "adrp" && idx + 2 < insn_vec.len() {
-                let next_insn = &insn_vec[idx + 1];
-                let next2_insn = &insn_vec[idx + 2];
-                let next_mnemonic = next_insn.mnemonic().unwrap_or("");
-                let next2_mnemonic = next2_insn.mnemonic().unwrap_or("");
-
-                // Conservative check: ADRP ... LDR ... BR pattern => forbidden region.
-                let is_ldr = next_mnemonic.starts_with("ldr");
-                let is_br = next2_mnemonic == "br";
-
-                if is_ldr && is_br {
+                let next_mnemonic = insn_vec[idx + 1].mnemonic().unwrap_or("");
+                let next2_mnemonic = insn_vec[idx + 2].mnemonic().unwrap_or("");
+                if next_mnemonic.starts_with("ldr") && next2_mnemonic == "br" {
                     forbidden.insert(va);
-                    forbidden.insert(next_insn.address());
-                    forbidden.insert(next2_insn.address());
+                    forbidden.insert(insn_vec[idx + 1].address());
+                    forbidden.insert(insn_vec[idx + 2].address());
                     tracing::debug!(
-                        "AArch64: jump table pattern at 0x{:x} (adrp+ldr+br), marking forbidden",
+                        "AArch64: jump table at 0x{:x} (adrp+ldr+br), marking forbidden",
                         va
                     );
                 }
@@ -166,12 +159,33 @@ impl Disassembler for AArch64Disassembler {
                 continue;
             }
 
-            let displaced_bytes = binary_data[file_offset..file_offset + 4].to_vec();
+            // Check if block starts with ADRP followed by a dependent instruction
+            // (ADD, LDR, STR). If so, displace both (8 bytes) to keep the pair
+            // together — ADRP computes a page address that the next instruction
+            // consumes, so they must be relocated as a unit.
+            let raw = u32::from_le_bytes(
+                binary_data[file_offset..file_offset + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            );
+            let is_adrp = (raw & 0x9F00_0000) == 0x9000_0000;
+            let displaced_len = if is_adrp
+                && file_offset + 8 <= binary_data.len()
+                && !block_starts.contains(&(block_va + 4))
+            {
+                // Verify the next instruction isn't a block start (which would
+                // mean something branches to it independently).
+                8
+            } else {
+                4
+            };
+
+            let displaced_bytes = binary_data[file_offset..file_offset + displaced_len].to_vec();
 
             blocks.push(BasicBlock {
                 va: block_va,
                 file_offset: file_offset as u64,
-                displaced_len: 4,
+                displaced_len,
                 displaced_bytes,
                 block_id: fnv_hash_u16(block_va),
             });
@@ -256,6 +270,9 @@ impl Disassembler for AArch64Disassembler {
             text_size
         );
 
-        Ok(blocks)
+        Ok(DisassemblyResult {
+            blocks,
+            skipped: Vec::new(),
+        })
     }
 }

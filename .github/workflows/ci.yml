@@ -342,6 +342,70 @@ jobs:
           test "$ORIG" = "$REWRITTEN"
           echo "PASS: coverage-rewritten PE produces same output (fib(10)=$ORIG)"
 
+      - name: Install MinGW 32-bit toolchain
+        shell: bash
+        run: |
+          pacman -S --noconfirm mingw-w64-i686-gcc 2>/dev/null || true
+          # Verify installation
+          /c/msys64/mingw32/bin/gcc --version && echo "mingw32 gcc available" || echo "mingw32 gcc not available"
+
+      - name: "PE32: rewrite and execute"
+        shell: bash
+        run: |
+          GCC32=/c/msys64/mingw32/bin/gcc
+          if [ ! -f "$GCC32" ]; then echo "SKIP: mingw32 not available"; exit 0; fi
+          cat > /tmp/pe32_test.c << 'EOF'
+          #include <stdio.h>
+          int main() { printf("pe32 ok\n"); return 0; }
+          EOF
+          $GCC32 -s -o /tmp/pe32_test.exe /tmp/pe32_test.c
+          ./target/debug/truant.exe /tmp/pe32_test.exe -o /tmp/pe32_test_out.exe
+          OUTPUT=$(/tmp/pe32_test_out.exe)
+          test "$OUTPUT" = "pe32 ok"
+          echo "PASS: coverage-rewritten PE32 executed correctly on Windows"
+
+      - name: "PE32: coverage rewrite preserves execution"
+        shell: bash
+        run: |
+          GCC32=/c/msys64/mingw32/bin/gcc
+          if [ ! -f "$GCC32" ]; then echo "SKIP: mingw32 not available"; exit 0; fi
+          cat > /tmp/pe32_fib.c << 'EOF'
+          #include <stdio.h>
+          int fib(int n) { return n <= 1 ? n : fib(n-1) + fib(n-2); }
+          int main() { printf("%d\n", fib(10)); return 0; }
+          EOF
+          $GCC32 -s -o /tmp/pe32_fib.exe /tmp/pe32_fib.c
+          ORIG=$(/tmp/pe32_fib.exe)
+          ./target/debug/truant.exe /tmp/pe32_fib.exe -o /tmp/pe32_fib_out.exe
+          REWRITTEN=$(/tmp/pe32_fib_out.exe)
+          test "$ORIG" = "$REWRITTEN"
+          echo "PASS: coverage-rewritten PE32 produces same output (fib(10)=$ORIG)"
+
+      - name: "PE32: heap-san companion DLL generated"
+        shell: bash
+        run: |
+          GCC32=/c/msys64/mingw32/bin/gcc
+          if [ ! -f "$GCC32" ]; then echo "SKIP: mingw32 not available"; exit 0; fi
+          cat > /tmp/pe32_heap.c << 'EOF'
+          #include <stdlib.h>
+          #include <stdio.h>
+          int main() {
+              char *p = malloc(64);
+              p[0] = 'A';
+              free(p);
+              printf("heap ok\n");
+              return 0;
+          }
+          EOF
+          $GCC32 -s -o /tmp/pe32_heap.exe /tmp/pe32_heap.c
+          ./target/debug/truant.exe /tmp/pe32_heap.exe -o /tmp/pe32_heap_out.exe --heap-san
+          # Verify DLL was generated
+          test -f /tmp/pe32_heap_out.exe.heap_san.dll
+          # Verify the rewritten binary runs (DLL is in same directory)
+          OUTPUT=$(/tmp/pe32_heap_out.exe)
+          test "$OUTPUT" = "heap ok"
+          echo "PASS: PE32 heap-san rewrite + execution on Windows"
+
   # ── Clippy + format ───────────────────────────────────────────
   lint:
     runs-on: ubuntu-latest

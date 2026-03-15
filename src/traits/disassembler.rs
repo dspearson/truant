@@ -1,4 +1,4 @@
-use crate::disasm::BasicBlock;
+use crate::disasm::DisassemblyResult;
 use crate::traits::binary_context::BinaryContext;
 use anyhow::Result;
 
@@ -13,5 +13,5 @@ pub trait Disassembler: Send + Sync + std::fmt::Debug {
         binary_data: &[u8],
         ctx: &dyn BinaryContext,
         instrument_modules: &Option<Vec<String>>,
-    ) -> Result<Vec<BasicBlock>>;
+    ) -> Result<DisassemblyResult>;
 }

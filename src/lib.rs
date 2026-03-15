@@ -8,10 +8,12 @@
 //! instrumentation (SHM bitmaps, forkserver, persistent mode).
 
 pub mod arch;
+pub mod binary_patch;
 pub mod detect;
 pub mod disasm;
 pub mod elf;
 pub mod elf_impl;
+pub mod error;
 pub mod fat;
 pub mod hook_preload;
 pub mod hook_trampoline;
@@ -34,6 +36,7 @@ pub mod trampoline;
 pub use arch::{X86_64Disassembler, X86_64TrampolineGenerator};
 pub use detect::{BinaryFormat, CpuArchitecture, detect_architecture, detect_format};
 pub use elf_impl::{ElfBinaryContext, ElfPatcher};
+pub use error::TruantError;
 pub use macho_impl::{MachOBinaryContext, MachOPatcher};
 pub use pe_impl::{PeBinaryContext, PePatcher};
 
@@ -116,7 +119,7 @@ pub struct ValidateResult {
     pub edge_count: u64,
     /// Number of blocks instrumented in the rewritten binary.
     pub blocks_instrumented: usize,
-    /// Whether validation succeeded (edge_count > 50).
+    /// Whether validation succeeded (edge_count > 0).
     pub success: bool,
     /// Error description if execution failed.
     pub error: Option<String>,
@@ -124,41 +127,42 @@ pub struct ValidateResult {
 
 /// Validate an ELF binary by rewriting to a temp path and running it once.
 ///
-/// Rewrites to `/tmp/truant_validate_<pid>_output`, passes a trivial input file,
+/// Rewrites to a secure temp directory, passes a trivial input file,
 /// sets up a SysV SHM segment, runs the binary, and counts edges.
-/// Returns success when edge_count > 50.
+/// Returns success when edge_count > 0.
 #[cfg(all(feature = "coverage", unix))]
 pub fn validate(config: &RewriteConfig) -> Result<ValidateResult> {
-    let pid = std::process::id();
-    let tmp_output = std::path::PathBuf::from(format!("/tmp/truant_validate_{}_output", pid));
-    let tmp_input = std::path::PathBuf::from(format!("/tmp/truant_validate_{}_input", pid));
+    // Use secure temp files to avoid predictable paths and symlink races.
+    let tmp_dir = tempfile::tempdir().context("failed to create temp directory for validation")?;
+    let tmp_output = tmp_dir.path().join("output");
+    let tmp_input = tmp_dir.path().join("input");
 
     // Write trivial input (16 zero bytes)
     std::fs::write(&tmp_input, [0u8; 16])
         .with_context(|| format!("failed to write temp input {}", tmp_input.display()))?;
 
-    // Build a rewrite config that writes to the temp output (not dry_run, not validate)
+    // Build a rewrite config matching the user's actual settings, but targeting
+    // the temp output and with validate/dry_run disabled to avoid recursion.
     let rewrite_cfg = RewriteConfig {
         input: config.input.clone(),
         output: tmp_output.clone(),
-        forkserver: false,
+        forkserver: config.forkserver,
         dry_run: false,
-        heap_san: false,
-        sidecar_san: false,
-        persistent_addr: None,
-        persistent_count: 1000,
-        defer: false,
+        heap_san: config.heap_san,
+        sidecar_san: config.sidecar_san,
+        persistent_addr: config.persistent_addr,
+        persistent_count: config.persistent_count,
+        defer: config.defer,
         #[cfg(feature = "coverage")]
         validate: false,
         instrument_modules: config.instrument_modules.clone(),
-        hooks: None,
-        no_coverage: false,
+        hooks: config.hooks.clone(),
+        no_coverage: config.no_coverage,
     };
 
     let rewrite_result = match rewrite(&rewrite_cfg) {
         Ok(r) => r,
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp_input);
             anyhow::bail!("rewrite failed during validation: {}", e);
         }
     };
@@ -167,7 +171,12 @@ pub fn validate(config: &RewriteConfig) -> Result<ValidateResult> {
     // Detect if the input is a Mach-O dylib (filetype = MH_DYLIB = 6).
     // For dylibs we cannot run them directly — build a minimal dlopen harness.
     let is_macho_dylib = {
-        let input_data = std::fs::read(&config.input).unwrap_or_default();
+        let input_data = std::fs::read(&config.input).with_context(|| {
+            format!(
+                "failed to read {} for dylib detection",
+                config.input.display()
+            )
+        })?;
         // Mach-O magic: 0xFEEDFACF (64-bit LE) or 0xCEFAEDFE (64-bit BE)
         // MH_DYLIB = 6 at offset 12 (after magic, cputype, cpusubtype)
         if input_data.len() >= 16 {
@@ -180,23 +189,26 @@ pub fn validate(config: &RewriteConfig) -> Result<ValidateResult> {
     };
 
     // Create a 65536-byte SysV SHM segment
+    // SAFETY: shmget with IPC_PRIVATE always creates a new segment; no pointer aliasing.
+    // We check the return value immediately below and bail on failure.
     let shm_id = unsafe { libc::shmget(libc::IPC_PRIVATE, 65536, libc::IPC_CREAT | 0o600) };
     if shm_id < 0 {
-        let _ = std::fs::remove_file(&tmp_input);
-        let _ = std::fs::remove_file(&tmp_output);
         anyhow::bail!("shmget failed (errno={})", std::io::Error::last_os_error());
     }
+    // SAFETY: shm_id is a valid segment ID (checked above). The returned pointer is
+    // valid for 65536 bytes until shmdt. We check for the (void *)-1 error sentinel below.
     let shm_ptr = unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
     if shm_ptr as isize == -1 {
+        // SAFETY: shm_id is valid; IPC_RMID marks the segment for removal after last detach.
         unsafe {
             libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut());
         }
-        let _ = std::fs::remove_file(&tmp_input);
-        let _ = std::fs::remove_file(&tmp_output);
         anyhow::bail!("shmat failed");
     }
 
     // Zero the bitmap before running
+    // SAFETY: shm_ptr is a valid pointer to a 65536-byte SHM segment (shmat succeeded,
+    // checked above). We have exclusive access — no other process has attached yet.
     unsafe {
         std::ptr::write_bytes(shm_ptr as *mut u8, 0, 65536);
     }
@@ -206,11 +218,11 @@ pub fn validate(config: &RewriteConfig) -> Result<ValidateResult> {
     // The dylib init code (called via LC_ROUTINES_64 or __mod_init_func) reads
     // __AFL_SHM_ID from KERN_PROCARGS2, attaches SHM, stores the pointer.
     // Trampolines only fire when code runs, so we must call exported functions.
-    let tmp_harness = std::path::PathBuf::from(format!("/tmp/truant_validate_{}_harness", pid));
     let run_result = if is_macho_dylib {
         #[cfg(target_os = "macos")]
         {
-            let harness_src_path = format!("/tmp/truant_validate_{}_harness.c", pid);
+            let tmp_harness = tmp_dir.path().join("harness");
+            let harness_src_path = tmp_dir.path().join("harness.c");
 
             // Extract exported function symbols from the ORIGINAL input dylib using nm.
             // nm -g -j lists global symbols one per line (just names, no address/type).
@@ -282,7 +294,7 @@ int main(int argc, char **argv) {{
                     tmp_harness
                         .to_str()
                         .ok_or_else(|| anyhow::anyhow!("harness path is not valid UTF-8"))?,
-                    &harness_src_path,
+                    harness_src_path.to_str().unwrap_or(""),
                 ])
                 .status();
             let _ = std::fs::remove_file(&harness_src_path);
@@ -328,19 +340,20 @@ int main(int argc, char **argv) {{
     };
 
     // Count edges before cleanup
+    // SAFETY: shm_ptr is still valid (not yet detached) and points to 65536 bytes.
+    // The child process has exited, so no concurrent writes are possible.
     let bitmap = unsafe { std::slice::from_raw_parts(shm_ptr as *const u8, 65536) };
     let edge_count = bitmap.iter().filter(|&&b| b != 0).count() as u64;
 
     // Cleanup SHM
+    // SAFETY: shm_ptr was returned by a successful shmat and has not been detached.
+    // shmctl IPC_RMID marks the segment for removal once all processes detach.
     unsafe {
         libc::shmdt(shm_ptr);
         libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut());
     }
 
-    // Cleanup temp files
-    let _ = std::fs::remove_file(&tmp_input);
-    let _ = std::fs::remove_file(&tmp_output);
-    let _ = std::fs::remove_file(&tmp_harness);
+    // tmp_dir is cleaned up on drop (tempfile::TempDir).
 
     // Check execution result
     let error = match run_result {
@@ -389,13 +402,12 @@ int main(int argc, char **argv) {{
 }
 
 /// Rewrite an ELF binary with AFL-compatible coverage instrumentation.
-pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
+pub fn rewrite(config: &RewriteConfig) -> error::Result<RewriteResult> {
     let data = std::fs::read(&config.input)
         .with_context(|| format!("failed to read {}", config.input.display()))?;
 
     // Auto-detect binary format
-    let binary_format =
-        detect_format(&data).context("unsupported binary format (not ELF, Mach-O, or PE)")?;
+    let binary_format = detect_format(&data).map_err(|_| TruantError::UnsupportedFormat)?;
 
     tracing::info!(
         "parsing {:?}: {} ({} bytes)",
@@ -406,7 +418,7 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
 
     // Fat binary: extract, instrument each slice, re-package
     if binary_format == BinaryFormat::Fat {
-        return fat::rewrite_fat(config);
+        return fat::rewrite_fat(config).map_err(TruantError::Other);
     }
 
     // Create format-specific context
@@ -446,9 +458,7 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
             }
             #[cfg(not(feature = "aarch64"))]
             {
-                anyhow::bail!(
-                    "AArch64 support requires --features aarch64 (compile with: cargo build --features aarch64)"
-                )
+                return Err(TruantError::UnsupportedFormat);
             }
         }
     };
@@ -457,11 +467,15 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
         tracing::info!("--no-coverage: skipping basic block discovery");
         Vec::new()
     } else {
-        let b = disasm
+        let result = disasm
             .find_basic_blocks(&data, &*ctx, &config.instrument_modules)
             .context("basic block detection failed")?;
-        tracing::info!("detected {} instrumentable basic blocks", b.len());
-        b
+        result.log_skip_summary();
+        tracing::info!(
+            "detected {} instrumentable basic blocks",
+            result.blocks.len()
+        );
+        result.blocks
     };
 
     if config.dry_run {
@@ -482,7 +496,9 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
 
     // Mutual exclusivity check
     if config.heap_san && config.sidecar_san {
-        anyhow::bail!("--heap-san and --sidecar-san are mutually exclusive");
+        return Err(TruantError::InvalidConfig(
+            "--heap-san and --sidecar-san are mutually exclusive".into(),
+        ));
     }
 
     // For dynamically linked binaries, GOT patching only intercepts calls through
@@ -506,9 +522,7 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
             }
             #[cfg(not(feature = "aarch64"))]
             {
-                anyhow::bail!(
-                    "AArch64 support requires --features aarch64 (compile with: cargo build --features aarch64)"
-                )
+                return Err(TruantError::UnsupportedFormat);
             }
         }
     };
@@ -615,6 +629,20 @@ pub fn rewrite(config: &RewriteConfig) -> Result<RewriteResult> {
     // Write output
     std::fs::write(&config.output, &patch_result.data)
         .with_context(|| format!("failed to write {}", config.output.display()))?;
+
+    // Structural validation: re-parse the output to catch header corruption early.
+    let validation_err = match binary_format {
+        BinaryFormat::Pe => pe::PeContext::parse(&patch_result.data).err(),
+        BinaryFormat::Elf => elf::ElfContext::parse(&patch_result.data).err(),
+        BinaryFormat::MachO => macho::MachOContext::parse(&patch_result.data).err(),
+        _ => None,
+    };
+    if let Some(e) = validation_err {
+        return Err(TruantError::CorruptInput {
+            offset: None,
+            message: format!("structural validation failed: rewritten binary is corrupt: {e}"),
+        });
+    }
 
     // Set executable permission
     set_executable(&config.output)?;

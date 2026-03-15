@@ -250,7 +250,9 @@ fn encode_sub_sp_imm(imm: u32) -> [u8; 4] {
     } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
         (1u32, imm >> 12)
     } else {
-        panic!("SUB sp, sp, #{imm} cannot be encoded in a single ADD/SUB immediate instruction");
+        unreachable!(
+            "SUB sp, sp, #{imm} cannot be encoded in a single ADD/SUB immediate instruction"
+        );
     };
     let word = 0xD100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
     word.to_le_bytes()
@@ -266,7 +268,9 @@ fn encode_add_sp_imm(imm: u32) -> [u8; 4] {
     } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
         (1u32, imm >> 12)
     } else {
-        panic!("ADD sp, sp, #{imm} cannot be encoded in a single ADD/SUB immediate instruction");
+        unreachable!(
+            "ADD sp, sp, #{imm} cannot be encoded in a single ADD/SUB immediate instruction"
+        );
     };
     let word = 0x9100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
     word.to_le_bytes()
@@ -408,7 +412,7 @@ fn compute_branch_target(raw: u32, insn_va: u64) -> Option<u64> {
 /// Used to redirect TBZ/TBNZ/CBZ/CBNZ/B.cond to a nearby branch island.
 /// Preserves opcode bits, register, bit number (TBZ/TBNZ), and condition code (B.cond).
 ///
-/// Panics if `raw` is not a recognised conditional branch.
+/// Unreachable if `raw` is not a recognised conditional branch (caller must verify).
 fn rewrite_branch_to_island(raw: u32, island_offset_bytes: i64) -> u32 {
     let is_bcond = (raw & 0xFF00_0010) == 0x5400_0000;
     let is_cbz_cbnz = (raw & 0x7E00_0000) == 0x3400_0000;
@@ -432,7 +436,7 @@ fn rewrite_branch_to_island(raw: u32, island_offset_bytes: i64) -> u32 {
         let new_imm19 = (offset_insns as u32) & 0x7_FFFF;
         0x5400_0000 | (new_imm19 << 5) | cond
     } else {
-        panic!(
+        unreachable!(
             "rewrite_branch_to_island called with non-conditional-branch: 0x{:08x}",
             raw
         );
@@ -628,9 +632,42 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
             } else {
                 code.extend_from_slice(bytes);
             }
+        } else if block.displaced_len == 8 {
+            // Two-instruction displacement (typically ADRP+ADD/LDR/STR pair).
+            // Relocate each instruction independently.
+            for i in 0..2 {
+                let offset = i * 4;
+                let insn_bytes = &block.displaced_bytes[offset..offset + 4];
+                let raw = u32::from_le_bytes([
+                    insn_bytes[0],
+                    insn_bytes[1],
+                    insn_bytes[2],
+                    insn_bytes[3],
+                ]);
+                let original_insn_va = block.va + offset as u64;
+                let displaced_insn_va = trampoline_va + code.len() as u64;
+
+                if is_pc_relative(raw) {
+                    match relocate_pc_relative(raw, original_insn_va, displaced_insn_va) {
+                        Ok(relocated) => {
+                            code.extend_from_slice(&relocated.to_le_bytes());
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "PC-relative relocation failed for instruction {} of pair at 0x{:x}: {e}",
+                                i,
+                                block.va
+                            ));
+                        }
+                    }
+                } else {
+                    code.extend_from_slice(insn_bytes);
+                }
+            }
         } else {
+            // Unexpected length — copy raw bytes as fallback.
             tracing::warn!(
-                "AArch64: unexpected displaced_len={} for block at 0x{:x}, expected 4",
+                "AArch64: unexpected displaced_len={} for block at 0x{:x}",
                 block.displaced_len,
                 block.va
             );

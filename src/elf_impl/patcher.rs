@@ -820,14 +820,17 @@ pub fn patch(
                         //   +32: p_filesz (8 bytes)  — update to new size
                         //   +40: p_memsz  (8 bytes)  — update to new size
                         //   +48: p_align  (8 bytes)  — keep
+                        use crate::binary_patch::PatchSet;
                         let new_filesz = reloc_data.len() as u64;
-                        // File offset: segment appended at file_end, reloc_va offset within segment
                         let new_file_offset = file_end + (reloc_va - segment_va);
-                        data[off + 8..off + 16].copy_from_slice(&new_file_offset.to_le_bytes());
-                        data[off + 16..off + 24].copy_from_slice(&reloc_va.to_le_bytes());
-                        data[off + 24..off + 32].copy_from_slice(&reloc_va.to_le_bytes());
-                        data[off + 32..off + 40].copy_from_slice(&new_filesz.to_le_bytes());
-                        data[off + 40..off + 48].copy_from_slice(&new_filesz.to_le_bytes());
+                        let mut ps = PatchSet::new();
+                        ps.write_u64(off + 8, new_file_offset, "PT_DYNAMIC p_offset");
+                        ps.write_u64(off + 16, reloc_va, "PT_DYNAMIC p_vaddr");
+                        ps.write_u64(off + 24, reloc_va, "PT_DYNAMIC p_paddr");
+                        ps.write_u64(off + 32, new_filesz, "PT_DYNAMIC p_filesz");
+                        ps.write_u64(off + 40, new_filesz, "PT_DYNAMIC p_memsz");
+                        ps.apply(&mut data)
+                            .expect("PT_DYNAMIC patches must not overlap");
                         tracing::info!(
                             "updated PT_DYNAMIC to relocated .dynamic at VA=0x{:x}, offset=0x{:x}, size={}",
                             reloc_va,
@@ -1004,22 +1007,18 @@ fn patch_phdr_note_to_load(
         );
     }
 
-    // p_type = PT_LOAD (1)
-    data[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
-    // p_flags = PF_R | PF_W | PF_X (7)
-    data[off + 4..off + 8].copy_from_slice(&7u32.to_le_bytes());
-    // p_offset = file_offset (where we append)
-    data[off + 8..off + 16].copy_from_slice(&file_offset.to_le_bytes());
-    // p_vaddr = segment_va
-    data[off + 16..off + 24].copy_from_slice(&segment_va.to_le_bytes());
-    // p_paddr = segment_va (same)
-    data[off + 24..off + 32].copy_from_slice(&segment_va.to_le_bytes());
-    // p_filesz = segment_size
-    data[off + 32..off + 40].copy_from_slice(&segment_size.to_le_bytes());
-    // p_memsz = segment_size
-    data[off + 40..off + 48].copy_from_slice(&segment_size.to_le_bytes());
-    // p_align = 0x1000 (page alignment)
-    data[off + 48..off + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    use crate::binary_patch::PatchSet;
+    let mut ps = PatchSet::new();
+    ps.write_u32(off, 1, "p_type (PT_LOAD)");
+    ps.write_u32(off + 4, 7, "p_flags (RWX)");
+    ps.write_u64(off + 8, file_offset, "p_offset");
+    ps.write_u64(off + 16, segment_va, "p_vaddr");
+    ps.write_u64(off + 24, segment_va, "p_paddr");
+    ps.write_u64(off + 32, segment_size, "p_filesz");
+    ps.write_u64(off + 40, segment_size, "p_memsz");
+    ps.write_u64(off + 48, 0x1000, "p_align");
+    ps.apply(data)
+        .context("PT_NOTE→PT_LOAD conversion failed")?;
 
     Ok(())
 }

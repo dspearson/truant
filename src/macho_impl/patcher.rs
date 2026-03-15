@@ -1656,28 +1656,21 @@ fn write_lc_segment_64_named(
     filesize: u64,
     initprot: u32,
 ) {
-    // cmd (4 bytes)
-    data[offset..offset + 4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
-    // cmdsize (4 bytes)
-    data[offset + 4..offset + 8].copy_from_slice(&LC_SEGMENT_64_SIZE.to_le_bytes());
-    // segname (16 bytes, null-padded)
-    data[offset + 8..offset + 24].copy_from_slice(segname);
-    // vmaddr (8 bytes)
-    data[offset + 24..offset + 32].copy_from_slice(&vmaddr.to_le_bytes());
-    // vmsize (8 bytes)
-    data[offset + 32..offset + 40].copy_from_slice(&vmsize.to_le_bytes());
-    // fileoff (8 bytes)
-    data[offset + 40..offset + 48].copy_from_slice(&fileoff.to_le_bytes());
-    // filesize (8 bytes)
-    data[offset + 48..offset + 56].copy_from_slice(&filesize.to_le_bytes());
-    // maxprot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE (0x7)
-    data[offset + 56..offset + 60].copy_from_slice(&7u32.to_le_bytes());
-    // initprot
-    data[offset + 60..offset + 64].copy_from_slice(&initprot.to_le_bytes());
-    // nsects = 0
-    data[offset + 64..offset + 68].copy_from_slice(&0u32.to_le_bytes());
-    // flags = 0
-    data[offset + 68..offset + 72].copy_from_slice(&0u32.to_le_bytes());
+    use crate::binary_patch::PatchSet;
+    let mut ps = PatchSet::new();
+    ps.write_u32(offset, LC_SEGMENT_64, "LC_SEGMENT_64 cmd");
+    ps.write_u32(offset + 4, LC_SEGMENT_64_SIZE, "LC_SEGMENT_64 cmdsize");
+    ps.write(offset + 8, segname, "LC_SEGMENT_64 segname");
+    ps.write_u64(offset + 24, vmaddr, "LC_SEGMENT_64 vmaddr");
+    ps.write_u64(offset + 32, vmsize, "LC_SEGMENT_64 vmsize");
+    ps.write_u64(offset + 40, fileoff, "LC_SEGMENT_64 fileoff");
+    ps.write_u64(offset + 48, filesize, "LC_SEGMENT_64 filesize");
+    ps.write_u32(offset + 56, 7, "LC_SEGMENT_64 maxprot");
+    ps.write_u32(offset + 60, initprot, "LC_SEGMENT_64 initprot");
+    ps.write_u32(offset + 64, 0, "LC_SEGMENT_64 nsects");
+    ps.write_u32(offset + 68, 0, "LC_SEGMENT_64 flags");
+    ps.apply(data)
+        .expect("LC_SEGMENT_64 patches must not overlap");
 }
 
 /// LC_DYLD_CHAINED_FIXUPS cmd value.

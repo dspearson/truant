@@ -14,6 +14,10 @@ fn require_pe(dir: &Path, suffix: &str, src: &str) -> std::path::PathBuf {
     common::compile_pe(dir, suffix, src).expect("x86_64-w64-mingw32-gcc required for PE tests")
 }
 
+fn require_pe32(dir: &Path, suffix: &str, src: &str) -> std::path::PathBuf {
+    common::compile_pe32(dir, suffix, src).expect("i686-w64-mingw32-gcc required for PE32 tests")
+}
+
 /// Read a PE section header by name from raw bytes.
 fn find_section(data: &[u8], name: &str) -> Option<(u32, u32, u32, u32, u32)> {
     if data.len() < 64 {
@@ -729,7 +733,6 @@ int main(void) {
         persistent_count: 1000,
         defer: false,
         #[cfg(feature = "coverage")]
-        #[cfg(feature = "coverage")]
         validate: false,
         instrument_modules: None,
         hooks: None,
@@ -795,7 +798,6 @@ fn pe_heap_san_import_count_increases() {
         persistent_addr: None,
         persistent_count: 1000,
         defer: false,
-        #[cfg(feature = "coverage")]
         #[cfg(feature = "coverage")]
         validate: false,
         instrument_modules: None,
@@ -953,5 +955,473 @@ int main(void) { return 0; }
         "new entry RVA 0x{:x} should be within .trcov (starts at 0x{:x})",
         new_entry_rva,
         trcov_rva,
+    );
+}
+
+// ====================================================================
+// PE32: coverage instrumentation patches .text with JMP rel32
+// ====================================================================
+
+#[test]
+fn pe32_coverage_patches_text_with_jmp() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+int fib(int n) { return n <= 1 ? n : fib(n-1) + fib(n-2); }
+int main(void) { return fib(5); }
+"#;
+    let input = require_pe32(td.path(), "pe32_jmp", src);
+    let output = td.path().join("pe32_jmp_out.exe");
+
+    let result = common::rewrite_pe(&input, &output);
+    assert!(
+        result.blocks_instrumented >= 5,
+        "recursive fib should have >= 5 blocks, got {}",
+        result.blocks_instrumented
+    );
+
+    // Verify .text contains JMP rel32 (E9) instructions targeting .trcov.
+    let data = std::fs::read(&output).unwrap();
+    let ctx = PeContext::parse(&data).unwrap();
+    let trcov = find_section(&data, ".trcov").unwrap();
+    let trcov_rva = trcov.1;
+    let trcov_end_rva = trcov_rva + trcov.0;
+
+    let text_off = ctx.text.offset as usize;
+    let text_size = ctx.text.size as usize;
+    let text_rva = (ctx.text.va - ctx.image_base) as u32;
+    let mut jmp_count = 0;
+    for i in 0..text_size.saturating_sub(4) {
+        if data[text_off + i] == 0xE9 {
+            let rel =
+                i32::from_le_bytes(data[text_off + i + 1..text_off + i + 5].try_into().unwrap());
+            let target_rva = (text_rva as i64 + i as i64 + 5 + rel as i64) as u32;
+            if target_rva >= trcov_rva && target_rva < trcov_end_rva {
+                jmp_count += 1;
+            }
+        }
+    }
+    assert!(
+        jmp_count >= 5,
+        "expected >= 5 JMP patches to .trcov, found {jmp_count}"
+    );
+}
+
+// ====================================================================
+// PE32: ASLR (DYNAMIC_BASE) is disabled after rewrite
+// ====================================================================
+
+#[test]
+fn pe32_rewrite_disables_aslr() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"int main(void) { return 0; }"#;
+    let input = require_pe32(td.path(), "pe32_aslr", src);
+    let output = td.path().join("pe32_aslr_out.exe");
+
+    common::rewrite_pe(&input, &output);
+
+    let data = std::fs::read(&output).unwrap();
+    let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+    let opt = e_lfanew + 4 + 20;
+    // PE32: DllCharacteristics at windows_fields + 42 = opt + 28 + 42 = opt + 70
+    let dll_chars_off = opt + 70;
+    let dll_chars = u16::from_le_bytes(data[dll_chars_off..dll_chars_off + 2].try_into().unwrap());
+    assert_eq!(
+        dll_chars & 0x0040,
+        0,
+        "DYNAMIC_BASE should be cleared for PE32 (DllCharacteristics=0x{:04X})",
+        dll_chars
+    );
+}
+
+// ====================================================================
+// PE32: relocation data directory is zeroed after rewrite
+// ====================================================================
+
+#[test]
+fn pe32_rewrite_zeroes_reloc_directory() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"int main(void) { return 0; }"#;
+    let input = require_pe32(td.path(), "pe32_reloc", src);
+    let output = td.path().join("pe32_reloc_out.exe");
+
+    common::rewrite_pe(&input, &output);
+
+    let data = std::fs::read(&output).unwrap();
+    let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+    let opt = e_lfanew + 4 + 20;
+    // PE32: data dirs at opt + 96, base reloc = entry 5 (at +40 bytes offset)
+    let reloc_dd_off = opt + 96 + 5 * 8;
+    let reloc_rva = u32::from_le_bytes(data[reloc_dd_off..reloc_dd_off + 4].try_into().unwrap());
+    let reloc_size =
+        u32::from_le_bytes(data[reloc_dd_off + 4..reloc_dd_off + 8].try_into().unwrap());
+    assert_eq!(reloc_rva, 0, "base relocation RVA should be zeroed");
+    assert_eq!(reloc_size, 0, "base relocation size should be zeroed");
+}
+
+// ====================================================================
+// PE32: hook shellcode is injected correctly
+// ====================================================================
+
+#[test]
+fn pe32_hook_shellcode_applies() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+__declspec(dllexport) int target_func(void) { return 42; }
+int main(void) { return target_func(); }
+"#;
+    let input = require_pe32(td.path(), "pe32_hook", src);
+    let output = td.path().join("pe32_hook_out.exe");
+    let hooks = common::write_hooks(
+        td.path(),
+        "pe32_hook",
+        r#"
+[[hook]]
+target = "target_func"
+mode = "pre"
+shellcode = [0xC3]
+"#,
+    );
+
+    let result = common::rewrite_pe_hooked(&input, &output, &hooks);
+    assert!(
+        result.hooks_applied > 0,
+        "PE32: should apply at least one hook"
+    );
+
+    let data = std::fs::read(&output).unwrap();
+    let trcov = find_section(&data, ".trcov").unwrap();
+    let section_data = &data[trcov.3 as usize..trcov.3 as usize + trcov.2 as usize];
+    assert!(
+        section_data.contains(&0xC3),
+        "PE32: shellcode byte 0xC3 not found in .trcov section"
+    );
+}
+
+// ====================================================================
+// PE32: auto-strip makes room for .trcov in header-full binaries
+// ====================================================================
+
+#[test]
+fn pe32_auto_strip_creates_room() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"int main(void) { return 0; }"#;
+    // Compile WITHOUT -s (debug info generates many sections that fill the header).
+    let src_path = td.path().join("pe32_strip.c");
+    let bin = td.path().join("pe32_strip.exe");
+    std::fs::write(&src_path, src).unwrap();
+    let status = std::process::Command::new("i686-w64-mingw32-gcc")
+        .args(["-o", bin.to_str().unwrap(), src_path.to_str().unwrap()])
+        .status();
+    let _ = std::fs::remove_file(&src_path);
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+            return;
+        }
+    }
+
+    let output = td.path().join("pe32_strip_out.exe");
+    // This should succeed by auto-stripping debug sections.
+    let result = common::rewrite_pe(&bin, &output);
+    assert!(
+        result.blocks_instrumented > 0,
+        "PE32 auto-strip: should instrument blocks"
+    );
+
+    // The output should have .trcov section.
+    let data = std::fs::read(&output).unwrap();
+    assert!(
+        find_section(&data, ".trcov").is_some(),
+        "PE32 auto-strip: .trcov section not found"
+    );
+}
+
+// ====================================================================
+// PE32: heap sanitiser companion DLL generation + import injection
+// ====================================================================
+
+#[test]
+#[cfg(feature = "coverage")]
+fn pe32_heap_san_dll_generated() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+#include <stdlib.h>
+int main(void) {
+    char *buf = (char *)malloc(64);
+    if (!buf) return 1;
+    buf[0] = 'A';
+    free(buf);
+    return 0;
+}
+"#;
+    let input = require_pe32(td.path(), "pe32_heap", src);
+    let output = td.path().join("pe32_heap_out.exe");
+
+    let config = truant::RewriteConfig {
+        input: input.clone(),
+        output: output.clone(),
+        forkserver: false,
+        dry_run: false,
+        heap_san: true,
+        sidecar_san: false,
+        persistent_addr: None,
+        persistent_count: 1000,
+        defer: false,
+        #[cfg(feature = "coverage")]
+        validate: false,
+        instrument_modules: None,
+        hooks: None,
+        no_coverage: false,
+    };
+
+    truant::rewrite(&config).expect("PE32 rewrite with heap_san failed");
+
+    // Companion DLL should be generated.
+    let dll_path = truant::preload::preload_dll_path(&output);
+    assert!(
+        dll_path.exists(),
+        "PE32 heap_san companion DLL not generated at {:?}",
+        dll_path
+    );
+
+    // DLL should be non-trivial size (> 10 KB).
+    let dll_size = std::fs::metadata(&dll_path).unwrap().len();
+    assert!(
+        dll_size > 10_000,
+        "PE32 heap_san DLL too small: {} bytes",
+        dll_size
+    );
+}
+
+#[test]
+#[cfg(feature = "coverage")]
+fn pe32_heap_san_import_injected() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"int main(void) { return 0; }"#;
+    let input = require_pe32(td.path(), "pe32_heap_imp", src);
+    let output = td.path().join("pe32_heap_imp_out.exe");
+
+    let config = truant::RewriteConfig {
+        input: input.clone(),
+        output: output.clone(),
+        forkserver: false,
+        dry_run: false,
+        heap_san: true,
+        sidecar_san: false,
+        persistent_addr: None,
+        persistent_count: 1000,
+        defer: false,
+        #[cfg(feature = "coverage")]
+        validate: false,
+        instrument_modules: None,
+        hooks: None,
+        no_coverage: false,
+    };
+
+    truant::rewrite(&config).expect("PE32 rewrite with heap_san import failed");
+
+    // .idata2 section should exist (injected import).
+    let data = std::fs::read(&output).unwrap();
+    assert!(
+        find_section(&data, ".idata2").is_some(),
+        "PE32: .idata2 section not found after heap_san injection"
+    );
+
+    // The PE should still be parseable as PE32.
+    let ctx = PeContext::parse(&data).unwrap();
+    assert!(!ctx.is_64bit, "should still be PE32");
+
+    // The .idata2 section should contain the DLL name and export name.
+    let idata2 = find_section(&data, ".idata2").unwrap();
+    let sec_data = &data[idata2.3 as usize..idata2.3 as usize + idata2.2 as usize];
+    assert!(
+        sec_data
+            .windows(b"truant_heap_san_init".len())
+            .any(|w| w == b"truant_heap_san_init"),
+        "PE32: truant_heap_san_init string not found in .idata2"
+    );
+}
+
+// ====================================================================
+// PE32: sidecar sanitiser companion DLL generation + import injection
+// ====================================================================
+
+#[test]
+#[cfg(feature = "coverage")]
+fn pe32_sidecar_san_dll_generated() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+#include <stdlib.h>
+int main(void) {
+    void *p = malloc(32);
+    free(p);
+    return 0;
+}
+"#;
+    let input = require_pe32(td.path(), "pe32_sidecar", src);
+    let output = td.path().join("pe32_sidecar_out.exe");
+
+    let config = truant::RewriteConfig {
+        input: input.clone(),
+        output: output.clone(),
+        forkserver: false,
+        dry_run: false,
+        heap_san: false,
+        sidecar_san: true,
+        persistent_addr: None,
+        persistent_count: 1000,
+        defer: false,
+        #[cfg(feature = "coverage")]
+        validate: false,
+        instrument_modules: None,
+        hooks: None,
+        no_coverage: false,
+    };
+
+    truant::rewrite(&config).expect("PE32 rewrite with sidecar_san failed");
+
+    // Companion DLL should be generated.
+    let dll_path = truant::sidecar_preload::sidecar_preload_dll_path(&output);
+    assert!(
+        dll_path.exists(),
+        "PE32 sidecar_san companion DLL not generated at {:?}",
+        dll_path
+    );
+
+    // .idata2 section should exist.
+    let data = std::fs::read(&output).unwrap();
+    assert!(
+        find_section(&data, ".idata2").is_some(),
+        "PE32: .idata2 section not found after sidecar_san injection"
+    );
+
+    // The PE should still be parseable as PE32.
+    let ctx = PeContext::parse(&data).unwrap();
+    assert!(!ctx.is_64bit, "should still be PE32");
+
+    // The .idata2 section should contain the sidecar DLL name and export.
+    let idata2 = find_section(&data, ".idata2").unwrap();
+    let sec_data = &data[idata2.3 as usize..idata2.3 as usize + idata2.2 as usize];
+    assert!(
+        sec_data
+            .windows(b"truant_sidecar_san_init".len())
+            .any(|w| w == b"truant_sidecar_san_init"),
+        "PE32: truant_sidecar_san_init string not found in .idata2"
+    );
+}
+
+// ====================================================================
+// PE32: no-coverage hook mode works
+// ====================================================================
+
+#[test]
+fn pe32_no_coverage_mode() {
+    if !common::mingw32_available() {
+        eprintln!("SKIP: i686-w64-mingw32-gcc not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+__declspec(dllexport) int target_func(void) { return 42; }
+int main(void) { return target_func(); }
+"#;
+    let input = require_pe32(td.path(), "pe32_nocov", src);
+    let output = td.path().join("pe32_nocov_out.exe");
+    let hooks = common::write_hooks(
+        td.path(),
+        "pe32_nocov",
+        r#"
+[[hook]]
+target = "target_func"
+mode = "pre"
+shellcode = [0xC3]
+"#,
+    );
+
+    let result = common::rewrite_pe_no_cov(&input, &output, &hooks);
+    assert_eq!(
+        result.blocks_instrumented, 0,
+        "PE32 no-coverage: should instrument 0 blocks"
+    );
+    assert!(
+        result.hooks_applied > 0,
+        "PE32 no-coverage: should apply hooks"
+    );
+}
+
+// ====================================================================
+// PE DLL: .reloc section preserved after rewrite
+// ====================================================================
+
+#[test]
+fn pe_dll_rewrite_preserves_reloc() {
+    if !common::mingw_available() {
+        eprintln!("SKIP: mingw not available");
+        return;
+    }
+
+    let td = common::test_dir();
+    let src = r#"
+__declspec(dllexport) int get_val(void) { return 42; }
+"#;
+    let input = common::compile_pe_dll(td.path(), "dll_reloc", src);
+    let input = match input {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: PE DLL compilation failed");
+            return;
+        }
+    };
+    let output = td.path().join("dll_reloc_out.dll");
+
+    common::rewrite_pe(&input, &output);
+
+    let data = std::fs::read(&output).unwrap();
+    let reloc = find_section(&data, ".reloc");
+    assert!(
+        reloc.is_some(),
+        "DLL rewrite should preserve .reloc section"
     );
 }

@@ -8,15 +8,36 @@ use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
 use std::collections::BTreeSet;
 
-use crate::disasm::BasicBlock;
+use crate::disasm::{BasicBlock, DisassemblyResult, SkipReason};
 use crate::pe::{PeContext, va_to_file_offset_pe};
+
+/// Check if an instruction is a NOP variant (alignment padding between functions).
+fn is_nop(instr: &Instruction) -> bool {
+    use iced_x86::Code;
+    matches!(
+        instr.code(),
+        Code::Nopw   // 66 90
+        | Code::Nopd  // 90
+        | Code::Nop_rm16
+        | Code::Nop_rm32
+        | Code::Nop_rm64
+    )
+}
+
+/// Check if an operand kind is a near branch (works for both 32-bit and 64-bit).
+fn is_near_branch(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+    )
+}
 
 /// Detect basic blocks in the .text section of a PE binary.
 pub fn find_basic_blocks_pe(
     ctx: &PeContext,
     data: &[u8],
     instrument_modules: &Option<Vec<String>>,
-) -> Result<Vec<BasicBlock>> {
+) -> Result<DisassemblyResult> {
     let text = &ctx.text;
     let text_start = text.offset as usize;
     let text_end = text_start + text.size as usize;
@@ -59,6 +80,34 @@ pub fn find_basic_blocks_pe(
         }
     }
 
+    // Scan ALL sections (including .text) for potential function pointers.
+    // This catches indirect call targets (CRT init tables, vtables, function pointer
+    // arrays, jump tables) that aren't visible via direct CALL/JMP analysis.
+    // For .text, we only scan at aligned boundaries to reduce false positives.
+    let ptr_size = if ctx.is_64bit { 8 } else { 4 };
+    let text_end_va = text_va.saturating_add(text.size);
+    for section in &ctx.sections {
+        let sec_off = section.raw_offset as usize;
+        let sec_end = sec_off + section.raw_size as usize;
+        if sec_end > data.len() || sec_off >= data.len() {
+            continue;
+        }
+        // Scan every byte offset — function pointer references can appear as
+        // unaligned immediates in x86 instructions (e.g., mov reg, imm32).
+        let mut i = sec_off;
+        while i + ptr_size <= sec_end {
+            let ptr_val = if ctx.is_64bit {
+                u64::from_le_bytes(data[i..i + 8].try_into().unwrap_or([0; 8]))
+            } else {
+                u32::from_le_bytes(data[i..i + 4].try_into().unwrap_or([0; 4])) as u64
+            };
+            if ptr_val >= text_va && ptr_val < text_end_va {
+                branch_targets.insert(ptr_val);
+            }
+            i += 1; // scan every byte offset for unaligned immediates
+        }
+    }
+
     while decoder.can_decode() {
         let instr = decoder.decode();
         if instr.is_invalid() {
@@ -68,7 +117,7 @@ pub fn find_basic_blocks_pe(
 
         match instr.flow_control() {
             FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
-                if instr.op_count() >= 1 && instr.op_kind(0) == OpKind::NearBranch64 {
+                if instr.op_count() >= 1 && is_near_branch(instr.op_kind(0)) {
                     let target = instr.near_branch_target();
                     if target >= text_va && target < text_va + text.size {
                         branch_targets.insert(target);
@@ -87,7 +136,7 @@ pub fn find_basic_blocks_pe(
                 }
             }
             FlowControl::Call => {
-                if instr.op_count() >= 1 && instr.op_kind(0) == OpKind::NearBranch64 {
+                if instr.op_count() >= 1 && is_near_branch(instr.op_kind(0)) {
                     let target = instr.near_branch_target();
                     if target >= text_va && target < text_va + text.size {
                         branch_targets.insert(target);
@@ -103,6 +152,7 @@ pub fn find_basic_blocks_pe(
 
     // Phase 2: build basic blocks from branch targets.
     let mut blocks = Vec::new();
+    let mut skipped: Vec<(u64, SkipReason)> = Vec::new();
     let targets: Vec<u64> = branch_targets.iter().copied().collect();
 
     for &target in &targets {
@@ -115,14 +165,55 @@ pub fn find_basic_blocks_pe(
 
         let file_offset = match va_to_file_offset_pe(target, ctx) {
             Some(off) => off,
-            None => continue,
+            None => {
+                skipped.push((target, SkipReason::NoFileMapping));
+                continue;
+            }
         };
 
         if file_offset >= data.len() {
+            skipped.push((target, SkipReason::NoFileMapping));
             continue;
         }
 
         // Decode instructions at block start to get displaced bytes (>= 5 for JMP rel32).
+        // Skip leading alignment NOPs — these are inter-function padding, and the real
+        // function entry point after the NOPs may be an indirect call target. If the JMP
+        // patch spans the NOP into the function entry, it corrupts the call target.
+        let mut skip_offset = 0usize;
+        let max_nop_skip = 4; // skip up to 4 bytes of alignment NOPs
+        while skip_offset < max_nop_skip && file_offset + skip_offset < data.len() {
+            let remaining = &data[file_offset + skip_offset
+                ..std::cmp::min(file_offset + skip_offset + 15, data.len())];
+            let mut peek = Decoder::with_ip(
+                bitness,
+                remaining,
+                target + skip_offset as u64,
+                DecoderOptions::NONE,
+            );
+            if !peek.can_decode() {
+                break;
+            }
+            let instr = peek.decode();
+            if instr.is_invalid() {
+                break;
+            }
+            if is_nop(&instr) {
+                skip_offset += instr.len();
+            } else {
+                break;
+            }
+        }
+        if skip_offset > 0 && file_offset + skip_offset + 5 <= data.len() {
+            // Ensure the post-NOP address is registered as a branch target so it
+            // doesn't get overwritten by another block's patch.
+            let adjusted_va = target + skip_offset as u64;
+            if !branch_targets.contains(&adjusted_va) {
+                skipped.push((target, SkipReason::AlignmentNop));
+                continue;
+            }
+        }
+
         let remaining = &data[file_offset..std::cmp::min(file_offset + 15, data.len())];
         let mut dec = Decoder::with_ip(bitness, remaining, target, DecoderOptions::NONE);
         let mut total_len = 0usize;
@@ -140,6 +231,7 @@ pub fn find_basic_blocks_pe(
             if uses_rip_relative(&instr) && total_len == 0 {
                 // If the very first instruction is RIP-relative, we can't easily
                 // displace it. Skip this block.
+                skipped.push((target, SkipReason::RipRelativeStart));
                 break;
             }
 
@@ -153,6 +245,7 @@ pub fn find_basic_blocks_pe(
         }
 
         if total_len < 5 {
+            skipped.push((target, SkipReason::TooShort));
             continue;
         }
 
@@ -165,6 +258,7 @@ pub fn find_basic_blocks_pe(
             .next()
             .is_some();
         if has_interior_target {
+            skipped.push((target, SkipReason::InteriorTarget));
             continue;
         }
 
@@ -179,7 +273,7 @@ pub fn find_basic_blocks_pe(
         });
     }
 
-    Ok(blocks)
+    Ok(DisassemblyResult { blocks, skipped })
 }
 
 /// Extract displaced bytes at a given VA for hook patching.

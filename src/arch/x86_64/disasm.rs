@@ -1,4 +1,4 @@
-use crate::disasm::BasicBlock;
+use crate::disasm::DisassemblyResult;
 use crate::traits::{BinaryContext, Disassembler};
 use anyhow::Result;
 
@@ -22,7 +22,7 @@ impl Disassembler for X86_64Disassembler {
         binary_data: &[u8],
         ctx: &dyn BinaryContext,
         instrument_modules: &Option<Vec<String>>,
-    ) -> Result<Vec<BasicBlock>> {
+    ) -> Result<DisassemblyResult> {
         if let Some(elf_ctx) = ctx
             .as_any()
             .downcast_ref::<crate::elf_impl::context::ElfBinaryContext>()

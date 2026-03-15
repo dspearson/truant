@@ -199,9 +199,12 @@ const X86_64_REGS: &[&str] = &[
 ];
 
 /// Validate a register name for the given architecture.
-fn validate_condition_register(register: &str, is_aarch64: bool) -> Result<()> {
+const PE32_REGS: &[&str] = &[
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags",
+];
+
+fn validate_condition_register(register: &str, is_aarch64: bool, is_pe32: bool) -> Result<()> {
     if is_aarch64 {
-        // x0-x30
         if let Some(rest) = register.strip_prefix('x')
             && let Ok(n) = rest.parse::<u32>()
             && n <= 30
@@ -209,6 +212,15 @@ fn validate_condition_register(register: &str, is_aarch64: bool) -> Result<()> {
             return Ok(());
         }
         bail!("invalid AArch64 register '{}' (expected x0-x30)", register);
+    } else if is_pe32 {
+        if PE32_REGS.contains(&register) {
+            return Ok(());
+        }
+        bail!(
+            "invalid PE32 register '{}' (expected one of: {})",
+            register,
+            PE32_REGS.join(", "),
+        );
     } else {
         if X86_64_REGS.contains(&register) {
             return Ok(());
@@ -251,6 +263,10 @@ trait HookResolver {
     fn extract_displaced(&self, index: usize, target: &str, va: u64) -> Result<(Vec<u8>, usize)>;
     /// Whether the target architecture uses AArch64 register names.
     fn is_aarch64(&self) -> bool;
+    /// Whether the target is PE32 (uses x86 32-bit register names).
+    fn is_pe32(&self) -> bool {
+        false
+    }
 }
 
 /// Generic hook resolution using a platform-specific `HookResolver`.
@@ -274,14 +290,13 @@ fn resolve_hooks_generic(
         let file_offset = (target_va - sec_va) + sec_offset;
 
         if let Some(ref cond) = hook.condition {
-            validate_condition_register(&cond.register, resolver.is_aarch64()).with_context(
-                || {
+            validate_condition_register(&cond.register, resolver.is_aarch64(), resolver.is_pe32())
+                .with_context(|| {
                     format!(
                         "hook[{}] (target={}): invalid condition register",
                         i, hook.target,
                     )
-                },
-            )?;
+                })?;
         }
 
         let source = match (&hook.handler, &hook.shellcode) {
@@ -618,6 +633,10 @@ impl HookResolver for PeResolver<'_> {
     fn is_aarch64(&self) -> bool {
         false
     }
+
+    fn is_pe32(&self) -> bool {
+        !self.ctx.is_64bit
+    }
 }
 
 /// Build a map from import function names to their IAT thunk VAs.
@@ -921,11 +940,11 @@ condition = {{ register = "rax", op = "{}", value = 1 }}"#,
 
     #[test]
     fn test_validate_condition_register_x86_64() {
-        assert!(validate_condition_register("rax", false).is_ok());
-        assert!(validate_condition_register("r15", false).is_ok());
-        assert!(validate_condition_register("rdi", false).is_ok());
-        assert!(validate_condition_register("x0", false).is_err());
-        assert!(validate_condition_register("eax", false).is_err());
+        assert!(validate_condition_register("rax", false, false).is_ok());
+        assert!(validate_condition_register("r15", false, false).is_ok());
+        assert!(validate_condition_register("rdi", false, false).is_ok());
+        assert!(validate_condition_register("x0", false, false).is_err());
+        assert!(validate_condition_register("eax", false, false).is_err());
     }
 
     #[test]
@@ -958,10 +977,10 @@ enabled = false
 
     #[test]
     fn test_validate_condition_register_aarch64() {
-        assert!(validate_condition_register("x0", true).is_ok());
-        assert!(validate_condition_register("x30", true).is_ok());
-        assert!(validate_condition_register("x31", true).is_err());
-        assert!(validate_condition_register("rax", true).is_err());
+        assert!(validate_condition_register("x0", true, false).is_ok());
+        assert!(validate_condition_register("x30", true, false).is_ok());
+        assert!(validate_condition_register("x31", true, false).is_err());
+        assert!(validate_condition_register("rax", true, false).is_err());
     }
 
     #[test]

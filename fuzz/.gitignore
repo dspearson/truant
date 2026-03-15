@@ -1,0 +1,5 @@
+target/
+corpus/
+artifacts/
+Cargo.lock
+# seeds/ is checked in — initial corpus for faster coverage discovery

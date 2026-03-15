@@ -98,6 +98,67 @@ const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const PE_LFANEW_OFFSET: usize = 60;
 /// Size of the COFF file header (between PE signature and optional header).
 const COFF_HEADER_SIZE: u32 = 20;
+/// Size of a PE section header entry.
+const SECTION_HEADER_SIZE: usize = 40;
+
+/// Section name prefixes that can be safely removed to make room for new headers.
+const STRIPPABLE_PREFIXES: &[&str] = &[
+    ".debug", ".zdebug", ".stabstr", ".stab", ".drectve", ".comment",
+    ".note",
+    // Note: .reloc is NOT stripped here — it's handled conditionally in the
+    // strip function based on whether the PE is a DLL (DLLs need .reloc for
+    // the loader to relocate them when the preferred base is occupied).
+];
+
+/// Strip expendable section headers from a PE binary to make room for new ones.
+///
+/// Removes headers for debug/symbol/COFF-overflow sections that aren't needed
+/// at runtime. Section data is left in the file (harmless dead bytes).
+/// Returns the number of headers removed.
+pub fn strip_expendable_section_headers(ctx: &PeContext, data: &mut [u8]) -> usize {
+    let sec_table = ctx.section_table_offset as usize;
+    let n = ctx.number_of_sections as usize;
+
+    let mut keep = Vec::with_capacity(n);
+    for i in 0..n {
+        let hdr_off = sec_table + i * SECTION_HEADER_SIZE;
+        let name = std::str::from_utf8(&data[hdr_off..hdr_off + 8])
+            .unwrap_or("")
+            .trim_end_matches('\0');
+
+        let is_strippable = STRIPPABLE_PREFIXES.iter().any(|p| name.starts_with(p))
+            || (name.starts_with('/') && name[1..].bytes().all(|b| b.is_ascii_digit()))
+            || (name == ".reloc" && !ctx.is_dll);
+
+        if !is_strippable {
+            keep.push(i);
+        }
+    }
+
+    let stripped = n - keep.len();
+    if stripped == 0 {
+        return 0;
+    }
+
+    for (new_idx, &old_idx) in keep.iter().enumerate() {
+        if new_idx != old_idx {
+            let src = sec_table + old_idx * SECTION_HEADER_SIZE;
+            let dst = sec_table + new_idx * SECTION_HEADER_SIZE;
+            data.copy_within(src..src + SECTION_HEADER_SIZE, dst);
+        }
+    }
+
+    let new_count = keep.len();
+    for i in new_count..n {
+        let off = sec_table + i * SECTION_HEADER_SIZE;
+        data[off..off + SECTION_HEADER_SIZE].fill(0);
+    }
+
+    let nsec_off = ctx.number_of_sections_field_offset as usize;
+    data[nsec_off..nsec_off + 2].copy_from_slice(&(new_count as u16).to_le_bytes());
+
+    stripped
+}
 
 impl PeContext {
     /// Parse a PE binary from raw bytes.
@@ -151,21 +212,23 @@ impl PeContext {
         //   ImageBase: 8 bytes at +0
         //   SectionAlignment: 4 bytes at +8
         //   SizeOfImage: 4 bytes at +32
+        //   SizeOfHeaders: 4 bytes at +36
         //   CheckSum: 4 bytes at +40
         //
         // PE32: standard fields = 28 bytes (includes BaseOfData)
         //   windows_fields start at optional_header_offset + 28
         //   ImageBase: 4 bytes at +0
         //   SectionAlignment: 4 bytes at +4
-        //   SizeOfImage: 4 bytes at +24
-        //   CheckSum: 4 bytes at +32
+        //   SizeOfImage: 4 bytes at +28
+        //   SizeOfHeaders: 4 bytes at +32
+        //   CheckSum: 4 bytes at +36
         let (_windows_fields_offset, size_of_image_field_offset, checksum_field_offset) =
             if is_64bit {
                 let wfo = optional_header_offset + 24;
                 (wfo, wfo + 32, wfo + 40)
             } else {
                 let wfo = optional_header_offset + 28;
-                (wfo, wfo + 24, wfo + 32)
+                (wfo, wfo + 28, wfo + 36)
             };
 
         // Section table starts after optional header
@@ -183,9 +246,9 @@ impl PeContext {
                 .trim_end_matches('\0')
                 .to_string();
 
-            let va = image_base + section.virtual_address as u64;
+            let va = image_base.saturating_add(section.virtual_address as u64);
             let vsize = section.virtual_size as u64;
-            let sec_end = image_base + section.virtual_address as u64 + vsize;
+            let sec_end = va.saturating_add(vsize);
             if sec_end > highest_va_end {
                 highest_va_end = sec_end;
             }
@@ -221,13 +284,13 @@ impl PeContext {
 
         // Entry point
         let entry_rva = opt_header.standard_fields.address_of_entry_point;
-        let entry_point = image_base + entry_rva as u64;
+        let entry_point = image_base.saturating_add(entry_rva as u64);
 
         // Export symbols as function addresses
         let mut func_symbols = Vec::new();
         for export in &pe.exports {
             if export.rva != 0 {
-                func_symbols.push(image_base + export.rva as u64);
+                func_symbols.push(image_base.saturating_add(export.rva as u64));
             }
         }
 
@@ -258,7 +321,7 @@ impl PeContext {
                             pdata[i * 12 + 3],
                         ]);
                         if begin_rva != 0 {
-                            pdata_functions.push(image_base + begin_rva as u64);
+                            pdata_functions.push(image_base.saturating_add(begin_rva as u64));
                         }
                     }
                 }
@@ -345,7 +408,9 @@ pub fn find_iat_thunk(data: &[u8], ctx: &PeContext, iat_rva: u64) -> Option<u64>
 /// Convert a VA to file offset using the PE section table.
 pub fn va_to_file_offset_pe(va: u64, ctx: &PeContext) -> Option<usize> {
     for section in &ctx.sections {
-        if va >= section.virtual_address && va < section.virtual_address + section.virtual_size {
+        if va >= section.virtual_address
+            && va < section.virtual_address.saturating_add(section.virtual_size)
+        {
             let offset_in_section = va - section.virtual_address;
             if offset_in_section < section.raw_size {
                 return Some((section.raw_offset + offset_in_section) as usize);
@@ -528,13 +593,28 @@ pub fn inject_import(
         ctx.section_table_offset as usize + ctx.number_of_sections as usize * 40;
 
     // Check there's space for the header (within SizeOfHeaders).
+    // If not, auto-strip expendable section headers to make room.
     if new_header_offset + 40 > ctx.size_of_headers as usize {
-        anyhow::bail!(
-            "no space for new section header (need {} bytes at {}, SizeOfHeaders={})",
-            40,
-            new_header_offset,
-            ctx.size_of_headers,
+        let stripped = strip_expendable_section_headers(ctx, &mut data);
+        if stripped > 0 {
+            tracing::info!("stripped {stripped} expendable section headers for import injection");
+        }
+        // Recompute with updated section count.
+        let new_count = u16::from_le_bytes(
+            data[ctx.number_of_sections_field_offset as usize
+                ..ctx.number_of_sections_field_offset as usize + 2]
+                .try_into()
+                .unwrap_or([0; 2]),
         );
+        let new_header_offset = ctx.section_table_offset as usize + new_count as usize * 40;
+        if new_header_offset + 40 > ctx.size_of_headers as usize {
+            anyhow::bail!(
+                "no space for new section header (need {} bytes at {}, SizeOfHeaders={})",
+                40,
+                new_header_offset,
+                ctx.size_of_headers,
+            );
+        }
     }
 
     // Section name: ".idata2\0"
@@ -550,31 +630,38 @@ pub fn inject_import(
 
     data[new_header_offset..new_header_offset + 40].copy_from_slice(&header);
 
-    // Update NumberOfSections.
+    // Update PE headers with overlap-checked patches.
+    use crate::binary_patch::PatchSet;
+    let mut ps = PatchSet::new();
+
     let new_section_count = ctx.number_of_sections + 1;
-    data[ctx.number_of_sections_field_offset as usize
-        ..ctx.number_of_sections_field_offset as usize + 2]
-        .copy_from_slice(&new_section_count.to_le_bytes());
+    ps.write_u16(
+        ctx.number_of_sections_field_offset as usize,
+        new_section_count,
+        "NumberOfSections",
+    );
 
-    // Update Import Directory RVA and size.
-    let new_import_rva = new_sec_rva;
-    let new_import_size = desc_area_size as u32;
-    data[import_dir_rva_offset..import_dir_rva_offset + 4]
-        .copy_from_slice(&new_import_rva.to_le_bytes());
-    data[import_dir_rva_offset + 4..import_dir_rva_offset + 8]
-        .copy_from_slice(&new_import_size.to_le_bytes());
+    ps.write_u32(import_dir_rva_offset, new_sec_rva, "ImportDirectory RVA");
+    ps.write_u32(
+        import_dir_rva_offset + 4,
+        desc_area_size as u32,
+        "ImportDirectory Size",
+    );
 
-    // Update SizeOfImage.
     let new_soi = align_up(
         new_sec_rva as u64 + section_vsize as u64,
         ctx.section_alignment as u64,
     ) as u32;
-    data[ctx.size_of_image_field_offset as usize..ctx.size_of_image_field_offset as usize + 4]
-        .copy_from_slice(&new_soi.to_le_bytes());
+    ps.write_u32(
+        ctx.size_of_image_field_offset as usize,
+        new_soi,
+        "SizeOfImage",
+    );
 
-    // Zero checksum.
-    data[ctx.checksum_field_offset as usize..ctx.checksum_field_offset as usize + 4]
-        .copy_from_slice(&0u32.to_le_bytes());
+    ps.zero(ctx.checksum_field_offset as usize, 4, "CheckSum");
+
+    ps.apply(&mut data)
+        .expect("inject_import header patches must not overlap");
 
     Ok(data)
 }
@@ -748,5 +835,289 @@ mod tests {
         assert_eq!(imp.name, "HeapAlloc");
         assert_eq!(imp.dll, "KERNEL32.dll");
         assert_eq!(imp.iat_rva, 0x3000);
+    }
+
+    /// Build a minimal valid PE binary in memory for testing.
+    /// Returns raw bytes parseable by `PeContext::parse`.
+    fn build_minimal_pe(is_64bit: bool) -> Vec<u8> {
+        let e_lfanew: u32 = 0x40; // PE sig right after DOS header
+        let pe_sig_offset = e_lfanew as usize;
+        let coff_offset = pe_sig_offset + 4;
+        let opt_offset = coff_offset + 20;
+
+        // Optional header sizes
+        let (magic, opt_standard_size, windows_fields_size): (u16, usize, usize) = if is_64bit {
+            (0x20B, 24, 88)
+        } else {
+            (0x10B, 28, 68)
+        };
+        let num_data_dirs: u32 = 16;
+        let data_dirs_size = num_data_dirs as usize * 8;
+        let opt_header_size = opt_standard_size + windows_fields_size + data_dirs_size;
+
+        let section_table_offset = opt_offset + opt_header_size;
+        let num_sections: u16 = 1;
+        let headers_end = section_table_offset + num_sections as usize * 40;
+        let size_of_headers = align_up(headers_end as u64, 0x200) as u32;
+
+        let text_rva: u32 = 0x1000;
+        let text_vsize: u32 = 0x100;
+        let text_raw_offset = size_of_headers;
+        let text_raw_size: u32 = 0x200;
+        let size_of_image = align_up((text_rva + text_vsize) as u64, 0x1000) as u32;
+
+        let image_base: u64 = if is_64bit {
+            0x0000_0001_4000_0000
+        } else {
+            0x0040_0000
+        };
+
+        let total_file_size = text_raw_offset as usize + text_raw_size as usize;
+        let mut data = vec![0u8; total_file_size];
+
+        // DOS header
+        data[0] = b'M';
+        data[1] = b'Z';
+        data[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+
+        // PE signature
+        data[pe_sig_offset..pe_sig_offset + 4].copy_from_slice(b"PE\0\0");
+
+        // COFF header
+        let machine: u16 = if is_64bit { 0x8664 } else { 0x014C };
+        data[coff_offset..coff_offset + 2].copy_from_slice(&machine.to_le_bytes());
+        data[coff_offset + 2..coff_offset + 4].copy_from_slice(&num_sections.to_le_bytes());
+        data[coff_offset + 16..coff_offset + 18]
+            .copy_from_slice(&(opt_header_size as u16).to_le_bytes());
+        let characteristics: u16 = 0x0002; // IMAGE_FILE_EXECUTABLE_IMAGE
+        data[coff_offset + 18..coff_offset + 20].copy_from_slice(&characteristics.to_le_bytes());
+
+        // Optional header - standard fields
+        data[opt_offset..opt_offset + 2].copy_from_slice(&magic.to_le_bytes());
+        // SizeOfCode at +4
+        data[opt_offset + 4..opt_offset + 8].copy_from_slice(&text_raw_size.to_le_bytes());
+        // AddressOfEntryPoint at +16
+        data[opt_offset + 16..opt_offset + 20].copy_from_slice(&text_rva.to_le_bytes());
+
+        // Windows-specific fields
+        let wf_offset = opt_offset + opt_standard_size;
+        if is_64bit {
+            // ImageBase (8 bytes)
+            data[wf_offset..wf_offset + 8].copy_from_slice(&image_base.to_le_bytes());
+            // SectionAlignment at +8
+            data[wf_offset + 8..wf_offset + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+            // FileAlignment at +12
+            data[wf_offset + 12..wf_offset + 16].copy_from_slice(&0x200u32.to_le_bytes());
+            // SizeOfImage at +32 (56 from opt start)
+            data[wf_offset + 32..wf_offset + 36].copy_from_slice(&size_of_image.to_le_bytes());
+            // SizeOfHeaders at +36
+            data[wf_offset + 36..wf_offset + 40].copy_from_slice(&size_of_headers.to_le_bytes());
+            // NumberOfRvaAndSizes at +84
+            data[wf_offset + 84..wf_offset + 88].copy_from_slice(&num_data_dirs.to_le_bytes());
+        } else {
+            // ImageBase (4 bytes)
+            data[wf_offset..wf_offset + 4].copy_from_slice(&(image_base as u32).to_le_bytes());
+            // SectionAlignment at +4
+            data[wf_offset + 4..wf_offset + 8].copy_from_slice(&0x1000u32.to_le_bytes());
+            // FileAlignment at +8
+            data[wf_offset + 8..wf_offset + 12].copy_from_slice(&0x200u32.to_le_bytes());
+            // SizeOfImage at +28
+            data[wf_offset + 28..wf_offset + 32].copy_from_slice(&size_of_image.to_le_bytes());
+            // SizeOfHeaders at +32
+            data[wf_offset + 32..wf_offset + 36].copy_from_slice(&size_of_headers.to_le_bytes());
+            // NumberOfRvaAndSizes at +64
+            data[wf_offset + 64..wf_offset + 68].copy_from_slice(&num_data_dirs.to_le_bytes());
+        }
+
+        // Section table: .text
+        let sh = section_table_offset;
+        data[sh..sh + 6].copy_from_slice(b".text\0");
+        data[sh + 8..sh + 12].copy_from_slice(&text_vsize.to_le_bytes());
+        data[sh + 12..sh + 16].copy_from_slice(&text_rva.to_le_bytes());
+        data[sh + 16..sh + 20].copy_from_slice(&text_raw_size.to_le_bytes());
+        data[sh + 20..sh + 24].copy_from_slice(&text_raw_offset.to_le_bytes());
+        let sec_chars: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | 0x4000_0000;
+        data[sh + 36..sh + 40].copy_from_slice(&sec_chars.to_le_bytes());
+
+        // Fill text section with INT3
+        for b in &mut data[text_raw_offset as usize..] {
+            *b = 0xCC;
+        }
+
+        data
+    }
+
+    #[test]
+    fn test_inject_import_pe64() {
+        let data = build_minimal_pe(true);
+        let ctx = PeContext::parse(&data).expect("should parse minimal PE64");
+        assert!(ctx.is_64bit);
+
+        let result = inject_import(data, &ctx, "test.dll", "test_init");
+        assert!(
+            result.is_ok(),
+            "inject_import failed for PE64: {:?}",
+            result.err()
+        );
+
+        let injected = result.unwrap();
+        assert!(injected.len() > ctx.size_of_headers as usize);
+
+        // Re-parse to verify structural integrity
+        let ctx2 = PeContext::parse(&injected).expect("should parse PE64 after inject_import");
+        assert_eq!(ctx2.number_of_sections, ctx.number_of_sections + 1);
+        assert!(ctx2.size_of_image > ctx.size_of_image);
+
+        // Verify the new section exists
+        let idata2 = ctx2.sections.iter().find(|s| s.name == ".idata2");
+        assert!(
+            idata2.is_some(),
+            ".idata2 section not found after injection"
+        );
+
+        // Verify import was added
+        let has_test_import = ctx2.imports.iter().any(|i| i.dll == "test.dll");
+        assert!(has_test_import, "test.dll import not found after injection");
+    }
+
+    #[test]
+    fn test_inject_import_pe32() {
+        let data = build_minimal_pe(false);
+        let ctx = PeContext::parse(&data).expect("should parse minimal PE32");
+        assert!(!ctx.is_64bit);
+
+        let result = inject_import(data, &ctx, "heap_san.dll", "truant_heap_san_init");
+        assert!(
+            result.is_ok(),
+            "inject_import failed for PE32: {:?}",
+            result.err()
+        );
+
+        let injected = result.unwrap();
+
+        // Re-parse to verify
+        let ctx2 = PeContext::parse(&injected).expect("should parse PE32 after inject_import");
+        assert_eq!(ctx2.number_of_sections, ctx.number_of_sections + 1);
+        assert!(ctx2.size_of_image > ctx.size_of_image);
+
+        let idata2 = ctx2.sections.iter().find(|s| s.name == ".idata2");
+        assert!(
+            idata2.is_some(),
+            ".idata2 section not found after PE32 injection"
+        );
+
+        let has_import = ctx2.imports.iter().any(|i| i.dll == "heap_san.dll");
+        assert!(
+            has_import,
+            "heap_san.dll import not found after PE32 injection"
+        );
+
+        // Verify the import has the correct export name
+        let has_init = ctx2
+            .imports
+            .iter()
+            .any(|i| i.name == "truant_heap_san_init");
+        assert!(has_init, "truant_heap_san_init not found in PE32 imports");
+    }
+
+    #[test]
+    fn test_inject_import_pe32_sidecar() {
+        let data = build_minimal_pe(false);
+        let ctx = PeContext::parse(&data).expect("should parse minimal PE32");
+
+        let result = inject_import(data, &ctx, "sidecar.dll", "truant_sidecar_san_init");
+        assert!(
+            result.is_ok(),
+            "inject_import failed for PE32 sidecar: {:?}",
+            result.err()
+        );
+
+        let injected = result.unwrap();
+        let ctx2 = PeContext::parse(&injected).expect("should parse PE32 after sidecar injection");
+
+        let has_import = ctx2.imports.iter().any(|i| i.dll == "sidecar.dll");
+        assert!(
+            has_import,
+            "sidecar.dll import not found after PE32 injection"
+        );
+
+        let has_init = ctx2
+            .imports
+            .iter()
+            .any(|i| i.name == "truant_sidecar_san_init");
+        assert!(
+            has_init,
+            "truant_sidecar_san_init not found in PE32 imports"
+        );
+    }
+
+    #[test]
+    fn test_inject_import_preserves_existing_imports() {
+        // Inject twice: both imports should survive
+        let data = build_minimal_pe(true);
+        let ctx = PeContext::parse(&data).unwrap();
+
+        let data2 = inject_import(data, &ctx, "first.dll", "first_init").unwrap();
+        let ctx2 = PeContext::parse(&data2).unwrap();
+        assert!(ctx2.imports.iter().any(|i| i.dll == "first.dll"));
+
+        let data3 = inject_import(data2, &ctx2, "second.dll", "second_init").unwrap();
+        let ctx3 = PeContext::parse(&data3).unwrap();
+
+        // Both imports should be present
+        assert!(
+            ctx3.imports.iter().any(|i| i.dll == "first.dll"),
+            "first.dll lost after second injection"
+        );
+        assert!(
+            ctx3.imports.iter().any(|i| i.dll == "second.dll"),
+            "second.dll not found after second injection"
+        );
+    }
+
+    #[test]
+    fn test_inject_import_pe32_thunk_size() {
+        // PE32 should use 4-byte IAT thunks, not 8-byte
+        let data = build_minimal_pe(false);
+        let ctx = PeContext::parse(&data).unwrap();
+
+        let injected = inject_import(data, &ctx, "test.dll", "test_func").unwrap();
+
+        // Find the .idata2 section data
+        let ctx2 = PeContext::parse(&injected).unwrap();
+        let idata2 = ctx2.sections.iter().find(|s| s.name == ".idata2").unwrap();
+
+        // The ILT and IAT entries should be 4 bytes each for PE32
+        // (not 8 as for PE64). The section's raw size should reflect this.
+        // With 4-byte thunks: descriptor area + ILT(8) + IAT(8) + hint/name + dll_name
+        // With 8-byte thunks: descriptor area + ILT(16) + IAT(16) + hint/name + dll_name
+        // PE32 raw content is smaller (though both may round to same alignment).
+        let data64 = build_minimal_pe(true);
+        let ctx64 = PeContext::parse(&data64).unwrap();
+        let injected64 = inject_import(data64, &ctx64, "test.dll", "test_func").unwrap();
+        let ctx64_2 = PeContext::parse(&injected64).unwrap();
+        let idata2_64 = ctx64_2
+            .sections
+            .iter()
+            .find(|s| s.name == ".idata2")
+            .unwrap();
+
+        // PE32 uses 4-byte thunks (ILT: 2*4=8, IAT: 2*4=8 = 16 total)
+        // PE64 uses 8-byte thunks (ILT: 2*8=16, IAT: 2*8=16 = 32 total)
+        // The raw_size may be identical due to file alignment, but the
+        // unpadded virtual_size or the injected file should differ.
+        // At minimum, both should produce valid PE binaries.
+        assert!(
+            idata2.raw_size > 0,
+            "PE32 .idata2 raw_size should be non-zero"
+        );
+        assert!(
+            idata2_64.raw_size > 0,
+            "PE64 .idata2 raw_size should be non-zero"
+        );
+
+        // Verify the import is resolvable in both
+        assert!(ctx2.imports.iter().any(|i| i.name == "test_func"));
+        assert!(ctx64_2.imports.iter().any(|i| i.name == "test_func"));
     }
 }

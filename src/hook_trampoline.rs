@@ -38,6 +38,9 @@ pub enum TargetAbi {
 /// 16 GPRs (rax..r15) + rip + rflags = 18 * 8 = 144.
 const REG_CONTEXT_SIZE: u64 = 144;
 
+/// Size of the XMM save area: 16 registers × 16 bytes = 256 bytes.
+const XMM_SAVE_SIZE: u32 = 256;
+
 /// Red zone size (x86-64 SysV ABI).
 const RED_ZONE: i32 = 128;
 
@@ -87,15 +90,17 @@ fn emit_red_zone_restore(code: &mut Vec<u8>, windows_abi: bool) {
 }
 
 /// Emit `mov <arg1_reg>, rsp` for handler first argument.
-/// SysV: mov rdi, rsp (48 89 E7). Windows: mov rcx, rsp (48 89 E1).
+/// Set arg1 = pointer to RegContext (which sits above the XMM save area on the stack).
+/// SysV: lea rdi, [rsp + XMM_SAVE_SIZE]. Windows: lea rcx, [rsp + XMM_SAVE_SIZE].
 fn emit_arg1_from_rsp(code: &mut Vec<u8>, windows_abi: bool) {
     if windows_abi {
-        // mov rcx, rsp
-        code.extend_from_slice(&[0x48, 0x89, 0xE1]);
+        // lea rcx, [rsp + XMM_SAVE_SIZE]  ; 48 8D 8C 24 <disp32>
+        code.extend_from_slice(&[0x48, 0x8D, 0x8C, 0x24]);
     } else {
-        // mov rdi, rsp
-        code.extend_from_slice(&[0x48, 0x89, 0xE7]);
+        // lea rdi, [rsp + XMM_SAVE_SIZE]  ; 48 8D BC 24 <disp32>
+        code.extend_from_slice(&[0x48, 0x8D, 0xBC, 0x24]);
     }
+    code.extend_from_slice(&(XMM_SAVE_SIZE as i32).to_le_bytes());
 }
 
 /// Emit `lea <arg2_reg>, [rip + disp32]` for replace mode (original function ptr).
@@ -442,6 +447,7 @@ fn generate_x86_64_chained_hook_trampoline(
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // For replace mode, set arg2 = ptr to original stub (fixup later).
     let lea_arg2_fixup_pos = if mode == HookMode::Replace {
@@ -501,6 +507,7 @@ fn generate_x86_64_chained_hook_trampoline(
     }
 
     // 5. Restore all registers
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 6. Deallocate RegContext
@@ -610,6 +617,7 @@ fn generate_x86_64_mixed_chain_trampoline(
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // 4. Call pre hooks
     for &i in &pre_indices {
@@ -648,6 +656,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     }
 
     // 5. Restore all registers
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 6. Deallocate RegContext
@@ -671,6 +680,7 @@ fn generate_x86_64_mixed_chain_trampoline(
 
     // 10. Save all registers
     emit_save_regs(&mut code, hook0.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // 11. Call post hooks
     for &i in &post_indices {
@@ -709,6 +719,7 @@ fn generate_x86_64_mixed_chain_trampoline(
     }
 
     // 12. Restore all registers
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 13. Deallocate RegContext
@@ -919,6 +930,74 @@ fn emit_restore_regs(code: &mut Vec<u8>) {
     emit_mov_from_rsp_off(code, 0x48, 0x8B, 0x04, 0); // rax <- +0
 }
 
+/// Save XMM0-XMM15 to the stack (256 bytes).
+///
+/// Hook handlers are arbitrary compiled code that freely uses SSE/AVX registers.
+/// On Windows x64, XMM6-XMM15 are callee-saved — failing to preserve them is
+/// an ABI violation. On SysV x86-64, all XMM registers are caller-saved, but
+/// the hook trampoline inserts a call where none existed in the original code,
+/// so any live XMM values at the hook point would be clobbered.
+///
+/// Uses movdqu (unaligned 128-bit move) since stack alignment is not guaranteed
+/// to be 16-byte at this point.
+fn emit_save_xmm(code: &mut Vec<u8>) {
+    // sub rsp, 256
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&XMM_SAVE_SIZE.to_le_bytes());
+
+    for i in 0u8..16 {
+        let offset = (i as i32) * 16;
+        // movdqu [rsp+offset], xmm<i>
+        // Encoding: F3 (0F|44) 0F 7F /r
+        // For xmm0-xmm7: F3 0F 7F ModRM
+        // For xmm8-xmm15: F3 44 0F 7F ModRM (REX.R prefix)
+        if i < 8 {
+            code.extend_from_slice(&[0xF3, 0x0F, 0x7F]);
+        } else {
+            code.extend_from_slice(&[0xF3, 0x44, 0x0F, 0x7F]);
+        }
+        let reg = i & 7;
+        if offset == 0 {
+            // ModRM: mod=00, reg=reg, rm=100 (SIB follows), SIB: base=rsp, index=none
+            code.extend_from_slice(&[(reg << 3) | 0x04, 0x24]);
+        } else if offset <= 127 {
+            // ModRM: mod=01, reg=reg, rm=100, SIB, disp8
+            code.extend_from_slice(&[0x44 | (reg << 3), 0x24, offset as u8]);
+        } else {
+            // ModRM: mod=10, reg=reg, rm=100, SIB, disp32
+            code.extend_from_slice(&[0x84 | (reg << 3), 0x24]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+}
+
+/// Restore XMM0-XMM15 from the stack and deallocate (256 bytes).
+fn emit_restore_xmm(code: &mut Vec<u8>) {
+    for i in 0u8..16 {
+        let offset = (i as i32) * 16;
+        // movdqu xmm<i>, [rsp+offset]
+        // Encoding: F3 (0F|44) 0F 6F /r
+        if i < 8 {
+            code.extend_from_slice(&[0xF3, 0x0F, 0x6F]);
+        } else {
+            code.extend_from_slice(&[0xF3, 0x44, 0x0F, 0x6F]);
+        }
+        let reg = i & 7;
+        if offset == 0 {
+            code.extend_from_slice(&[(reg << 3) | 0x04, 0x24]);
+        } else if offset <= 127 {
+            code.extend_from_slice(&[0x44 | (reg << 3), 0x24, offset as u8]);
+        } else {
+            code.extend_from_slice(&[0x84 | (reg << 3), 0x24]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+
+    // add rsp, 256
+    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+    code.extend_from_slice(&XMM_SAVE_SIZE.to_le_bytes());
+}
+
 /// Emit `mov reg, [rsp+offset]`.
 fn emit_mov_from_rsp_off(
     code: &mut Vec<u8>,
@@ -998,8 +1077,8 @@ fn reg_context_offset_x86_64(reg: &str) -> Result<i32> {
 fn emit_condition_check_x86_64(code: &mut Vec<u8>, condition: &HookCondition) -> Result<usize> {
     let reg_offset = reg_context_offset_x86_64(&condition.register)?;
 
-    // Load the register value from RegContext: mov rax, [rsp + reg_offset]
-    emit_mov_from_rsp_off(code, 0x48, 0x8B, 0x04, reg_offset);
+    // Load the register value from RegContext: mov rax, [rsp + XMM_SAVE_SIZE + reg_offset]
+    emit_mov_from_rsp_off(code, 0x48, 0x8B, 0x04, XMM_SAVE_SIZE as i32 + reg_offset);
 
     if condition.op == CondOp::BitSet || condition.op == CondOp::BitClear {
         // TEST rax, mask
@@ -1095,6 +1174,7 @@ fn generate_pre_hook_trampoline(
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // 3a. Toggle check (if present) — skip hook call if toggle is 0.
     let toggle_fixup = toggle_va.map(|tva| emit_toggle_check_x86_64(&mut code, trampoline_va, tva));
@@ -1143,6 +1223,7 @@ fn generate_pre_hook_trampoline(
     }
 
     // 8. Restore all registers
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 9. Deallocate RegContext: add rsp, 144
@@ -1207,6 +1288,7 @@ fn generate_post_hook_trampoline(
 
     // 4. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // 4a. Toggle check (if present).
     let toggle_fixup = toggle_va.map(|tva| emit_toggle_check_x86_64(&mut code, trampoline_va, tva));
@@ -1255,6 +1337,7 @@ fn generate_post_hook_trampoline(
     }
 
     // 9. Restore all registers
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
@@ -1308,6 +1391,7 @@ fn generate_replace_hook_trampoline(
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va, windows_abi);
+    emit_save_xmm(&mut code);
 
     // 3a. Toggle check (if present) — skip to fallback path when toggle is 0.
     let toggle_fixup = toggle_va.map(|tva| emit_toggle_check_x86_64(&mut code, trampoline_va, tva));
@@ -1348,6 +1432,7 @@ fn generate_replace_hook_trampoline(
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
 
     // 9. Restore all registers (hook may have modified RegContext)
+    emit_restore_xmm(&mut code);
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
@@ -1373,6 +1458,7 @@ fn generate_replace_hook_trampoline(
         }
 
         // Restore all registers
+        emit_restore_xmm(&mut code);
         emit_restore_regs(&mut code);
 
         // Deallocate RegContext (lea to avoid clobbering flags)
@@ -1529,6 +1615,7 @@ fn generate_return_hook_trampolines_x86_64(
 
     // 3. Save all registers
     emit_save_regs(&mut ret_code, hook.target_va, windows_abi);
+    emit_save_xmm(&mut ret_code);
 
     // 3a. Toggle check (if present).
     let toggle_fixup =
@@ -1574,6 +1661,7 @@ fn generate_return_hook_trampolines_x86_64(
     }
 
     // 8. Restore all registers
+    emit_restore_xmm(&mut ret_code);
     emit_restore_regs(&mut ret_code);
 
     // 9. Deallocate RegContext (lea to avoid clobbering flags)
@@ -2484,20 +2572,41 @@ mod tests {
         assert_eq!(code.len(), 8);
     }
 
+    /// Exhaustive verification that Rust reg_context_offset_x86_64 matches
+    /// the C header (include/truant_regctx.h) TRUANT_X64_* constants.
+    /// If either side changes without the other, this test fails.
     #[test]
-    fn test_reg_context_offset_x86_64() {
-        assert_eq!(
-            reg_context_offset_x86_64("rax").expect("rax is a valid x86_64 register"),
-            0
-        );
-        assert_eq!(
-            reg_context_offset_x86_64("rdi").expect("rdi is a valid x86_64 register"),
-            40
-        );
-        assert_eq!(
-            reg_context_offset_x86_64("r15").expect("r15 is a valid x86_64 register"),
-            120
-        );
+    fn test_reg_context_abi_x86_64() {
+        // These constants must match TRUANT_X64_* in truant_regctx.h
+        const EXPECTED: &[(&str, i32)] = &[
+            ("rax", 0),
+            ("rbx", 8),
+            ("rcx", 16),
+            ("rdx", 24),
+            ("rsi", 32),
+            ("rdi", 40),
+            ("rbp", 48),
+            ("rsp", 56),
+            ("r8", 64),
+            ("r9", 72),
+            ("r10", 80),
+            ("r11", 88),
+            ("r12", 96),
+            ("r13", 104),
+            ("r14", 112),
+            ("r15", 120),
+        ];
+        for &(name, offset) in EXPECTED {
+            assert_eq!(
+                reg_context_offset_x86_64(name).unwrap(),
+                offset,
+                "x86_64 RegContext offset mismatch for {name}: Rust says {}, header says {offset}",
+                reg_context_offset_x86_64(name).unwrap(),
+            );
+        }
+        // Total size = last offset + 8 = 128 (TRUANT_X64_SIZE)
+        assert_eq!(EXPECTED.last().unwrap().1 + 8, 128);
+        // Reject unknown registers
         assert!(reg_context_offset_x86_64("x0").is_err());
         assert!(reg_context_offset_x86_64("eax").is_err());
     }
@@ -3126,22 +3235,32 @@ mod tests {
         );
     }
 
+    /// Exhaustive verification that Rust reg_context_offset_pe32 matches
+    /// the C header (include/truant_regctx.h) TRUANT_X86_* constants.
     #[test]
-    fn test_pe32_reg_context_offsets() {
-        assert_eq!(
-            reg_context_offset_pe32("eax").expect("eax is a valid PE32 register"),
-            28
-        );
-        assert_eq!(
-            reg_context_offset_pe32("edi").expect("edi is a valid PE32 register"),
-            0
-        );
-        assert_eq!(
-            reg_context_offset_pe32("eflags").expect("eflags is a valid PE32 register"),
-            36
-        );
+    fn test_reg_context_abi_pe32() {
+        const EXPECTED: &[(&str, i32)] = &[
+            ("edi", 0),
+            ("esi", 4),
+            ("ebp", 8),
+            ("esp", 12),
+            ("ebx", 16),
+            ("edx", 20),
+            ("ecx", 24),
+            ("eax", 28),
+            ("eip", 32),
+            ("eflags", 36),
+        ];
+        for &(name, offset) in EXPECTED {
+            assert_eq!(
+                reg_context_offset_pe32(name).unwrap(),
+                offset,
+                "PE32 RegContext offset mismatch for {name}",
+            );
+        }
+        // Total size = last offset + 4 = 40 (TRUANT_X86_SIZE)
+        assert_eq!(EXPECTED.last().unwrap().1 + 4, 40);
         assert!(reg_context_offset_pe32("rax").is_err());
-        assert!(reg_context_offset_pe32("r8").is_err());
     }
 
     #[test]

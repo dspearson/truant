@@ -1,3 +1,4 @@
+pub mod code_builder;
 pub mod context;
 pub mod patcher;
 

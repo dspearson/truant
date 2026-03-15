@@ -7,7 +7,7 @@ use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use std::collections::BTreeSet;
 
-use crate::disasm::BasicBlock;
+use crate::disasm::{BasicBlock, DisassemblyResult};
 use crate::macho::{MachOContext, is_in_stubs, va_to_file_offset_macho};
 
 /// Detect basic blocks in the __text section of a Mach-O binary.
@@ -18,7 +18,7 @@ pub fn find_basic_blocks_macho(
     ctx: &MachOContext,
     data: &[u8],
     instrument_modules: &Option<Vec<String>>,
-) -> Result<Vec<BasicBlock>> {
+) -> Result<DisassemblyResult> {
     let text = &ctx.text;
     let text_start = text.offset as usize;
     let text_end = text_start + text.size as usize;
@@ -254,7 +254,10 @@ pub fn find_basic_blocks_macho(
         branch_targets.len(),
     );
 
-    Ok(blocks)
+    Ok(DisassemblyResult {
+        blocks,
+        skipped: Vec::new(),
+    })
 }
 
 /// Extract displaced bytes at a given VA for Mach-O binaries.

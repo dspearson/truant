@@ -4,6 +4,58 @@ use std::collections::BTreeSet;
 
 use crate::elf::ElfContext;
 
+/// Why a candidate block was skipped during disassembly.
+#[derive(Debug, Clone, Copy)]
+pub enum SkipReason {
+    TooShort,
+    InteriorTarget,
+    RipRelativeStart,
+    AlignmentNop,
+    NoFileMapping,
+    PltOrStub,
+    MidInstruction,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(f, "displaced region < 5 bytes"),
+            Self::InteriorTarget => write!(f, "branch target inside displaced region"),
+            Self::RipRelativeStart => write!(f, "first instruction uses RIP-relative addressing"),
+            Self::AlignmentNop => write!(f, "alignment NOP before unregistered target"),
+            Self::NoFileMapping => write!(f, "VA has no file offset mapping"),
+            Self::PltOrStub => write!(f, "PLT/stub entry"),
+            Self::MidInstruction => write!(f, "target is mid-instruction"),
+        }
+    }
+}
+
+/// Result of basic block discovery: blocks to instrument + skipped blocks.
+pub struct DisassemblyResult {
+    pub blocks: Vec<BasicBlock>,
+    pub skipped: Vec<(u64, SkipReason)>,
+}
+
+impl DisassemblyResult {
+    /// Log a summary of skipped blocks. Warns if >30% were skipped.
+    pub fn log_skip_summary(&self) {
+        let total = self.blocks.len() + self.skipped.len();
+        if self.skipped.is_empty() || total == 0 {
+            return;
+        }
+        for &(va, reason) in &self.skipped {
+            tracing::debug!("skip block 0x{va:x}: {reason}");
+        }
+        let pct = self.skipped.len() * 100 / total;
+        if pct > 30 {
+            tracing::warn!(
+                "high skip rate: {}/{total} blocks skipped ({pct}%)",
+                self.skipped.len()
+            );
+        }
+    }
+}
+
 /// A basic block that is eligible for instrumentation.
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
@@ -28,7 +80,7 @@ pub fn find_basic_blocks(
     ctx: &ElfContext,
     data: &[u8],
     instrument_modules: &Option<Vec<String>>,
-) -> Result<Vec<BasicBlock>> {
+) -> Result<DisassemblyResult> {
     let text = &ctx.text;
     let text_start = text.offset as usize;
     let text_end = text_start + text.size as usize;
@@ -304,7 +356,10 @@ pub fn find_basic_blocks(
         branch_targets.len(),
     );
 
-    Ok(blocks)
+    Ok(DisassemblyResult {
+        blocks,
+        skipped: Vec::new(),
+    })
 }
 
 /// Check if an instruction is a NOP variant (alignment padding).
@@ -635,14 +690,15 @@ mod tests {
         use crate::elf::ElfContext;
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
-        let blocks = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let result = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let blocks = &result.blocks;
 
         assert!(
             !blocks.is_empty(),
             "should find at least one basic block in /usr/bin/true"
         );
 
-        for block in &blocks {
+        for block in blocks {
             assert!(
                 block.displaced_len >= 5,
                 "block at 0x{:x} too small: {}",
@@ -667,9 +723,10 @@ mod tests {
     fn test_blocks_no_plt_stubs() {
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
-        let blocks = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let result = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let blocks = &result.blocks;
 
-        for block in &blocks {
+        for block in blocks {
             assert!(
                 !is_in_plt(block.va, &ctx),
                 "block at 0x{:x} is in PLT",
@@ -700,12 +757,13 @@ mod tests {
         // For now, just test on /usr/bin/true which has basic blocks.
         let data = std::fs::read("/usr/bin/true").expect("cannot read /usr/bin/true");
         let ctx = ElfContext::parse(&data).expect("failed to parse ELF");
-        let blocks = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let result = find_basic_blocks(&ctx, &data, &None).expect("block detection failed");
+        let blocks = &result.blocks;
 
         // Verify displaced regions don't overlap: for each block, check that
         // no other block starts inside its displaced region.
         let block_starts: BTreeSet<u64> = blocks.iter().map(|b| b.va).collect();
-        for block in &blocks {
+        for block in blocks {
             for offset in 1..block.displaced_len as u64 {
                 assert!(
                     !block_starts.contains(&(block.va + offset)),

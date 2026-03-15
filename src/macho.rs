@@ -268,7 +268,7 @@ impl MachOContext {
                             .expect("slice is 4 bytes"),
                     );
 
-                    let va_end = vmaddr + vmsize;
+                    let va_end = vmaddr.saturating_add(vmsize);
                     if va_end > highest_va_end {
                         highest_va_end = va_end;
                     }
@@ -365,7 +365,7 @@ impl MachOContext {
                             });
                             // Read existing init function pointers (64-bit absolute)
                             let ptr_start = sect_offset as usize;
-                            let ptr_end = ptr_start + sect_size as usize;
+                            let ptr_end = ptr_start.saturating_add(sect_size as usize);
                             if ptr_end <= data.len() {
                                 let mut p = ptr_start;
                                 while p + 8 <= ptr_end {
@@ -391,7 +391,7 @@ impl MachOContext {
                             });
                             // Read 32-bit offsets, convert to absolute VA
                             let off_start = sect_offset as usize;
-                            let off_end = off_start + sect_size as usize;
+                            let off_end = off_start.saturating_add(sect_size as usize);
                             if off_end <= data.len() {
                                 let mut p = off_start;
                                 while p + 4 <= off_end {

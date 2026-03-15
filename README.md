@@ -237,8 +237,8 @@ truant target.exe -o target_san.exe --heap-san
 | Library handler hooks | x | x | x | x |
 | Coverage instrumentation | x | x | x | x |
 | Persistent mode | x | x | x | x |
-| Heap sanitiser | x | x | x | - |
-| Sidecar sanitiser | x | x | x | - |
+| Heap sanitiser | x | x | x | x |
+| Sidecar sanitiser | x | x | x | x |
 | Forkserver | x | x | - | - |
 | AArch64 | x | x | - | - |
 
@@ -282,12 +282,15 @@ src/
   macho_trampoline.rs       Mach-O init code + persistent mode (x86_64 + AArch64)
   fat.rs                    Universal (fat) binary support
 
-  pe.rs                     PE/COFF parsing (sections, imports, exports, IAT)
+  pe.rs                     PE/COFF parsing (sections, imports, exports, IAT, import injection)
   pe_impl/
     patcher.rs              PE patching (.trcov section, PE32/PE64 init, persistent)
+    code_builder.rs         CodeBuilder with label/fixup system for PE init codegen
     context.rs              PeBinaryContext wrapper
   pe_disasm.rs              PE basic block detection (32-bit + 64-bit)
 
+  error.rs                  Typed error taxonomy (TruantError enum)
+  binary_patch.rs           Overlap-checked binary patching (PatchSet)
   preload.rs                Heap sanitiser (LD_PRELOAD / DYLD_INSERT / companion DLL)
   sidecar_preload.rs        Sidecar memory sanitiser (SHM ring buffer)
   hook_preload.rs           Companion library for library-based hooks
@@ -313,7 +316,7 @@ src/
 
 ```sh
 cargo build              # debug build
-cargo test -- --test-threads=1   # 381 tests across 8 test suites
+cargo test -- --test-threads=1   # 338+ tests across 8 test suites
 cargo build --release    # optimised build
 ```
 
@@ -321,12 +324,12 @@ cargo build --release    # optimised build
 
 | Suite | Tests | What it covers |
 |-------|-------|----------------|
-| Unit tests (`--lib`) | 270 | Trampoline codegen, hook resolution, parsing, PC-relative relocation, format detection |
+| Unit tests (`--lib`) | 308 | Trampoline codegen, hook resolution, parsing, PC-relative relocation, format detection, PE import injection, binary patching |
 | `feature_parity` | 47 | Code generator parity across x86_64/AArch64, ELF/Mach-O |
 | `hook_e2e` | 20 | Live hook verification: pre/post/replace/return/conditional/toggle/chained/library |
 | `hook_unit` | 13 | Hook modes, coverage exclusion, symbol resolution |
 | `corpus_e2e` | 11 | 24 binary shapes x 7 hook types (~170 combos), multiple optimisation levels |
-| `pe_e2e` | 20 | PE structural validation, headers, entry points, DLL support |
+| `pe_e2e` | 32 | PE32/PE64 structural validation, headers, entry points, hooks, heap/sidecar sanitiser, auto-strip, DLL .reloc |
 
 ### CI matrix
 
