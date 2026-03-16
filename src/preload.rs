@@ -144,6 +144,7 @@ const PRELOAD_SOURCE_MACOS: &str = r#"/* truant heap sanitiser -- DYLD_INSERT_LI
  */
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
