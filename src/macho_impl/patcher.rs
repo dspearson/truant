@@ -1250,7 +1250,7 @@ fn insert_load_commands_and_update_entry(
             layout.segment_va + layout.page_sz,
             sizes.code_segment_vmsize,
             file_layout.file_offset_of_code_seg,
-            sizes.code_segment_size,
+            sizes.code_segment_vmsize,
             0x7,
         );
     } else {
@@ -1260,7 +1260,7 @@ fn insert_load_commands_and_update_entry(
             layout.segment_va,
             sizes.segment_vmsize,
             file_layout.file_offset_of_segment,
-            sizes.segment_size,
+            sizes.segment_vmsize,
             0x7,
         );
     }
