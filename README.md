@@ -271,11 +271,13 @@ src/
 
   elf.rs                    ELF parsing (sections, symbols, PLT, allocators)
   elf_impl/
+    mod.rs                  Module root
     patcher.rs              ELF patching (PT_NOTE segment, block patching, heap san)
     context.rs              ElfBinaryContext wrapper
 
   macho.rs                  Mach-O parsing (segments, symbols, stubs, LC stripping)
   macho_impl/
+    mod.rs                  Module root
     patcher.rs              Mach-O patching (__TR_COV/__TR_DAT, LINKEDIT, LC space reclamation)
     context.rs              MachOBinaryContext wrapper
   macho_disasm.rs           Mach-O basic block detection
@@ -284,6 +286,7 @@ src/
 
   pe.rs                     PE/COFF parsing (sections, imports, exports, IAT, import injection)
   pe_impl/
+    mod.rs                  Module root
     patcher.rs              PE patching (.trcov section, PE32/PE64 init, persistent)
     code_builder.rs         CodeBuilder with label/fixup system for PE init codegen
     context.rs              PeBinaryContext wrapper
@@ -296,10 +299,13 @@ src/
   hook_preload.rs           Companion library for library-based hooks
 
   arch/
+    mod.rs                  Module root
     x86_64/
+      mod.rs                Module root
       disasm.rs             x86_64 basic block detection helpers
       trampoline_gen.rs     x86_64 trampoline generation dispatch
     aarch64/
+      mod.rs                Module root
       asm.rs                Shared ARM64 instruction encoding (60 encoders)
       disasm.rs             AArch64 basic block detection
       trampoline_gen.rs     Coverage trampoline + persistent mode (AArch64)
@@ -307,6 +313,7 @@ src/
       relocation.rs         PC-relative instruction relocation (ADRP, ADR, B, etc.)
 
   traits/
+    mod.rs                  Module root
     patcher.rs              Patcher trait
     binary_context.rs       BinaryContext trait
     trampoline_gen.rs       TrampolineGenerator trait
@@ -317,7 +324,7 @@ src/
 
 ```sh
 cargo build              # debug build
-cargo test -- --test-threads=1   # 338+ tests across 8 test suites
+cargo test -- --test-threads=1   # 431+ tests across 6 test suites
 cargo build --release    # optimised build
 ```
 
@@ -334,14 +341,14 @@ cargo build --release    # optimised build
 
 ### CI matrix
 
-Tests run on 6 platform/architecture combinations:
+Tests run on 5 CI platform/architecture combinations (plus local macOS Intel verification):
 
 | Platform | Architecture | Runner |
 |----------|-------------|--------|
 | Linux | x86_64 | `ubuntu-latest` |
 | Linux | AArch64 | `ubuntu-24.04-arm` |
 | macOS | ARM64 (M-series) | `macos-latest` |
-| macOS | x86_64 (Intel) | `macos-13` |
+| macOS | x86_64 (Intel) | tested locally |
 | Windows | x86_64 | `windows-latest` |
 
 Hook E2E and corpus tests are arch-portable (x86_64 + AArch64 shellcode).
