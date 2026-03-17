@@ -72,7 +72,7 @@ pub fn patch(
     let persistent_count = opts.persistent_count;
     let defer = opts.defer;
     let no_coverage = opts.no_coverage;
-    if blocks.is_empty() && !no_coverage {
+    if blocks.is_empty() && !no_coverage && resolved_hooks.is_empty() {
         bail!("no basic blocks to instrument");
     }
 
@@ -175,7 +175,7 @@ pub fn patch(
             }
         }
 
-        if trampolines.is_empty() {
+        if trampolines.is_empty() && !blocks.is_empty() {
             bail!("all basic blocks failed trampoline generation");
         }
     }

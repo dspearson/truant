@@ -388,7 +388,7 @@ fn patch_pe(
     let no_coverage = opts.no_coverage;
     let persistent_addr = opts.persistent_addr;
     let persistent_count = opts.persistent_count;
-    if blocks.is_empty() && !no_coverage {
+    if blocks.is_empty() && !no_coverage && resolved_hooks.is_empty() {
         bail!("no basic blocks to instrument");
     }
 

@@ -1160,10 +1160,45 @@ mod arm64 {
     }
     #[inline]
     pub fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
-        let imm21 = byte_offset as u32;
+        let imm21 = (byte_offset & 0x1FFFFF) as u32;
         let immlo = imm21 & 0x3;
         let immhi = (imm21 >> 2) & 0x7FFFF;
         ((immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd).to_le_bytes()
+    }
+    #[inline]
+    pub fn encode_adrp(rd: u32, byte_offset: i64) -> [u8; 4] {
+        let page_offset = byte_offset >> 12;
+        let imm21 = (page_offset & 0x1FFFFF) as u32;
+        let immlo = imm21 & 0x3;
+        let immhi = (imm21 >> 2) & 0x7FFFF;
+        ((1u32 << 31) | (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd).to_le_bytes()
+    }
+    /// Wide PC-relative address: ADRP + ADD (±4 GiB, 8 bytes).
+    pub fn encode_adr_wide(rd: u32, pc: u64, target: u64) -> [u8; 8] {
+        let pc_page = pc & !0xFFF;
+        let target_page = target & !0xFFF;
+        let page_offset = target_page as i64 - pc_page as i64;
+        let page_off12 = (target & 0xFFF) as u32;
+        let adrp = encode_adrp(rd, page_offset);
+        let add = encode_add_imm(rd, rd, page_off12);
+        let mut result = [0u8; 8];
+        result[..4].copy_from_slice(&adrp);
+        result[4..].copy_from_slice(&add);
+        result
+    }
+    #[inline]
+    pub fn adr_in_range(byte_offset: i64) -> bool {
+        byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
+    }
+    /// Patch an 8-byte placeholder (two NOPs) with ADR+NOP or ADRP+ADD.
+    pub fn patch_adr_auto(code: &mut [u8], pos: usize, pc: u64, target: u64, rd: u32) {
+        let offset = target as i64 - pc as i64;
+        if adr_in_range(offset) {
+            code[pos..pos + 4].copy_from_slice(&encode_adr(rd, offset));
+            code[pos + 4..pos + 8].copy_from_slice(&encode_nop());
+        } else {
+            code[pos..pos + 8].copy_from_slice(&encode_adr_wide(rd, pc, target));
+        }
     }
 
     pub fn emit_mov32(code: &mut Vec<u8>, reg: u32, val: u32) {
@@ -1429,9 +1464,10 @@ pub fn generate_macho_exec_init_aarch64(
     // x20 = envp (from x2, saved above)
     code.extend_from_slice(&encode_mov_reg(20, 2));
 
-    // x19 = data_va (via ADR)
+    // x19 = data_va (via ADR or ADRP+ADD)
     let adr_data_pos = code.len();
-    code.extend_from_slice(&encode_nop()); // placeholder: ADR x19, data_va
+    code.extend_from_slice(&encode_nop()); // placeholder slot 1
+    code.extend_from_slice(&encode_nop()); // placeholder slot 2
 
     // Load needle bytes for __AFL_SHM_ID= comparison
     let needle_a_pos = code.len();
@@ -1607,8 +1643,8 @@ pub fn generate_macho_exec_init_aarch64(
     code.extend_from_slice(&(u32::from_le_bytes(*b"M_ID") as u64).to_le_bytes());
 
     // ── Patch placeholders ──
-    let adr_data_delta = data_va as i64 - (init_va + adr_data_pos as u64) as i64;
-    code[adr_data_pos..adr_data_pos + 4].copy_from_slice(&encode_adr(19, adr_data_delta));
+    let adr_data_pc = init_va + adr_data_pos as u64;
+    patch_adr_auto(&mut code, adr_data_pos, adr_data_pc, data_va, 19);
     patch_ldr_literal(&mut code, needle_a_pos, init_va, needle_a_lit, 25);
     patch_ldr_literal(&mut code, needle_b_pos, init_va, needle_b_lit, 26);
 
@@ -1647,9 +1683,10 @@ pub fn generate_macho_dylib_init_aarch64(
     code.extend_from_slice(&encode_stp_offset(21, 22, 64));
     code.extend_from_slice(&encode_stp_offset(19, 20, 80));
 
-    // x19 = data_va
+    // x19 = data_va (via ADR or ADRP+ADD)
     let adr_data_pos = code.len();
-    code.extend_from_slice(&encode_nop()); // placeholder
+    code.extend_from_slice(&encode_nop()); // placeholder slot 1
+    code.extend_from_slice(&encode_nop()); // placeholder slot 2
 
     // Step 1: getpid
     emit_macos_syscall(&mut code, MACOS_SYS_GETPID);
@@ -1974,8 +2011,8 @@ pub fn generate_macho_dylib_init_aarch64(
     code.extend_from_slice(&(u32::from_le_bytes(*b"M_ID") as u64).to_le_bytes());
 
     // Patch placeholders
-    let adr_dd = data_va as i64 - (init_va + adr_data_pos as u64) as i64;
-    code[adr_data_pos..adr_data_pos + 4].copy_from_slice(&encode_adr(19, adr_dd));
+    let adr_data_pc = init_va + adr_data_pos as u64;
+    patch_adr_auto(&mut code, adr_data_pos, adr_data_pc, data_va, 19);
     patch_ldr_literal(&mut code, needle_a_pos_d, init_va, needle_a_lit2, 25);
     patch_ldr_literal(&mut code, needle_b_pos_d, init_va, needle_b_lit2, 26);
 
@@ -2027,9 +2064,10 @@ pub fn generate_macho_unixthread_init_aarch64(
     let add_lsl3 = 0x8B00_0000u32 | (24 << 16) | (0b011u32 << 10) | (20 << 5) | 20; // shift=LSL, amount=3
     code.extend_from_slice(&add_lsl3.to_le_bytes());
 
-    // x19 = data_va
+    // x19 = data_va (via ADR or ADRP+ADD)
     let adr_data_pos = code.len();
-    code.extend_from_slice(&encode_nop());
+    code.extend_from_slice(&encode_nop()); // placeholder slot 1
+    code.extend_from_slice(&encode_nop()); // placeholder slot 2
 
     // Now x20 = envp pointer array. Same scan as exec init.
     let needle_a_pos = code.len();
@@ -2168,8 +2206,8 @@ pub fn generate_macho_unixthread_init_aarch64(
     let nb_lit = code.len();
     code.extend_from_slice(&(u32::from_le_bytes(*b"M_ID") as u64).to_le_bytes());
 
-    let adr_dd = data_va as i64 - (init_va + adr_data_pos as u64) as i64;
-    code[adr_data_pos..adr_data_pos + 4].copy_from_slice(&encode_adr(19, adr_dd));
+    let adr_data_pc = init_va + adr_data_pos as u64;
+    patch_adr_auto(&mut code, adr_data_pos, adr_data_pc, data_va, 19);
     patch_ldr_literal(&mut code, needle_a_pos, init_va, na_lit, 25);
     patch_ldr_literal(&mut code, needle_b_pos, init_va, nb_lit, 26);
 

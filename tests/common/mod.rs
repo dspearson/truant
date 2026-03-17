@@ -20,21 +20,33 @@ pub fn test_dir() -> tempfile::TempDir {
 /// Platform-appropriate C compiler and flags for test binaries.
 /// On Linux: `gcc -no-pie` for non-PIE ELF.
 /// On macOS: `cc -Wl,-headerpad_max_install_names` (non-PIE not applicable on ARM64).
+/// On Windows: `gcc` (MinGW produces PE).
 fn cc_command() -> (String, Vec<String>) {
     if cfg!(target_os = "macos") {
         (
             "cc".to_string(),
             vec!["-Wl,-headerpad_max_install_names".to_string()],
         )
+    } else if cfg!(target_os = "windows") {
+        ("gcc".to_string(), vec![])
     } else {
         ("gcc".to_string(), vec!["-no-pie".to_string()])
+    }
+}
+
+/// Platform-appropriate binary filename (appends .exe on Windows).
+pub fn bin_path(dir: &Path, suffix: &str) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        dir.join(format!("{}.exe", suffix))
+    } else {
+        dir.join(suffix)
     }
 }
 
 /// Compile a non-PIE test binary from custom C source into `dir`.
 pub fn compile_bin(dir: &Path, suffix: &str, src: &str) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
-    let bin = dir.join(suffix);
+    let bin = bin_path(dir, suffix);
     std::fs::write(&src_path, src).unwrap();
     let (cc, base_flags) = cc_command();
     let status = Command::new(&cc)
@@ -52,7 +64,7 @@ pub fn compile_bin(dir: &Path, suffix: &str, src: &str) -> PathBuf {
 /// Compile a non-PIE test binary with extra flags into `dir`.
 pub fn compile_bin_flags(dir: &Path, suffix: &str, src: &str, flags: &[&str]) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
-    let bin = dir.join(suffix);
+    let bin = bin_path(dir, suffix);
     std::fs::write(&src_path, src).unwrap();
     let (cc, base_flags) = cc_command();
     let mut cmd = Command::new(&cc);
@@ -68,11 +80,13 @@ pub fn compile_bin_flags(dir: &Path, suffix: &str, src: &str, flags: &[&str]) ->
     bin
 }
 
-/// Compile a shared library (.so / .dylib) from C source into `dir`.
+/// Compile a shared library (.so / .dylib / .dll) from C source into `dir`.
 pub fn compile_so(dir: &Path, suffix: &str, src: &str) -> PathBuf {
     let src_path = dir.join(format!("{}.c", suffix));
     let ext = if cfg!(target_os = "macos") {
         "dylib"
+    } else if cfg!(target_os = "windows") {
+        "dll"
     } else {
         "so"
     };

@@ -93,19 +93,17 @@ pub fn generate_return_hook_trampolines(
     // STR x16, [sp] = F900_03F0
     entry.extend_from_slice(&0xF900_03F0u32.to_le_bytes());
 
-    // ADR x16, data_slot — PC-relative address of return address slot
-    let adr1_va = entry_va + entry.len() as u64;
-    let adr1_offset = return_slot_va as i64 - adr1_va as i64;
-    entry.extend_from_slice(&encode_adr(16, adr1_offset));
+    // x16 = &return_slot (PC-relative)
+    let adr1_pc = entry_va + entry.len() as u64;
+    asm::emit_adr_auto(&mut entry, 16, adr1_pc, return_slot_va);
 
     // STR x30, [x16] — save original LR to data slot
     // STR x30, [x16, #0] = F900_021E
     entry.extend_from_slice(&0xF900_021Eu32.to_le_bytes());
 
-    // ADR x30, ret_tramp_va — set LR to return trampoline
-    let adr2_va = entry_va + entry.len() as u64;
-    let adr2_offset = ret_tramp_va as i64 - adr2_va as i64;
-    entry.extend_from_slice(&encode_adr(30, adr2_offset));
+    // x30 = ret_tramp_va (PC-relative, sets LR to return trampoline)
+    let adr2_pc = entry_va + entry.len() as u64;
+    asm::emit_adr_auto(&mut entry, 30, adr2_pc, ret_tramp_va);
 
     // Restore scratch register x16 from stack.
     // LDR x16, [sp] = F940_03F0
@@ -134,7 +132,7 @@ pub fn generate_return_hook_trampolines(
             delta,
         );
     }
-    entry.extend_from_slice(&encode_b((delta / 4) as i32));
+    entry.extend_from_slice(&asm::encode_b((delta / 4) as i32));
 
     let entry_tramp = Trampoline {
         va: entry_va,
@@ -148,7 +146,7 @@ pub fn generate_return_hook_trampolines(
     // The handler call can clobber these, but the hooked function's return
     // value lives in d0 (float/double results per AAPCS64).
     // SUB sp, sp, #64
-    ret_code.extend_from_slice(&encode_sub_sp(64));
+    ret_code.extend_from_slice(&asm::encode_sub_sp_imm(64));
     // STP d0,d1,[sp,#0]; STP d2,d3,[sp,#16]; STP d4,d5,[sp,#32]; STP d6,d7,[sp,#48]
     ret_code.extend_from_slice(&0x6D0007E0u32.to_le_bytes()); // STP d0, d1, [sp, #0]
     ret_code.extend_from_slice(&0x6D010FE2u32.to_le_bytes()); // STP d2, d3, [sp, #16]
@@ -156,7 +154,7 @@ pub fn generate_return_hook_trampolines(
     ret_code.extend_from_slice(&0x6D031FE6u32.to_le_bytes()); // STP d6, d7, [sp, #48]
 
     // 1. Allocate RegContext
-    ret_code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    ret_code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 2. Save all registers
     emit_save_regs(&mut ret_code, hook.target_va);
@@ -174,7 +172,7 @@ pub fn generate_return_hook_trampolines(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    ret_code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+    ret_code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4. Call hook handler
     emit_hook_call(
@@ -202,7 +200,7 @@ pub fn generate_return_hook_trampolines(
     emit_restore_regs(&mut ret_code);
 
     // 6. Deallocate RegContext
-    ret_code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    ret_code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // 6b. Restore FP/SIMD registers d0-d7.
     // LDP d0,d1,[sp,#0]; LDP d2,d3,[sp,#16]; LDP d4,d5,[sp,#32]; LDP d6,d7,[sp,#48]
@@ -211,13 +209,12 @@ pub fn generate_return_hook_trampolines(
     ret_code.extend_from_slice(&0x6D4217E4u32.to_le_bytes()); // LDP d4, d5, [sp, #32]
     ret_code.extend_from_slice(&0x6D431FE6u32.to_le_bytes()); // LDP d6, d7, [sp, #48]
     // ADD sp, sp, #64
-    ret_code.extend_from_slice(&encode_add_sp(64));
+    ret_code.extend_from_slice(&asm::encode_add_sp_imm(64));
 
     // 7. Load saved original LR from data slot into x16, BR x16
-    let adr3_va = ret_tramp_va + ret_code.len() as u64;
-    let adr3_offset = return_slot_va as i64 - adr3_va as i64;
-    ret_code.extend_from_slice(&encode_adr(16, adr3_offset));
-    ret_code.extend_from_slice(&encode_ldr_reg(16, 16)); // LDR x16, [x16]
+    let adr3_pc = ret_tramp_va + ret_code.len() as u64;
+    asm::emit_adr_auto(&mut ret_code, 16, adr3_pc, return_slot_va);
+    ret_code.extend_from_slice(&asm::encode_ldr_reg(16, 16)); // LDR x16, [x16]
     // BR x16: 0xD61F_0200
     ret_code.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
 
@@ -254,7 +251,7 @@ pub fn generate_chained_hook_trampoline(
     }
 
     // 1. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
@@ -263,7 +260,8 @@ pub fn generate_chained_hook_trampoline(
     // For replace mode, ADR x1 to original stub (fixup later).
     let adr_x1_fixup_pos = if mode == HookMode::Replace {
         let pos = code.len();
-        code.extend_from_slice(&encode_adr(1, 0)); // placeholder
+        code.extend_from_slice(&asm::encode_nop()); // placeholder slot 1
+        code.extend_from_slice(&asm::encode_nop()); // placeholder slot 2
         Some(pos)
     } else {
         None
@@ -283,7 +281,7 @@ pub fn generate_chained_hook_trampoline(
         };
 
         // Refresh x0 = sp (arg1 = &RegContext) before each call.
-        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+        code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
 
         // Call this hook's handler
         emit_hook_call(
@@ -312,7 +310,7 @@ pub fn generate_chained_hook_trampoline(
     emit_restore_regs(&mut code);
 
     // 5. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     match mode {
         HookMode::Pre => {
@@ -328,7 +326,7 @@ pub fn generate_chained_hook_trampoline(
             if delta % 4 != 0 || delta.abs() > 128 * 1024 * 1024 {
                 anyhow::bail!("chained hook: return branch out of range");
             }
-            code.extend_from_slice(&encode_b((delta / 4) as i32));
+            code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
         }
         HookMode::Post => {
             let b_va = trampoline_va + code.len() as u64;
@@ -336,7 +334,7 @@ pub fn generate_chained_hook_trampoline(
             if delta % 4 != 0 || delta.abs() > 128 * 1024 * 1024 {
                 anyhow::bail!("chained hook: return branch out of range");
             }
-            code.extend_from_slice(&encode_b((delta / 4) as i32));
+            code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
         }
         HookMode::Replace => {
             // RET to caller
@@ -347,10 +345,8 @@ pub fn generate_chained_hook_trampoline(
             let stub_va = trampoline_va + stub_offset as u64;
 
             if let Some(fixup_pos) = adr_x1_fixup_pos {
-                let adr_va = trampoline_va + fixup_pos as u64;
-                let adr_offset = stub_va as i64 - adr_va as i64;
-                let adr_word = encode_adr(1, adr_offset);
-                code[fixup_pos..fixup_pos + 4].copy_from_slice(&adr_word);
+                let adr_pc = trampoline_va + fixup_pos as u64;
+                asm::patch_adr_auto(&mut code, fixup_pos, adr_pc, stub_va, 1);
             }
 
             let displaced_va = trampoline_va + code.len() as u64;
@@ -364,7 +360,7 @@ pub fn generate_chained_hook_trampoline(
             if delta2 % 4 != 0 || delta2.abs() > 128 * 1024 * 1024 {
                 anyhow::bail!("chained hook: stub return branch out of range");
             }
-            code.extend_from_slice(&encode_b((delta2 / 4) as i32));
+            code.extend_from_slice(&asm::encode_b((delta2 / 4) as i32));
         }
         // Return mode is rejected before this match is reached.
         _ => unreachable!(),
@@ -376,155 +372,7 @@ pub fn generate_chained_hook_trampoline(
     })
 }
 
-// ============================================================
-// ARM64 instruction encoding helpers (reused from trampoline_gen.rs patterns)
-// ============================================================
-
-/// Encode B (unconditional branch, ±128 MiB).
-#[inline]
-fn encode_b(offset_instructions: i32) -> [u8; 4] {
-    let word = 0x1400_0000u32 | ((offset_instructions as u32) & 0x03FF_FFFF);
-    word.to_le_bytes()
-}
-
-/// Encode BLR xN (branch-and-link to register).
-#[inline]
-fn encode_blr(reg: u32) -> [u8; 4] {
-    let word = 0xD63F_0000u32 | (reg << 5);
-    word.to_le_bytes()
-}
-
-/// Encode STP xN, xM, [sp, #offset] (signed offset, no writeback).
-#[inline]
-fn encode_stp_offset(rn: u32, rm: u32, offset: i32) -> [u8; 4] {
-    let imm7 = ((offset / 8) as u32) & 0x7F;
-    let word = (0b10u32 << 30)
-        | (0b101u32 << 27)
-        | (0b010u32 << 23) // signed offset
-        | (imm7 << 15)
-        | (rm << 10)
-        | (31u32 << 5) // sp
-        | rn;
-    word.to_le_bytes()
-}
-
-/// Encode LDP xN, xM, [sp, #offset] (signed offset, no writeback).
-#[inline]
-fn encode_ldp_offset(rn: u32, rm: u32, offset: i32) -> [u8; 4] {
-    let imm7 = ((offset / 8) as u32) & 0x7F;
-    let word = (0b10u32 << 30)
-        | (0b101u32 << 27)
-        | (0b010u32 << 23) // signed offset
-        | (1u32 << 22)     // L=1 (load)
-        | (imm7 << 15)
-        | (rm << 10)
-        | (31u32 << 5) // sp
-        | rn;
-    word.to_le_bytes()
-}
-
-/// Encode STR xN, [sp, #offset] (unsigned immediate, 8-byte aligned).
-#[inline]
-fn encode_str_sp(xn: u32, offset: u32) -> [u8; 4] {
-    let imm12 = (offset / 8) & 0xFFF;
-    let word = 0xF900_03E0u32 | (imm12 << 10) | xn;
-    word.to_le_bytes()
-}
-
-/// Encode LDR xN, [sp, #offset] (unsigned immediate, 8-byte aligned).
-#[inline]
-fn encode_ldr_sp(xn: u32, offset: u32) -> [u8; 4] {
-    let imm12 = (offset / 8) & 0xFFF;
-    let word = 0xF940_03E0u32 | (imm12 << 10) | xn;
-    word.to_le_bytes()
-}
-
-/// Encode SUB sp, sp, #imm.
-#[inline]
-fn encode_sub_sp(imm: u32) -> [u8; 4] {
-    let (sh, imm12) = if imm <= 0xFFF {
-        (0u32, imm)
-    } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
-        (1u32, imm >> 12)
-    } else {
-        unreachable!("SUB sp, sp, #{imm} cannot be encoded");
-    };
-    let word = 0xD100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
-    word.to_le_bytes()
-}
-
-/// Encode ADD sp, sp, #imm.
-#[inline]
-fn encode_add_sp(imm: u32) -> [u8; 4] {
-    let (sh, imm12) = if imm <= 0xFFF {
-        (0u32, imm)
-    } else if imm & 0xFFF == 0 && (imm >> 12) <= 0xFFF {
-        (1u32, imm >> 12)
-    } else {
-        unreachable!("ADD sp, sp, #{imm} cannot be encoded");
-    };
-    let word = 0x9100_03FFu32 | (sh << 22) | ((imm12 & 0xFFF) << 10);
-    word.to_le_bytes()
-}
-
-/// Encode ADD xD, sp, #imm (read sp into register).
-#[inline]
-fn encode_add_from_sp(xd: u32, imm: u32) -> [u8; 4] {
-    // ADD xD, sp, #imm: sf=1, op=0, S=0, Rn=31(sp), Rd=xD
-    let word = 0x9100_03E0u32 | ((imm & 0xFFF) << 10) | xd;
-    word.to_le_bytes()
-}
-
-/// Encode MOVZ xN, #imm16.
-#[inline]
-fn encode_movz(reg: u32, imm16: u16) -> [u8; 4] {
-    let word = 0xD280_0000u32 | ((imm16 as u32) << 5) | reg;
-    word.to_le_bytes()
-}
-
-/// Encode MOVK xN, #imm16, LSL #shift.
-#[inline]
-fn encode_movk(reg: u32, imm16: u16, lsl: u32) -> [u8; 4] {
-    let hw = lsl / 16;
-    let word = 0xF280_0000u32 | (hw << 21) | ((imm16 as u32) << 5) | reg;
-    word.to_le_bytes()
-}
-
-/// Encode LDR xN, [xM] (load 64-bit).
-#[inline]
-fn encode_ldr_reg(xn: u32, xm: u32) -> [u8; 4] {
-    let word = 0xF940_0000u32 | (xm << 5) | xn;
-    word.to_le_bytes()
-}
-
-/// Encode ADR xN, PC+offset (±1 MiB).
-#[inline]
-fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
-    let imm21 = byte_offset as u32;
-    let immlo = imm21 & 0x3;
-    let immhi = (imm21 >> 2) & 0x7FFFF;
-    let word = (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd;
-    word.to_le_bytes()
-}
-
-/// Load a 64-bit immediate into register xN.
-fn emit_mov64(code: &mut Vec<u8>, xn: u32, val: u64) {
-    let w0 = (val & 0xFFFF) as u16;
-    let w1 = ((val >> 16) & 0xFFFF) as u16;
-    let w2 = ((val >> 32) & 0xFFFF) as u16;
-    let w3 = ((val >> 48) & 0xFFFF) as u16;
-
-    code.extend_from_slice(&encode_movz(xn, w0));
-    if w1 != 0 {
-        code.extend_from_slice(&encode_movk(xn, w1, 16));
-    }
-    if w2 != 0 {
-        code.extend_from_slice(&encode_movk(xn, w2, 32));
-    }
-    if w3 != 0 {
-        code.extend_from_slice(&encode_movk(xn, w3, 48));
-    }
-}
+use super::asm;
 
 // ============================================================
 // RegContext layout (AArch64, 272 bytes)
@@ -554,28 +402,27 @@ const OFF_NZCV: u32 = 264;
 /// safe to clobber in trampoline context.
 fn emit_save_regs(code: &mut Vec<u8>, target_va: u64) {
     // Save x0-x29 as pairs: STP x0,x1,[sp,#0]; STP x2,x3,[sp,#16]; ... STP x28,x29,[sp,#224]
-    for i in (0..30).step_by(2) {
-        let offset = (i as i32) * 8;
-        code.extend_from_slice(&encode_stp_offset(i, i + 1, offset));
+    for i in (0u32..30).step_by(2) {
+        code.extend_from_slice(&asm::encode_stp_offset(i, i + 1, (i * 8) as i32));
     }
 
     // Save x30 (LR): STR x30, [sp, #240]
-    code.extend_from_slice(&encode_str_sp(30, 240));
+    code.extend_from_slice(&asm::encode_str_sp_imm(30, 240));
 
     // Compute and save original SP: original_sp = current_sp + REG_CONTEXT_SIZE
     // ADD x16, sp, #REG_CONTEXT_SIZE
-    code.extend_from_slice(&encode_add_from_sp(16, REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_from_sp(16, REG_CONTEXT_SIZE));
     // STR x16, [sp, #248]
-    code.extend_from_slice(&encode_str_sp(16, OFF_SP));
+    code.extend_from_slice(&asm::encode_str_sp_imm(16, OFF_SP));
 
     // Store target_va at [sp+256] (pc field, read-only info)
-    emit_mov64(code, 16, target_va);
-    code.extend_from_slice(&encode_str_sp(16, OFF_PC));
+    asm::emit_mov64(code, 16, target_va);
+    code.extend_from_slice(&asm::encode_str_sp_imm(16, OFF_PC));
 
     // Save NZCV: MRS x16, NZCV; STR x16, [sp, #264]
     // MRS x16, NZCV = S3_3_C4_C2_0: [0x10, 0x42, 0x3B, 0xD5]
     code.extend_from_slice(&[0x10, 0x42, 0x3B, 0xD5]);
-    code.extend_from_slice(&encode_str_sp(16, OFF_NZCV));
+    code.extend_from_slice(&asm::encode_str_sp_imm(16, OFF_NZCV));
 }
 
 /// Emit the restore-all-registers block from RegContext at [sp].
@@ -584,18 +431,17 @@ fn emit_save_regs(code: &mut Vec<u8>, target_va: u64) {
 /// SP explicitly via ADD sp, sp, #frame_size).
 fn emit_restore_regs(code: &mut Vec<u8>) {
     // Restore NZCV first: LDR x16, [sp, #264]; MSR NZCV, x16
-    code.extend_from_slice(&encode_ldr_sp(16, OFF_NZCV));
+    code.extend_from_slice(&asm::encode_ldr_sp_imm(16, OFF_NZCV));
     // MSR NZCV, x16: [0x10, 0x42, 0x1B, 0xD5]
     code.extend_from_slice(&[0x10, 0x42, 0x1B, 0xD5]);
 
     // Restore x0-x29 as pairs
-    for i in (0..30).step_by(2) {
-        let offset = (i as i32) * 8;
-        code.extend_from_slice(&encode_ldp_offset(i, i + 1, offset));
+    for i in (0u32..30).step_by(2) {
+        code.extend_from_slice(&asm::encode_ldp_offset(i, i + 1, (i * 8) as i32));
     }
 
     // Restore x30: LDR x30, [sp, #240]
-    code.extend_from_slice(&encode_ldr_sp(30, 240));
+    code.extend_from_slice(&asm::encode_ldr_sp_imm(30, 240));
 }
 
 /// Save NEON/FP registers v0-v31 (512 bytes) to the stack.
@@ -605,7 +451,7 @@ fn emit_restore_regs(code: &mut Vec<u8>) {
 /// 32 registers must be preserved to avoid clobbering live SIMD/FP state.
 fn emit_save_neon(code: &mut Vec<u8>) {
     // SUB sp, sp, #512
-    code.extend_from_slice(&encode_sub_sp(NEON_SAVE_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(NEON_SAVE_SIZE));
     // STP q0,q1,[sp,#0]; STP q2,q3,[sp,#32]; ... STP q30,q31,[sp,#480]
     for i in (0u32..32).step_by(2) {
         let offset = i * 16;
@@ -636,7 +482,7 @@ fn emit_restore_neon(code: &mut Vec<u8>) {
         code.extend_from_slice(&word.to_le_bytes());
     }
     // ADD sp, sp, #512
-    code.extend_from_slice(&encode_add_sp(NEON_SAVE_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(NEON_SAVE_SIZE));
 }
 
 /// Emit the hook call sequence: load handler address into x16, BLR x16.
@@ -658,22 +504,19 @@ fn emit_hook_call(
             // ADR x16, data_slot_va (PC-relative)
             // LDR x16, [x16]       (dereference pointer)
             let slot_va = hook_data_va + (*data_slot_index as u64) * 8;
-            let adr_va = trampoline_va + code.len() as u64;
-            let adr_offset = slot_va as i64 - adr_va as i64;
-            code.extend_from_slice(&encode_adr(16, adr_offset));
-            code.extend_from_slice(&encode_ldr_reg(16, 16));
+            let adr_pc = trampoline_va + code.len() as u64;
+            asm::emit_adr_auto(code, 16, adr_pc, slot_va);
+            code.extend_from_slice(&asm::encode_ldr_reg(16, 16));
         }
         HookSource::Shellcode(_) => {
-            // ADR x16, shellcode_va (PC-relative address of embedded shellcode)
             let sc_va = shellcode_va.expect("shellcode_va must be set for shellcode hooks");
-            let adr_va = trampoline_va + code.len() as u64;
-            let adr_offset = sc_va as i64 - adr_va as i64;
-            code.extend_from_slice(&encode_adr(16, adr_offset));
+            let adr_pc = trampoline_va + code.len() as u64;
+            asm::emit_adr_auto(code, 16, adr_pc, sc_va);
         }
     }
 
     // BLR x16
-    code.extend_from_slice(&encode_blr(16));
+    code.extend_from_slice(&asm::encode_blr(16));
 }
 
 /// Relocate displaced AArch64 instructions from their original VA to a new VA.
@@ -733,15 +576,6 @@ fn reg_context_offset_aarch64(reg: &str) -> Result<u32> {
     anyhow::bail!("unknown AArch64 register '{}'", reg);
 }
 
-/// Encode B.cond with a 19-bit signed instruction offset.
-/// `cond` is the 4-bit condition code (0=EQ, 1=NE, 2=CS/HS, 3=CC/LO, etc.).
-#[inline]
-fn encode_bcond(cond: u32, offset_instructions: i32) -> [u8; 4] {
-    let imm19 = (offset_instructions as u32) & 0x7_FFFF;
-    let word = 0x5400_0000 | (imm19 << 5) | cond;
-    word.to_le_bytes()
-}
-
 /// Emit an AArch64 condition check that reads a register from the RegContext
 /// on the stack, compares it, and emits a B.cond to skip the hook call
 /// when the condition is FALSE.
@@ -756,17 +590,17 @@ fn emit_condition_check_aarch64(code: &mut Vec<u8>, condition: &HookCondition) -
 
     // LDR x9, [sp, #NEON_SAVE_SIZE + reg_offset]  — load saved register value
     // (RegContext sits above the NEON save area on the stack)
-    code.extend_from_slice(&encode_ldr_sp(9, NEON_SAVE_SIZE + reg_offset));
+    code.extend_from_slice(&asm::encode_ldr_sp_imm(9, NEON_SAVE_SIZE + reg_offset));
 
     if condition.op == CondOp::BitSet || condition.op == CondOp::BitClear {
         // Load mask into x10, then TST x9, x10 (= ANDS xzr, x9, x10)
-        emit_mov64(code, 10, condition.value);
+        asm::emit_mov64(code, 10, condition.value);
         // TST x9, x10 (= ANDS xzr, x9, x10)
         let word: u32 = (1 << 31) | (3 << 29) | (0b01010 << 24) | (10 << 16) | (9 << 5) | 31;
         code.extend_from_slice(&word.to_le_bytes());
     } else {
         // Load value into x10, then CMP x9, x10 (= SUBS xzr, x9, x10)
-        emit_mov64(code, 10, condition.value);
+        asm::emit_mov64(code, 10, condition.value);
         // CMP x9, x10 = SUBS xzr, x9, x10
         // sf=1, op=1, S=1, 01011, shift=00, 0, Rm=x10, imm6=0, Rn=x9, Rd=xzr
         let word: u32 =
@@ -788,7 +622,7 @@ fn emit_condition_check_aarch64(code: &mut Vec<u8>, condition: &HookCondition) -
     };
 
     let fixup_pos = code.len();
-    code.extend_from_slice(&encode_bcond(cond_code, 0)); // placeholder offset
+    code.extend_from_slice(&asm::encode_bcond(cond_code, 0)); // placeholder offset
 
     Ok(fixup_pos)
 }
@@ -798,7 +632,7 @@ fn fixup_condition_skip_aarch64(code: &mut [u8], fixup_pos: usize, skip_target_o
     let delta = (skip_target_offset as i64) - (fixup_pos as i64);
     assert!(delta % 4 == 0, "B.cond target must be 4-byte aligned");
     let offset_insns = (delta / 4) as i32;
-    let new_word = encode_bcond(
+    let new_word = asm::encode_bcond(
         // Preserve the existing condition code from the placeholder
         u32::from_le_bytes(
             code[fixup_pos..fixup_pos + 4]
@@ -819,10 +653,9 @@ fn fixup_condition_skip_aarch64(code: &mut [u8], fixup_pos: usize, skip_target_o
 ///
 /// Returns the byte offset of the B.EQ instruction for later fixup.
 fn emit_toggle_check_aarch64(code: &mut Vec<u8>, trampoline_va: u64, toggle_va: u64) -> usize {
-    // ADR x9, toggle_va (PC-relative)
-    let adr_va = trampoline_va + code.len() as u64;
-    let adr_offset = toggle_va as i64 - adr_va as i64;
-    code.extend_from_slice(&encode_adr(9, adr_offset));
+    // x9 = toggle_va (PC-relative)
+    let adr_pc = trampoline_va + code.len() as u64;
+    asm::emit_adr_auto(code, 9, adr_pc, toggle_va);
 
     // LDRB w9, [x9]  —  load toggle byte (0 or 1)
     // LDRB w9, [x9] = 0x39400129
@@ -889,7 +722,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
 
     // === Pre hooks ===
     // 1. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
@@ -908,7 +741,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
             None
         };
 
-        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+        code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
         emit_hook_call(
             &mut code,
             trampoline_va,
@@ -932,7 +765,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
     emit_restore_regs(&mut code);
 
     // 5. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // === Displaced instructions ===
     let displaced_va = trampoline_va + code.len() as u64;
@@ -943,7 +776,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
 
     // === Post hooks ===
     // 6. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 7. Save all registers
     emit_save_regs(&mut code, hook0.target_va);
@@ -962,7 +795,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
             None
         };
 
-        code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+        code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
         emit_hook_call(
             &mut code,
             trampoline_va,
@@ -986,7 +819,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
     emit_restore_regs(&mut code);
 
     // 10. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // 11. B return_va
     let b_va = trampoline_va + code.len() as u64;
@@ -994,7 +827,7 @@ pub fn generate_mixed_chain_trampoline_aarch64(
     if delta % 4 != 0 || delta.abs() > 128 * 1024 * 1024 {
         anyhow::bail!("mixed chain hook: return branch out of range");
     }
-    code.extend_from_slice(&encode_b((delta / 4) as i32));
+    code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
 
     Ok(Trampoline {
         va: trampoline_va,
@@ -1029,7 +862,7 @@ fn generate_pre_hook(
     let mut code = Vec::with_capacity(512);
 
     // 1. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook.target_va);
@@ -1047,7 +880,7 @@ fn generate_pre_hook(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+    code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4-5. Call hook handler
     emit_hook_call(
@@ -1075,7 +908,7 @@ fn generate_pre_hook(
     emit_restore_regs(&mut code);
 
     // 7. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // 8. Relocated displaced instruction(s)
     let displaced_va = trampoline_va + code.len() as u64;
@@ -1098,7 +931,7 @@ fn generate_pre_hook(
             delta,
         );
     }
-    code.extend_from_slice(&encode_b((delta / 4) as i32));
+    code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
 
     Ok(Trampoline {
         va: trampoline_va,
@@ -1131,7 +964,7 @@ fn generate_post_hook(
     code.extend_from_slice(&relocated);
 
     // 2. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 3. Save all registers
     emit_save_regs(&mut code, hook.target_va);
@@ -1149,7 +982,7 @@ fn generate_post_hook(
     };
 
     // 4. MOV x0, sp
-    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+    code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 5-6. Call hook handler
     emit_hook_call(
@@ -1177,7 +1010,7 @@ fn generate_post_hook(
     emit_restore_regs(&mut code);
 
     // 8. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // 9. B return_va
     let b_va = trampoline_va + code.len() as u64;
@@ -1189,7 +1022,7 @@ fn generate_post_hook(
             delta,
         );
     }
-    code.extend_from_slice(&encode_b((delta / 4) as i32));
+    code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
 
     Ok(Trampoline {
         va: trampoline_va,
@@ -1218,7 +1051,7 @@ fn generate_replace_hook(
     // === Main trampoline ===
 
     // 1. Allocate RegContext
-    code.extend_from_slice(&encode_sub_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_sub_sp_imm(REG_CONTEXT_SIZE));
 
     // 2. Save all registers
     emit_save_regs(&mut code, hook.target_va);
@@ -1236,11 +1069,12 @@ fn generate_replace_hook(
     };
 
     // 3. MOV x0, sp (arg1 = &RegContext)
-    code.extend_from_slice(&encode_add_from_sp(0, NEON_SAVE_SIZE));
+    code.extend_from_slice(&asm::encode_add_from_sp(0, NEON_SAVE_SIZE));
 
     // 4. ADR x1, original_stub (arg2) — placeholder, fix up later
     let adr_x1_fixup_pos = code.len();
-    code.extend_from_slice(&encode_adr(1, 0)); // placeholder offset
+    code.extend_from_slice(&asm::encode_nop()); // placeholder slot 1
+    code.extend_from_slice(&asm::encode_nop()); // placeholder slot 2
 
     // 5. Call hook handler
     emit_hook_call(
@@ -1256,7 +1090,7 @@ fn generate_replace_hook(
     emit_restore_regs(&mut code);
 
     // 7. Deallocate RegContext
-    code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+    code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
     // 8. RET to caller — the hook has fully replaced the function.
     code.extend_from_slice(&[0xC0, 0x03, 0x5F, 0xD6]); // RET (x30)
@@ -1277,7 +1111,7 @@ fn generate_replace_hook(
         emit_restore_regs(&mut code);
 
         // Deallocate RegContext
-        code.extend_from_slice(&encode_add_sp(REG_CONTEXT_SIZE));
+        code.extend_from_slice(&asm::encode_add_sp_imm(REG_CONTEXT_SIZE));
 
         // Execute displaced instruction(s)
         let displaced_va = trampoline_va + code.len() as u64;
@@ -1304,18 +1138,16 @@ fn generate_replace_hook(
                 delta,
             );
         }
-        code.extend_from_slice(&encode_b((delta / 4) as i32));
+        code.extend_from_slice(&asm::encode_b((delta / 4) as i32));
     }
 
     // === Original function stub (for when hook fires and wants to call original) ===
     let stub_offset = code.len();
     let stub_va = trampoline_va + stub_offset as u64;
 
-    // Fix up ADR x1 to point to the stub.
-    let adr_va = trampoline_va + adr_x1_fixup_pos as u64;
-    let adr_offset = stub_va as i64 - adr_va as i64;
-    let adr_word = encode_adr(1, adr_offset);
-    code[adr_x1_fixup_pos..adr_x1_fixup_pos + 4].copy_from_slice(&adr_word);
+    // Fix up ADR/ADRP+ADD to point x1 to the stub.
+    let adr_pc = trampoline_va + adr_x1_fixup_pos as u64;
+    asm::patch_adr_auto(&mut code, adr_x1_fixup_pos, adr_pc, stub_va, 1);
 
     // Relocated displaced instruction(s)
     let displaced_va = trampoline_va + code.len() as u64;
@@ -1338,7 +1170,7 @@ fn generate_replace_hook(
             delta2,
         );
     }
-    code.extend_from_slice(&encode_b((delta2 / 4) as i32));
+    code.extend_from_slice(&asm::encode_b((delta2 / 4) as i32));
 
     Ok(Trampoline {
         va: trampoline_va,

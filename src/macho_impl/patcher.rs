@@ -474,7 +474,7 @@ fn generate_init_and_trampolines<'a>(
         }
     }
 
-    if trampolines.is_empty() {
+    if trampolines.is_empty() && !blocks.is_empty() {
         bail!("all basic blocks failed trampoline generation");
     }
 
@@ -1370,7 +1370,7 @@ fn patch_macho(
     let enable_heap_san = opts.enable_heap_san;
     let persistent_addr = opts.persistent_addr;
     let no_coverage = opts.no_coverage;
-    if blocks.is_empty() && !no_coverage {
+    if blocks.is_empty() && !no_coverage && hooks.is_empty() {
         bail!("no basic blocks to instrument");
     }
 

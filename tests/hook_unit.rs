@@ -8,7 +8,6 @@ mod shellcode;
 
 use common::*;
 use shellcode::*;
-use std::path::PathBuf;
 use truant::{RewriteConfig, rewrite};
 
 #[test]
@@ -19,7 +18,7 @@ fn test_hook_pre_shellcode_nop() {
         "unit_pre_nop",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_pre_nop_out");
+    let output = bin_path(td.path(), "unit_pre_nop_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -49,7 +48,7 @@ fn test_hook_pre_shellcode_by_symbol() {
         "unit_pre_sym",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_pre_sym_out");
+    let output = bin_path(td.path(), "unit_pre_sym_out");
 
     let hooks_toml = write_hooks(
         td.path(),
@@ -77,7 +76,7 @@ fn test_hook_replace_shellcode() {
         "unit_replace_sc",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_replace_sc_out");
+    let output = bin_path(td.path(), "unit_replace_sc_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -103,7 +102,7 @@ fn test_hook_post_shellcode() {
         "unit_post_sc",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_post_sc_out");
+    let output = bin_path(td.path(), "unit_post_sc_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -133,7 +132,7 @@ fn test_hook_multiple_targets() {
         "unit_multi",
         "__attribute__((noinline)) int func_a(void) { return 10; }\n__attribute__((noinline)) int func_b(void) { return 20; }\nint main() { return func_a() + func_b(); }\n",
     );
-    let output = td.path().join("unit_multi_out");
+    let output = bin_path(td.path(), "unit_multi_out");
     let va_a = find_symbol_va(&input, "func_a").expect("func_a not found");
     let va_b = find_symbol_va(&input, "func_b").expect("func_b not found");
 
@@ -167,8 +166,8 @@ fn test_hook_coverage_excluded_at_hook_site() {
         "unit_cov_excl",
         "__attribute__((noinline)) int target_func(void) { return 0; }\nint main() { return target_func(); }\n",
     );
-    let output_no_hooks = td.path().join("unit_cov_excl_nohook");
-    let output_hooks = td.path().join("unit_cov_excl_hooked");
+    let output_no_hooks = bin_path(td.path(), "unit_cov_excl_nohook");
+    let output_hooks = bin_path(td.path(), "unit_cov_excl_hooked");
 
     let config_no_hooks = RewriteConfig {
         input: input.clone(),
@@ -213,7 +212,7 @@ fn test_hook_coverage_excluded_at_hook_site() {
 fn test_hook_error_symbol_not_found() {
     let td = test_dir();
     let input = compile_bin(td.path(), "unit_err_sym", "int main() { return 0; }\n");
-    let output = td.path().join("unit_err_sym_out");
+    let output = bin_path(td.path(), "unit_err_sym_out");
 
     let hooks_toml = write_hooks(
         td.path(),
@@ -257,7 +256,7 @@ fn test_hook_chaining_same_target() {
         "unit_chain",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_chain_out");
+    let output = bin_path(td.path(), "unit_chain_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -293,7 +292,7 @@ fn test_hook_chaining_mixed_modes_supported() {
         "unit_chain_mix",
         "__attribute__((noinline)) int target_func(void) { return 0; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_chain_mix_out");
+    let output = bin_path(td.path(), "unit_chain_mix_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -335,6 +334,7 @@ fn test_hook_chaining_mixed_modes_supported() {
 #[test]
 fn test_hook_error_handler_without_library() {
     let td = test_dir();
+    let input = compile_bin(td.path(), "unit_err_nolib_bin", "int main() { return 0; }\n");
     let hooks_toml = write_hooks(
         td.path(),
         "unit_err_nolib",
@@ -342,8 +342,8 @@ fn test_hook_error_handler_without_library() {
     );
 
     let config = RewriteConfig {
-        input: PathBuf::from("/usr/bin/true"),
-        output: td.path().join("unit_err_nolib_out"),
+        input,
+        output: bin_path(td.path(), "unit_err_nolib_out"),
         forkserver: false,
         dry_run: false,
         heap_san: false,
@@ -376,7 +376,7 @@ fn test_hook_plt_stub() {
         "unit_plt_hook",
         "#include <stdio.h>\nint main() { puts(\"hello\"); return 0; }\n",
     );
-    let output = td.path().join("unit_plt_hook_out");
+    let output = bin_path(td.path(), "unit_plt_hook_out");
     let plt_va = find_plt_va(&input, "puts").expect("puts@plt not found");
 
     let hooks_toml = write_hooks(
@@ -406,7 +406,7 @@ fn test_hook_no_coverage_mode() {
         "unit_nocov",
         "__attribute__((noinline)) int target_func(void) { return 42; }\nint main() { return target_func(); }\n",
     );
-    let output = td.path().join("unit_nocov_out");
+    let output = bin_path(td.path(), "unit_nocov_out");
     let target_va = find_symbol_va(&input, "target_func").expect("target_func not found");
 
     let hooks_toml = write_hooks(
@@ -433,7 +433,7 @@ fn test_hook_no_coverage_mode() {
 fn test_hook_with_condition() {
     let td = test_dir();
     let input = compile_bin(td.path(), "unit_condhook", "int main() { return 42; }\n");
-    let output = td.path().join("unit_condhook_out");
+    let output = bin_path(td.path(), "unit_condhook_out");
     let main_va = find_symbol_va(&input, "main").expect("main not found");
 
     // Condition: first arg register == 0. On entry to main, argc is typically 1,

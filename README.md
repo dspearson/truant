@@ -300,6 +300,7 @@ src/
       disasm.rs             x86_64 basic block detection helpers
       trampoline_gen.rs     x86_64 trampoline generation dispatch
     aarch64/
+      asm.rs                Shared ARM64 instruction encoding (60 encoders)
       disasm.rs             AArch64 basic block detection
       trampoline_gen.rs     Coverage trampoline + persistent mode (AArch64)
       hook_trampoline.rs    Hook trampoline codegen (AArch64)

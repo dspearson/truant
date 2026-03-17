@@ -36,7 +36,7 @@ fn pre_hook_modifies_argument() {
         int main() { return add_ten(5); }
     "#,
     );
-    let output = td.path().join("e2e_prearg_out");
+    let output = bin_path(td.path(), "e2e_prearg_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
     let hooks = write_hooks(
@@ -73,7 +73,7 @@ fn replace_reads_args_computes() {
         int main() { return target(11); }
     "#,
     );
-    let output = td.path().join("e2e_repcmp_out");
+    let output = bin_path(td.path(), "e2e_repcmp_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
@@ -106,7 +106,7 @@ fn replace_constant_return() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_repconst_out");
+    let output = bin_path(td.path(), "e2e_repconst_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
@@ -131,7 +131,7 @@ fn replace_constant_return() {
 fn conditional_fires_when_true() {
     let td = test_dir();
     let input = compile_bin(td.path(), "e2e_condtrue", "int main() { return 42; }\n");
-    let output = td.path().join("e2e_condtrue_out");
+    let output = bin_path(td.path(), "e2e_condtrue_out");
     let va = find_symbol_va(&input, "main").expect("main not found");
 
     let hooks = write_hooks(
@@ -170,7 +170,7 @@ fn conditional_bit_set() {
         int main() { return add_ten(15); }
     "#,
     );
-    let output = td.path().join("e2e_bitset_out");
+    let output = bin_path(td.path(), "e2e_bitset_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
     let hooks = write_hooks(
@@ -209,7 +209,7 @@ fn conditional_bit_clear() {
         int main() { return add_ten(14); }
     "#,
     );
-    let output = td.path().join("e2e_bitclr_out");
+    let output = bin_path(td.path(), "e2e_bitclr_out");
     let va = find_symbol_va(&input, "add_ten").expect("add_ten not found");
 
     let hooks = write_hooks(
@@ -248,7 +248,7 @@ fn hook_fires_every_call() {
         int main() { return add_one(0) + add_one(0) + add_one(0); }
     "#,
     );
-    let output = td.path().join("e2e_every_out");
+    let output = bin_path(td.path(), "e2e_every_out");
     let va = find_symbol_va(&input, "add_one").expect("add_one not found");
 
     let hooks = write_hooks(
@@ -281,7 +281,7 @@ fn recursive_function_stable() {
         int main() { return factorial(5); }
     "#,
     );
-    let output = td.path().join("e2e_recurse_out");
+    let output = bin_path(td.path(), "e2e_recurse_out");
     let va = find_symbol_va(&input, "factorial").expect("factorial not found");
 
     let hooks = write_hooks(
@@ -318,7 +318,7 @@ fn chained_hooks_accumulate() {
         int main() { return identity(0); }
     "#,
     );
-    let output = td.path().join("e2e_chain_out");
+    let output = bin_path(td.path(), "e2e_chain_out");
     let va = find_symbol_va(&input, "identity").expect("identity not found");
 
     let hooks = write_hooks(
@@ -357,7 +357,7 @@ fn mixed_pre_post_both_work() {
         int main() { return func(0); }
     "#,
     );
-    let output = td.path().join("e2e_mixed_out");
+    let output = bin_path(td.path(), "e2e_mixed_out");
     let va = find_symbol_va(&input, "func").expect("func not found");
 
     let hooks = write_hooks(
@@ -400,7 +400,7 @@ fn plt_replace_suppresses_output() {
         int main() { puts("hello world"); return 0; }
     "#,
     );
-    let output = td.path().join("e2e_pltrepl_out");
+    let output = bin_path(td.path(), "e2e_pltrepl_out");
     let plt_va = find_plt_va(&input, "puts")
         .expect("puts@plt not found — binary must be dynamically linked");
 
@@ -454,7 +454,7 @@ fn library_handler_hook() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_libhook_out");
+    let output = bin_path(td.path(), "e2e_libhook_out");
 
     let hooks = write_hooks(
         td.path(),
@@ -497,7 +497,7 @@ fn return_hook_modifies_retval() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_rethook_out");
+    let output = bin_path(td.path(), "e2e_rethook_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
@@ -530,7 +530,7 @@ fn toggle_disabled_skips_hook() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_togoff_out");
+    let output = bin_path(td.path(), "e2e_togoff_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
@@ -567,7 +567,7 @@ fn toggle_enabled_fires_hook() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_togon_out");
+    let output = bin_path(td.path(), "e2e_togon_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
@@ -596,35 +596,29 @@ fn callee_saved_regs_preserved() {
         td.path(),
         "e2e_callee",
         r#"
+        #include <stdlib.h>
         __attribute__((noinline))
         int target(int x) { return x; }
         int main() {
-            int r;
-            asm volatile(
-                "mov $10, %%rbx\n"
-                "mov $20, %%r12\n"
-                "mov $30, %%r13\n"
-                "mov $40, %%r14\n"
-                "mov $50, %%r15\n"
-                "xor %%edi, %%edi\n"
-                "call target\n"
-                "add %%ebx, %%eax\n"
-                "add %%r12d, %%eax\n"
-                "add %%r13d, %%eax\n"
-                "add %%r14d, %%eax\n"
-                "add %%r15d, %%eax\n"
-                : "=a"(r)
-                :
-                : "rbx", "r12", "r13", "r14", "r15",
-                  "rdi", "rcx", "rdx", "rsi",
-                  "r8", "r9", "r10", "r11", "memory"
-            );
-            return r;
+            register long rbx_val asm("rbx") = 10;
+            register long r12_val asm("r12") = 20;
+            register long r13_val asm("r13") = 30;
+            register long r14_val asm("r14") = 40;
+            register long r15_val asm("r15") = 50;
+            /* Force compiler to materialise the register assignments */
+            asm volatile("" : "+r"(rbx_val), "+r"(r12_val), "+r"(r13_val),
+                              "+r"(r14_val), "+r"(r15_val));
+            int ret = target(0);
+            /* Read back callee-saved regs — if hook trampoline clobbered them, values differ */
+            asm volatile("" : "+r"(rbx_val), "+r"(r12_val), "+r"(r13_val),
+                              "+r"(r14_val), "+r"(r15_val));
+            long sum = ret + rbx_val + r12_val + r13_val + r14_val + r15_val;
+            return (int)sum;
         }
     "#,
         &["-O0"],
     );
-    let output = td.path().join("e2e_callee_out");
+    let output = bin_path(td.path(), "e2e_callee_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     // Shellcode clobbers rbx, r12-r15 (machine regs, NOT RegContext fields).
@@ -665,7 +659,7 @@ fn stripped_binary_hook_by_va() {
     );
     let va = find_symbol_va(&input, "target").expect("target not found");
 
-    let stripped = td.path().join("e2e_strip_stripped");
+    let stripped = bin_path(td.path(), "e2e_strip_stripped");
     std::fs::copy(&input, &stripped).unwrap();
     let mut strip_cmd = std::process::Command::new("strip");
     if cfg!(target_os = "macos") {
@@ -680,7 +674,7 @@ fn stripped_binary_hook_by_va() {
         "target should not be found after stripping"
     );
 
-    let output = td.path().join("e2e_strip_out");
+    let output = bin_path(td.path(), "e2e_strip_out");
     let hooks = write_hooks(
         td.path(),
         "e2e_strip",
@@ -712,7 +706,7 @@ fn selective_multi_function() {
         int main() { return func_a() + func_b() + func_c(); }
     "#,
     );
-    let output = td.path().join("e2e_select_out");
+    let output = bin_path(td.path(), "e2e_select_out");
     let va_b = find_symbol_va(&input, "func_b").expect("func_b not found");
 
     let hooks = write_hooks(
@@ -744,7 +738,7 @@ fn hook_preserves_stdio() {
         int main() { printf("hello 42\n"); return 0; }
     "#,
     );
-    let output = td.path().join("e2e_stdio_out");
+    let output = bin_path(td.path(), "e2e_stdio_out");
     let va = find_symbol_va(&input, "main").expect("main not found");
 
     let hooks = write_hooks(
@@ -783,7 +777,7 @@ fn no_coverage_hooks_only() {
         int main() { return target(); }
     "#,
     );
-    let output = td.path().join("e2e_nocov_out");
+    let output = bin_path(td.path(), "e2e_nocov_out");
     let va = find_symbol_va(&input, "target").expect("target not found");
 
     let hooks = write_hooks(
