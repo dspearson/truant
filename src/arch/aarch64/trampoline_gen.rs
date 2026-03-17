@@ -53,10 +53,8 @@ const FORKSRV_FD: u32 = 198;
 /// AT_FDCWD encoded as u32 = 0xFFFFFF9C (-100 two's complement)
 const AT_FDCWD_U32: u32 = 0xFFFF_FF9C;
 
-
 use super::asm;
 use super::relocation::{is_pc_relative, relocate_pc_relative, sign_extend};
-
 
 /// Extract the original branch target VA from a conditional branch instruction that can
 /// benefit from branch island synthesis.
@@ -1098,7 +1096,6 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
     }
 }
 
-
 // ============================================================
 // Forkserver assembly for ARM64
 // ============================================================
@@ -1537,7 +1534,8 @@ pub fn generate_persistent_wrapper_aarch64(
         // .persistent_section:
         let persistent_section = code.len();
         let cd = (persistent_section as i64 - cbnz_persistent_pos as i64) as i32;
-        code[cbnz_persistent_pos..cbnz_persistent_pos + 4].copy_from_slice(&asm::encode_cbnz(10, cd));
+        code[cbnz_persistent_pos..cbnz_persistent_pos + 4]
+            .copy_from_slice(&asm::encode_cbnz(10, cd));
         let brel = ((persistent_section as i64 - b_persistent_pos as i64) / 4) as i32;
         code[b_persistent_pos..b_persistent_pos + 4].copy_from_slice(&asm::encode_b(brel));
     }

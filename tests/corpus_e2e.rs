@@ -938,11 +938,11 @@ fn corpus_library_handler_hook() {
     // The handler receives a pointer to RegContext and zeros the first argument
     // register: rdi at offset 40 on x86_64, x0 at offset 0 on AArch64.
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-    const FIRST_ARG_OFFSET: &str = "40";  // rdi
+    const FIRST_ARG_OFFSET: &str = "40"; // rdi
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    const FIRST_ARG_OFFSET: &str = "16";  // rcx
+    const FIRST_ARG_OFFSET: &str = "16"; // rcx
     #[cfg(target_arch = "aarch64")]
-    const FIRST_ARG_OFFSET: &str = "0";   // x0
+    const FIRST_ARG_OFFSET: &str = "0"; // x0
 
     let lib = compile_so(
         dir.path(),

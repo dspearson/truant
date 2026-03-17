@@ -334,7 +334,11 @@ fn test_hook_chaining_mixed_modes_supported() {
 #[test]
 fn test_hook_error_handler_without_library() {
     let td = test_dir();
-    let input = compile_bin(td.path(), "unit_err_nolib_bin", "int main() { return 0; }\n");
+    let input = compile_bin(
+        td.path(),
+        "unit_err_nolib_bin",
+        "int main() { return 0; }\n",
+    );
     let hooks_toml = write_hooks(
         td.path(),
         "unit_err_nolib",

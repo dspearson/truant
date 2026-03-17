@@ -445,7 +445,7 @@ pub(crate) fn encode_subs_w_imm(wd: u32, wn: u32, imm: u32) -> [u8; 4] {
 #[inline]
 pub(crate) fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
     debug_assert!(
-        byte_offset >= -(1 << 20) && byte_offset < (1 << 20),
+        (-(1_i64 << 20)..(1_i64 << 20)).contains(&byte_offset),
         "ADR offset out of ±1 MiB range: {:#x} — use emit_adr_auto() instead",
         byte_offset
     );
@@ -486,7 +486,7 @@ pub(crate) fn encode_adr_wide(rd: u32, pc: u64, target: u64) -> [u8; 8] {
 /// Returns true if `byte_offset` fits in ADR's ±1 MiB range.
 #[inline]
 pub(crate) fn adr_in_range(byte_offset: i64) -> bool {
-    byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
+    (-(1_i64 << 20)..(1_i64 << 20)).contains(&byte_offset)
 }
 
 /// Emit ADR (4 bytes) or ADRP+ADD (8 bytes) depending on range.

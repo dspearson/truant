@@ -456,7 +456,10 @@ fn parse_coff_text_data_ranges(
             // COFF Value field is the RVA for defined symbols.
             let sym_va = image_base + value as u64;
             let is_function = sym_type >= 0x20; // DTYPE_FUNCTION
-            text_syms.push(SymInfo { va: sym_va, is_function });
+            text_syms.push(SymInfo {
+                va: sym_va,
+                is_function,
+            });
         }
 
         // Skip aux symbols.
@@ -475,10 +478,7 @@ fn parse_coff_text_data_ranges(
         if sym.is_function {
             continue;
         }
-        let next_va = text_syms
-            .get(idx + 1)
-            .map(|s| s.va)
-            .unwrap_or(text_end_va);
+        let next_va = text_syms.get(idx + 1).map(|s| s.va).unwrap_or(text_end_va);
         let size = next_va.saturating_sub(sym.va);
         if size > 0 {
             ranges.push((sym.va, size));

@@ -211,30 +211,48 @@ pub fn rewrite_no_cov(input: &Path, output: &Path, hooks: &Path) -> truant::Rewr
 }
 
 /// Run binary and return exit code.
+/// Retries on ETXTBSY ("Text file busy") which can occur on Linux when the
+/// kernel hasn't fully released a just-written executable.
 pub fn run(binary: &Path) -> i32 {
-    Command::new(binary)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run {}: {}", binary.display(), e))
-        .code()
-        .expect("process terminated by signal")
+    for attempt in 0..5 {
+        match Command::new(binary).status() {
+            Ok(status) => return status.code().expect("process terminated by signal"),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 4 => {
+                // ETXTBSY = 26 on Linux
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("failed to run {}: {}", binary.display(), e),
+        }
+    }
+    unreachable!()
 }
 
 /// Run binary and capture stdout.
 pub fn run_stdout(binary: &Path) -> String {
-    let out = Command::new(binary)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {}: {}", binary.display(), e));
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    for attempt in 0..5 {
+        match Command::new(binary).output() {
+            Ok(out) => return String::from_utf8_lossy(&out.stdout).into_owned(),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("failed to run {}: {}", binary.display(), e),
+        }
+    }
+    unreachable!()
 }
 
 /// Run binary with LD_PRELOAD and return exit code.
 pub fn run_with_preload(binary: &Path, preload: &Path) -> i32 {
-    Command::new(binary)
-        .env("LD_PRELOAD", preload)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run {}: {}", binary.display(), e))
-        .code()
-        .expect("process terminated by signal")
+    for attempt in 0..5 {
+        match Command::new(binary).env("LD_PRELOAD", preload).status() {
+            Ok(status) => return status.code().expect("process terminated by signal"),
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("failed to run {}: {}", binary.display(), e),
+        }
+    }
+    unreachable!()
 }
 
 /// Compile a PE binary from C source using x86_64-w64-mingw32-gcc into `dir`.

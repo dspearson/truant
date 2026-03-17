@@ -34,7 +34,9 @@ fn is_near_branch(kind: OpKind) -> bool {
 
 /// Check if an address falls within any known data-in-text range.
 fn is_in_data_range(va: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|&(start, size)| va >= start && va < start + size)
+    ranges
+        .iter()
+        .any(|&(start, size)| va >= start && va < start + size)
 }
 
 /// Detect basic blocks in the .text section of a PE binary.

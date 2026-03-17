@@ -1188,7 +1188,7 @@ mod arm64 {
     }
     #[inline]
     pub fn adr_in_range(byte_offset: i64) -> bool {
-        byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
+        (-(1_i64 << 20)..(1_i64 << 20)).contains(&byte_offset)
     }
     /// Patch an 8-byte placeholder (two NOPs) with ADR+NOP or ADRP+ADD.
     pub fn patch_adr_auto(code: &mut [u8], pos: usize, pc: u64, target: u64, rd: u32) {
