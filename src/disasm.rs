@@ -14,6 +14,7 @@ pub enum SkipReason {
     NoFileMapping,
     PltOrStub,
     MidInstruction,
+    DataInText,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -26,6 +27,7 @@ impl std::fmt::Display for SkipReason {
             Self::NoFileMapping => write!(f, "VA has no file offset mapping"),
             Self::PltOrStub => write!(f, "PLT/stub entry"),
             Self::MidInstruction => write!(f, "target is mid-instruction"),
+            Self::DataInText => write!(f, "data symbol in .text section"),
         }
     }
 }

@@ -32,6 +32,11 @@ fn is_near_branch(kind: OpKind) -> bool {
     )
 }
 
+/// Check if an address falls within any known data-in-text range.
+fn is_in_data_range(va: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges.iter().any(|&(start, size)| va >= start && va < start + size)
+}
+
 /// Detect basic blocks in the .text section of a PE binary.
 pub fn find_basic_blocks_pe(
     ctx: &PeContext,
@@ -101,7 +106,10 @@ pub fn find_basic_blocks_pe(
             } else {
                 u32::from_le_bytes(data[i..i + 4].try_into().unwrap_or([0; 4])) as u64
             };
-            if ptr_val >= text_va && ptr_val < text_end_va {
+            if ptr_val >= text_va
+                && ptr_val < text_end_va
+                && !is_in_data_range(ptr_val, &ctx.text_data_ranges)
+            {
                 branch_targets.insert(ptr_val);
             }
             i += 1; // scan every byte offset for unaligned immediates
@@ -156,6 +164,12 @@ pub fn find_basic_blocks_pe(
     let targets: Vec<u64> = branch_targets.iter().copied().collect();
 
     for &target in &targets {
+        // Skip targets that fall within known data-in-text ranges.
+        if is_in_data_range(target, &ctx.text_data_ranges) {
+            skipped.push((target, SkipReason::DataInText));
+            continue;
+        }
+
         // Filter by module if requested.
         if let Some(modules) = instrument_modules {
             // For PE, we use export symbol names for module filtering.
@@ -259,6 +273,15 @@ pub fn find_basic_blocks_pe(
             .is_some();
         if has_interior_target {
             skipped.push((target, SkipReason::InteriorTarget));
+            continue;
+        }
+
+        // Heuristic: skip blocks whose displaced bytes are all zeros. This is
+        // data (e.g. null-terminated function pointer arrays like __DTOR_LIST__),
+        // not code — no compiler emits sequences of `add [rax], al` as real code.
+        // This catches data-in-text on stripped binaries where COFF symbols are absent.
+        if displaced.iter().all(|&b| b == 0) {
+            skipped.push((target, SkipReason::DataInText));
             continue;
         }
 

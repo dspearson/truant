@@ -28,7 +28,10 @@ fn cc_command() -> (String, Vec<String>) {
             vec!["-Wl,-headerpad_max_install_names".to_string()],
         )
     } else if cfg!(target_os = "windows") {
-        ("gcc".to_string(), vec![])
+        (
+            "gcc".to_string(),
+            vec!["-Wl,--export-all-symbols".to_string()],
+        )
     } else {
         ("gcc".to_string(), vec!["-no-pie".to_string()])
     }

@@ -86,6 +86,11 @@ pub struct PeContext {
 
     /// Parsed imports (dynamically linked functions from DLLs).
     pub imports: Vec<PeImport>,
+
+    /// VA ranges of non-function (data) symbols within .text.
+    /// Used to exclude data-in-text regions (e.g. MinGW __CTOR_LIST__/__DTOR_LIST__)
+    /// from instrumentation.
+    pub text_data_ranges: Vec<(u64, u64)>,
 }
 
 // PE constants
@@ -329,6 +334,17 @@ impl PeContext {
             }
         }
 
+        // Parse COFF symbol table to find non-function (data) symbols in .text.
+        // MinGW places __CTOR_LIST__, __DTOR_LIST__ etc. as data arrays in .text;
+        // these must be excluded from instrumentation.
+        let text_data_ranges = parse_coff_text_data_ranges(
+            data,
+            coff_header_offset as usize,
+            &text,
+            image_base,
+            &sections,
+        );
+
         Ok(PeContext {
             text,
             entry_point,
@@ -356,8 +372,120 @@ impl PeContext {
             size_of_initialized_data_field_offset,
             has_reloc,
             imports,
+            text_data_ranges,
         })
     }
+}
+
+/// Parse the COFF symbol table to find non-function symbols in .text.
+///
+/// Returns a sorted list of (va, size) ranges for data symbols. Size is estimated
+/// as the distance to the next symbol in the same section, or to the section end.
+///
+/// COFF symbol entries are 18 bytes:
+///   [0..8]   Name (short name or string table offset)
+///   [8..12]  Value (RVA within section)
+///   [12..14] SectionNumber (1-based, 0=external)
+///   [14..16] Type (low byte: base type, high byte: derived type; 0x20 = function)
+///   [16]     StorageClass
+///   [17]     NumberOfAuxSymbols
+fn parse_coff_text_data_ranges(
+    data: &[u8],
+    coff_header_offset: usize,
+    text: &TextSection,
+    image_base: u64,
+    sections: &[PeSection],
+) -> Vec<(u64, u64)> {
+    // COFF header layout: pointer_to_symbol_table at +8, number_of_symbols at +12.
+    if coff_header_offset + 16 > data.len() {
+        return Vec::new();
+    }
+    let symtab_off = u32::from_le_bytes(
+        data[coff_header_offset + 8..coff_header_offset + 12]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let num_syms = u32::from_le_bytes(
+        data[coff_header_offset + 12..coff_header_offset + 16]
+            .try_into()
+            .unwrap(),
+    );
+
+    if symtab_off == 0 || num_syms == 0 {
+        return Vec::new(); // Stripped binary, no COFF symbols.
+    }
+
+    const COFF_SYM_SIZE: usize = 18;
+    let symtab_end = symtab_off + (num_syms as usize) * COFF_SYM_SIZE;
+    if symtab_end > data.len() {
+        return Vec::new();
+    }
+
+    // Find which section index .text is (1-based).
+    let text_section_index: Option<u16> = sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == ".text")
+        .map(|(i, _)| (i + 1) as u16);
+    let text_sec_idx = match text_section_index {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+
+    // Collect all symbols in .text, noting which are functions and which are data.
+    // A symbol is a function if Type has DTYPE_FUNCTION (bit 5 of high byte, i.e. Type >= 0x20).
+    struct SymInfo {
+        va: u64,
+        is_function: bool,
+    }
+    let mut text_syms: Vec<SymInfo> = Vec::new();
+
+    let mut i = 0u32;
+    while i < num_syms {
+        let off = symtab_off + (i as usize) * COFF_SYM_SIZE;
+        if off + COFF_SYM_SIZE > data.len() {
+            break;
+        }
+
+        let value = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
+        let section_number = u16::from_le_bytes(data[off + 12..off + 14].try_into().unwrap());
+        let sym_type = u16::from_le_bytes(data[off + 14..off + 16].try_into().unwrap());
+        let num_aux = data[off + 17];
+
+        if section_number == text_sec_idx {
+            // COFF Value field is the RVA for defined symbols.
+            let sym_va = image_base + value as u64;
+            let is_function = sym_type >= 0x20; // DTYPE_FUNCTION
+            text_syms.push(SymInfo { va: sym_va, is_function });
+        }
+
+        // Skip aux symbols.
+        i += 1 + num_aux as u32;
+    }
+
+    // Sort by VA.
+    text_syms.sort_by_key(|s| s.va);
+
+    // Build ranges for non-function symbols. Size = distance to next symbol or section end.
+    let text_end = text.va + text.size;
+    let text_end_va = image_base + text_end;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+
+    for (idx, sym) in text_syms.iter().enumerate() {
+        if sym.is_function {
+            continue;
+        }
+        let next_va = text_syms
+            .get(idx + 1)
+            .map(|s| s.va)
+            .unwrap_or(text_end_va);
+        let size = next_va.saturating_sub(sym.va);
+        if size > 0 {
+            ranges.push((sym.va, size));
+        }
+    }
+
+    ranges
 }
 
 /// Find an IAT thunk stub in .text for the given IAT entry RVA.
@@ -718,6 +846,7 @@ mod tests {
             size_of_initialized_data_field_offset: 0,
             has_reloc: false,
             imports: vec![],
+            text_data_ranges: vec![],
         }
     }
 
