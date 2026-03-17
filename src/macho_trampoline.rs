@@ -2259,16 +2259,23 @@ fn emit_macos_forkserver_aarch64(code: &mut Vec<u8>) {
     // Deallocate forkserver stack
     code.extend_from_slice(&encode_add_sp_imm(16));
 
-    // .no_forkserver: patch B.CS
-    let no_fork = code.len();
-    // The no-forkserver path also needs ADD sp, 16 stack cleanup.
-    // B.CS is patched to jump here where the cleanup is emitted.
-    // The child path already emitted ADD sp, 16 above.
-    // For no_forkserver, we need the same cleanup. Add it here:
-    code.extend_from_slice(&encode_add_sp_imm(16));
-    let _no_fork_end = code.len();
+    // Skip over the no_forkserver cleanup — child already cleaned up above.
+    // Without this branch, the child falls through and executes ADD sp, 16
+    // a second time, corrupting the stack frame and causing SIGSEGV when
+    // the epilogue restores callee-saved registers from wrong offsets.
+    let b_skip_nofork = code.len();
+    code.extend_from_slice(&encode_b(0)); // placeholder: B .after_cleanup
 
-    // Patch B.CS to .no_fork_end - 4 (the ADD sp, 16 we just emitted)
+    // .no_forkserver: B.CS lands here (forkserver pipe write failed)
+    let no_fork = code.len();
+    code.extend_from_slice(&encode_add_sp_imm(16));
+
+    // .after_cleanup: child branch target
+    let after_cleanup = code.len();
+    let skip_delta = ((after_cleanup as i64 - b_skip_nofork as i64) / 4) as i32;
+    code[b_skip_nofork..b_skip_nofork + 4].copy_from_slice(&encode_b(skip_delta));
+
+    // Patch B.CS to .no_forkserver
     patch_b_cond(
         code,
         bcs_no_fork,
