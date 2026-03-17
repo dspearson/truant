@@ -302,11 +302,58 @@ fn encode_ldr_literal(xn: u32, offset_bytes: i32) -> [u8; 4] {
 #[inline]
 fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
     // ADR Xd, #offset: op=0, immlo=offset[1:0], 10000, immhi=offset[20:2], Rd
-    let imm21 = byte_offset as u32; // truncate to low 21 bits (sign-extended by CPU)
+    debug_assert!(
+        byte_offset >= -(1 << 20) && byte_offset < (1 << 20),
+        "ADR offset out of ±1 MiB range: {:#x} — use encode_adr_wide() instead",
+        byte_offset
+    );
+    let imm21 = (byte_offset & 0x1FFFFF) as u32; // mask to 21 bits preserving sign encoding
     let immlo = imm21 & 0x3;
     let immhi = (imm21 >> 2) & 0x7FFFF;
     let word = (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd;
     word.to_le_bytes()
+}
+
+/// Encode ADRP xN, PC+page_offset (PC-relative page address, ±4 GiB range).
+#[inline]
+fn encode_adrp(rd: u32, byte_offset: i64) -> [u8; 4] {
+    // ADRP: like ADR but page-aligned, op=1, ±4 GiB range
+    let page_offset = byte_offset >> 12;
+    let imm21 = (page_offset & 0x1FFFFF) as u32;
+    let immlo = imm21 & 0x3;
+    let immhi = (imm21 >> 2) & 0x7FFFF;
+    let word = (1u32 << 31) | (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd;
+    word.to_le_bytes()
+}
+
+/// Encode ADD xD, xN, #imm12 (immediate, no shift).
+#[inline]
+fn encode_add_imm(rd: u32, rn: u32, imm12: u32) -> [u8; 4] {
+    let word = 0x9100_0000u32 | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd;
+    word.to_le_bytes()
+}
+
+/// Wide PC-relative address computation: ADRP + ADD (±4 GiB range, 8 bytes).
+/// Use when the offset exceeds ADR's ±1 MiB range.
+/// `pc` must be the VA of the ADRP instruction itself.
+#[inline]
+fn encode_adr_wide(rd: u32, pc: u64, target: u64) -> [u8; 8] {
+    let pc_page = pc & !0xFFF;
+    let target_page = target & !0xFFF;
+    let page_offset = target_page as i64 - pc_page as i64;
+    let page_off12 = (target & 0xFFF) as u32;
+    let adrp = encode_adrp(rd, page_offset);
+    let add = encode_add_imm(rd, rd, page_off12);
+    let mut result = [0u8; 8];
+    result[..4].copy_from_slice(&adrp);
+    result[4..].copy_from_slice(&add);
+    result
+}
+
+/// Returns true if byte_offset fits in ADR's ±1 MiB range.
+#[inline]
+fn adr_in_range(byte_offset: i64) -> bool {
+    byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
 }
 
 /// Encode STR xN, [xM, #offset] for 8-byte aligned slots.
@@ -507,9 +554,15 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         //   ADR x11, data_va                          ; x11 = runtime &data_va
         //   LDR x10, [x11]                            ; x10 = shm_ptr
 
-        // ADR x11, data_va (computed directly — data_va is known at rewrite time)
-        let adr1_offset = data_va as i64 - (trampoline_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(11, adr1_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        // Use ADR (4 bytes) if within ±1 MiB, otherwise ADRP+ADD (8 bytes).
+        let adr1_pc = trampoline_va + code.len() as u64;
+        let adr1_offset = data_va as i64 - adr1_pc as i64;
+        if adr_in_range(adr1_offset) {
+            code.extend_from_slice(&encode_adr(11, adr1_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(11, adr1_pc, data_va));
+        }
 
         // LDR x10, [x11]  (x10 = shm_ptr)
         code.extend_from_slice(&encode_ldr_reg(10, 11));
@@ -548,9 +601,14 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_strb_reg(11, 10));
 
         // ── Update prev_loc = block_id >> 1 ─────────────────────────────
-        // Need data_ptr again — recompute via ADR.
-        let adr2_offset = data_va as i64 - (trampoline_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(11, adr2_offset));
+        // Need data_ptr again — recompute address.
+        let adr2_pc = trampoline_va + code.len() as u64;
+        let adr2_offset = data_va as i64 - adr2_pc as i64;
+        if adr_in_range(adr2_offset) {
+            code.extend_from_slice(&encode_adr(11, adr2_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(11, adr2_pc, data_va));
+        }
 
         // MOVZ x10, #(block_id >> 1)
         code.extend_from_slice(&encode_movz(10, (block_id >> 1) as u16));
@@ -635,6 +693,8 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         } else if block.displaced_len == 8 {
             // Two-instruction displacement (typically ADRP+ADD/LDR/STR pair).
             // Relocate each instruction independently.
+            // NB: capture base offset BEFORE loop — code.len() grows as we emit.
+            let pair_base_va = trampoline_va + code.len() as u64;
             for i in 0..2 {
                 let offset = i * 4;
                 let insn_bytes = &block.displaced_bytes[offset..offset + 4];
@@ -645,7 +705,7 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
                     insn_bytes[3],
                 ]);
                 let original_insn_va = block.va + offset as u64;
-                let displaced_insn_va = trampoline_va + code.len() as u64;
+                let displaced_insn_va = pair_base_va + offset as u64;
 
                 if is_pc_relative(raw) {
                     match relocate_pc_relative(raw, original_insn_va, displaced_insn_va) {
@@ -1017,9 +1077,14 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_mov_reg(19, 0));
 
         // ── Store shm_ptr at data_va ──────────────────────────────────────
-        // Compute data_va address via ADR (PC-relative, PIE-safe).
-        let adr_datava_offset = data_va as i64 - (init_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        let adr_datava_pc = init_va + code.len() as u64;
+        let adr_datava_offset = data_va as i64 - adr_datava_pc as i64;
+        if adr_in_range(adr_datava_offset) {
+            code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(20, adr_datava_pc, data_va));
+        }
 
         // STR x19, [x20]  (shm_ptr at data_va+0)
         code.extend_from_slice(&encode_str_reg(19, 20));
@@ -1330,18 +1395,27 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_mov_reg(19, 0)); // shm_ptr in x19
 
         // ── Store shm_ptr at data_va ──────────────────────────────────────
-        // Compute data_va address via ADR (PC-relative, PIE-safe).
-        let adr_datava_offset = data_va as i64 - (init_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        let adr_datava_pc2 = init_va + code.len() as u64;
+        let adr_datava_offset = data_va as i64 - adr_datava_pc2 as i64;
+        if adr_in_range(adr_datava_offset) {
+            code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(20, adr_datava_pc2, data_va));
+        }
 
         code.extend_from_slice(&encode_str_reg(19, 20)); // STR x19, [x20] -- shm_ptr
         code.extend_from_slice(&encode_strh_zero(20, PREV_LOC_OFFSET as u32)); // clear prev_loc
 
         // ── Chain to original DT_INIT if present ─────────────────────────
         if let Some(dt_init_va) = dt_init {
-            // ADR x16, original_dt_init (PC-relative, PIE-safe for .so)
-            let adr_dtinit_offset = dt_init_va as i64 - (init_va + code.len() as u64) as i64;
-            code.extend_from_slice(&encode_adr(16, adr_dtinit_offset));
+            let adr_dtinit_pc = init_va + code.len() as u64;
+            let adr_dtinit_offset = dt_init_va as i64 - adr_dtinit_pc as i64;
+            if adr_in_range(adr_dtinit_offset) {
+                code.extend_from_slice(&encode_adr(16, adr_dtinit_offset));
+            } else {
+                code.extend_from_slice(&encode_adr_wide(16, adr_dtinit_pc, dt_init_va));
+            }
             code.extend_from_slice(&encode_blr(16)); // BLR x16
         }
 
