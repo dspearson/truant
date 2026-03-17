@@ -303,7 +303,7 @@ fn encode_ldr_literal(xn: u32, offset_bytes: i32) -> [u8; 4] {
 fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
     // ADR Xd, #offset: op=0, immlo=offset[1:0], 10000, immhi=offset[20:2], Rd
     debug_assert!(
-        (-(1 << 20)..(1 << 20)).contains(&byte_offset),
+        byte_offset >= -(1 << 20) && byte_offset < (1 << 20),
         "ADR offset out of ±1 MiB range: {:#x} — use encode_adr_wide() instead",
         byte_offset
     );
@@ -353,7 +353,7 @@ fn encode_adr_wide(rd: u32, pc: u64, target: u64) -> [u8; 8] {
 /// Returns true if byte_offset fits in ADR's ±1 MiB range.
 #[inline]
 fn adr_in_range(byte_offset: i64) -> bool {
-    (-(1 << 20)..(1 << 20)).contains(&byte_offset)
+    byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
 }
 
 /// Encode STR xN, [xM, #offset] for 8-byte aligned slots.
@@ -685,6 +685,8 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         } else if block.displaced_len == 8 {
             // Two-instruction displacement (typically ADRP+ADD/LDR/STR pair).
             // Relocate each instruction independently.
+            // NB: capture base offset BEFORE loop — code.len() grows as we emit.
+            let pair_base_va = trampoline_va + code.len() as u64;
             for i in 0..2 {
                 let offset = i * 4;
                 let insn_bytes = &block.displaced_bytes[offset..offset + 4];
@@ -695,7 +697,7 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
                     insn_bytes[3],
                 ]);
                 let original_insn_va = block.va + offset as u64;
-                let displaced_insn_va = trampoline_va + code.len() as u64;
+                let displaced_insn_va = pair_base_va + offset as u64;
 
                 if is_pc_relative(raw) {
                     match relocate_pc_relative(raw, original_insn_va, displaced_insn_va) {
@@ -1067,9 +1069,14 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_mov_reg(19, 0));
 
         // ── Store shm_ptr at data_va ──────────────────────────────────────
-        // Compute data_va address via ADR (PC-relative, PIE-safe).
-        let adr_datava_offset = data_va as i64 - (init_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        let adr_datava_pc = init_va + code.len() as u64;
+        let adr_datava_offset = data_va as i64 - adr_datava_pc as i64;
+        if adr_in_range(adr_datava_offset) {
+            code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(20, adr_datava_pc, data_va));
+        }
 
         // STR x19, [x20]  (shm_ptr at data_va+0)
         code.extend_from_slice(&encode_str_reg(19, 20));
@@ -1380,18 +1387,27 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_mov_reg(19, 0)); // shm_ptr in x19
 
         // ── Store shm_ptr at data_va ──────────────────────────────────────
-        // Compute data_va address via ADR (PC-relative, PIE-safe).
-        let adr_datava_offset = data_va as i64 - (init_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        let adr_datava_pc2 = init_va + code.len() as u64;
+        let adr_datava_offset = data_va as i64 - adr_datava_pc2 as i64;
+        if adr_in_range(adr_datava_offset) {
+            code.extend_from_slice(&encode_adr(20, adr_datava_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(20, adr_datava_pc2, data_va));
+        }
 
         code.extend_from_slice(&encode_str_reg(19, 20)); // STR x19, [x20] -- shm_ptr
         code.extend_from_slice(&encode_strh_zero(20, PREV_LOC_OFFSET as u32)); // clear prev_loc
 
         // ── Chain to original DT_INIT if present ─────────────────────────
         if let Some(dt_init_va) = dt_init {
-            // ADR x16, original_dt_init (PC-relative, PIE-safe for .so)
-            let adr_dtinit_offset = dt_init_va as i64 - (init_va + code.len() as u64) as i64;
-            code.extend_from_slice(&encode_adr(16, adr_dtinit_offset));
+            let adr_dtinit_pc = init_va + code.len() as u64;
+            let adr_dtinit_offset = dt_init_va as i64 - adr_dtinit_pc as i64;
+            if adr_in_range(adr_dtinit_offset) {
+                code.extend_from_slice(&encode_adr(16, adr_dtinit_offset));
+            } else {
+                code.extend_from_slice(&encode_adr_wide(16, adr_dtinit_pc, dt_init_va));
+            }
             code.extend_from_slice(&encode_blr(16)); // BLR x16
         }
 
