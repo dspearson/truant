@@ -302,11 +302,58 @@ fn encode_ldr_literal(xn: u32, offset_bytes: i32) -> [u8; 4] {
 #[inline]
 fn encode_adr(rd: u32, byte_offset: i64) -> [u8; 4] {
     // ADR Xd, #offset: op=0, immlo=offset[1:0], 10000, immhi=offset[20:2], Rd
-    let imm21 = byte_offset as u32; // truncate to low 21 bits (sign-extended by CPU)
+    debug_assert!(
+        byte_offset >= -(1 << 20) && byte_offset < (1 << 20),
+        "ADR offset out of ±1 MiB range: {:#x} — use encode_adr_wide() instead",
+        byte_offset
+    );
+    let imm21 = (byte_offset & 0x1FFFFF) as u32; // mask to 21 bits preserving sign encoding
     let immlo = imm21 & 0x3;
     let immhi = (imm21 >> 2) & 0x7FFFF;
     let word = (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd;
     word.to_le_bytes()
+}
+
+/// Encode ADRP xN, PC+page_offset (PC-relative page address, ±4 GiB range).
+#[inline]
+fn encode_adrp(rd: u32, byte_offset: i64) -> [u8; 4] {
+    // ADRP: like ADR but page-aligned, op=1, ±4 GiB range
+    let page_offset = byte_offset >> 12;
+    let imm21 = (page_offset & 0x1FFFFF) as u32;
+    let immlo = imm21 & 0x3;
+    let immhi = (imm21 >> 2) & 0x7FFFF;
+    let word = (1u32 << 31) | (immlo << 29) | (0b10000u32 << 24) | (immhi << 5) | rd;
+    word.to_le_bytes()
+}
+
+/// Encode ADD xD, xN, #imm12 (immediate, no shift).
+#[inline]
+fn encode_add_imm(rd: u32, rn: u32, imm12: u32) -> [u8; 4] {
+    let word = 0x9100_0000u32 | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd;
+    word.to_le_bytes()
+}
+
+/// Wide PC-relative address computation: ADRP + ADD (±4 GiB range, 8 bytes).
+/// Use when the offset exceeds ADR's ±1 MiB range.
+/// `pc` must be the VA of the ADRP instruction itself.
+#[inline]
+fn encode_adr_wide(rd: u32, pc: u64, target: u64) -> [u8; 8] {
+    let pc_page = pc & !0xFFF;
+    let target_page = target & !0xFFF;
+    let page_offset = target_page as i64 - pc_page as i64;
+    let page_off12 = (target & 0xFFF) as u32;
+    let adrp = encode_adrp(rd, page_offset);
+    let add = encode_add_imm(rd, rd, page_off12);
+    let mut result = [0u8; 8];
+    result[..4].copy_from_slice(&adrp);
+    result[4..].copy_from_slice(&add);
+    result
+}
+
+/// Returns true if byte_offset fits in ADR's ±1 MiB range.
+#[inline]
+fn adr_in_range(byte_offset: i64) -> bool {
+    byte_offset >= -(1 << 20) && byte_offset < (1 << 20)
 }
 
 /// Encode STR xN, [xM, #offset] for 8-byte aligned slots.
@@ -507,9 +554,15 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         //   ADR x11, data_va                          ; x11 = runtime &data_va
         //   LDR x10, [x11]                            ; x10 = shm_ptr
 
-        // ADR x11, data_va (computed directly — data_va is known at rewrite time)
-        let adr1_offset = data_va as i64 - (trampoline_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(11, adr1_offset));
+        // Compute data_va address (PC-relative, PIE-safe).
+        // Use ADR (4 bytes) if within ±1 MiB, otherwise ADRP+ADD (8 bytes).
+        let adr1_pc = trampoline_va + code.len() as u64;
+        let adr1_offset = data_va as i64 - adr1_pc as i64;
+        if adr_in_range(adr1_offset) {
+            code.extend_from_slice(&encode_adr(11, adr1_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(11, adr1_pc, data_va));
+        }
 
         // LDR x10, [x11]  (x10 = shm_ptr)
         code.extend_from_slice(&encode_ldr_reg(10, 11));
@@ -548,9 +601,14 @@ impl TrampolineGenerator for AArch64TrampolineGenerator {
         code.extend_from_slice(&encode_strb_reg(11, 10));
 
         // ── Update prev_loc = block_id >> 1 ─────────────────────────────
-        // Need data_ptr again — recompute via ADR.
-        let adr2_offset = data_va as i64 - (trampoline_va + code.len() as u64) as i64;
-        code.extend_from_slice(&encode_adr(11, adr2_offset));
+        // Need data_ptr again — recompute address.
+        let adr2_pc = trampoline_va + code.len() as u64;
+        let adr2_offset = data_va as i64 - adr2_pc as i64;
+        if adr_in_range(adr2_offset) {
+            code.extend_from_slice(&encode_adr(11, adr2_offset));
+        } else {
+            code.extend_from_slice(&encode_adr_wide(11, adr2_pc, data_va));
+        }
 
         // MOVZ x10, #(block_id >> 1)
         code.extend_from_slice(&encode_movz(10, (block_id >> 1) as u16));
